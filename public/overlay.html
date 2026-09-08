@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>easyop 字幕</title>
+    <style>
+      :root {
+        --panel: rgba(12, 10, 18, 0.72);
+        --panel-edge: rgba(255, 255, 255, 0.14);
+        --ink: #ffffff;
+        --ink-acc: #cdb3ff;
+        --accent: #8f6bff;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .stage {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        align-items: center;
+        padding: 10px;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+      }
+
+      /* 音符背景层 */
+      .notes {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        overflow: hidden;
+        z-index: 0;
+      }
+      .note {
+        position: absolute;
+        bottom: -40px;
+        left: 0;
+        opacity: 0;
+        pointer-events: none;
+        font-family: "Segoe UI Symbol", "Segoe UI", serif;
+        animation: floatUp linear forwards;
+        will-change: transform, opacity;
+        text-shadow: 0 0 12px currentColor;
+      }
+      @keyframes floatUp {
+        0%   { transform: translateY(0) translateX(0) rotate(0deg) scale(0.7); opacity: 0; }
+        12%  { opacity: 0.85; }
+        70%  { transform: translateY(-80px) translateX(18px) rotate(28deg) scale(1); opacity: 0.55; }
+        100% { transform: translateY(-130px) translateX(-14px) rotate(-24deg) scale(1.15); opacity: 0; }
+      }
+
+      /* 字幕面板：高对比白字，与彩色音符背景不冲突 */
+      .panel {
+        position: relative;
+        z-index: 2;
+        width: 100%;
+        max-width: 100%;
+        padding: 6px 10px;
+        background: var(--panel);
+        border: 1px solid var(--panel-edge);
+        border-radius: 10px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 16px rgba(143, 107, 255, 0.12);
+        backdrop-filter: blur(4px);
+      }
+
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 9px;
+        letter-spacing: 0.04em;
+        color: var(--ink-acc);
+        margin-bottom: 3px;
+        opacity: 0.9;
+      }
+      .status::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 8px var(--accent);
+        animation: pulse 1.3s ease-in-out infinite;
+        flex-shrink: 0;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.45; transform: scale(0.82); }
+      }
+
+      .text {
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1.2;
+        color: var(--ink);
+        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.8);
+        white-space: nowrap;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+      .text::-webkit-scrollbar { display: none; }
+      .text .cursor {
+        display: inline-block;
+        width: 2px;
+        height: 1em;
+        margin-left: 2px;
+        vertical-align: -0.14em;
+        background: #ffffff;
+        animation: blink 1s steps(2) infinite;
+      }
+      @keyframes blink { 50% { opacity: 0; } }
+
+      .text.placeholder {
+        font-weight: 500;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.55);
+        text-shadow: none;
+      }
+      .text.flash { animation: flash 0.8s ease; }
+      @keyframes flash {
+        0% { transform: scale(0.985); color: var(--ink-acc); }
+        100% { transform: scale(1); color: var(--ink); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <div class="notes" id="notes"></div>
+      <div class="panel">
+        <div class="status" id="status">等待语音…</div>
+        <div class="text placeholder" id="text">按 PTT 键说话，这里实时显示识别文字</div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        var textEl = document.getElementById("text");
+        var statusEl = document.getElementById("status");
+        var notesEl = document.getElementById("notes");
+
+        var glyphs = ["♪", "♫", "♩", "♬", "♭", "♮", "𝄞", "𝄢"];
+        var hues = [265, 300, 210, 340, 185, 255, 320];
+
+        function spawnNote() {
+          var el = document.createElement("span");
+          el.className = "note";
+          el.textContent = glyphs[Math.floor(Math.random() * glyphs.length)];
+          el.style.left = Math.random() * 100 + "%";
+          el.style.fontSize = 16 + Math.random() * 26 + "px";
+          var hue = hues[Math.floor(Math.random() * hues.length)];
+          el.style.color = "hsl(" + hue + ", 88%, 66%)";
+          var dur = 5 + Math.random() * 4;
+          el.style.animationDuration = dur + "s";
+          el.style.animationDelay = "0s";
+          notesEl.appendChild(el);
+          el.addEventListener("animationend", function () { el.remove(); });
+        }
+        for (var i = 0; i < 5; i++) { spawnNote(); }
+        setInterval(spawnNote, 380);
+
+        function setText(payload) {
+          textEl.classList.remove("placeholder");
+          textEl.textContent = payload;
+          // 单行模式：文字超长时水平滚动到末尾，展示最新识别内容。
+          textEl.scrollLeft = textEl.scrollWidth;
+        }
+
+        // 通过 withGlobalTauri 注入的全局 Tauri API 监听事件
+        var tauri = window.__TAURI__;
+        if (tauri && tauri.event && tauri.event.listen) {
+          tauri.event.listen("asr-partial", function (e) { setText(e.payload); });
+          tauri.event.listen("asr-final", function (e) {
+            setText(e.payload);
+            statusEl.textContent = "已上屏";
+            textEl.classList.remove("flash");
+            void textEl.offsetWidth;
+            textEl.classList.add("flash");
+          });
+          tauri.event.listen("asr-state", function (e) {
+            var s = e.payload || "";
+            statusEl.textContent = s;
+            if (/正在|通话|聆听/.test(s)) {
+              textEl.classList.remove("placeholder");
+              textEl.textContent = "";  // 清空上次残留字幕
+            } else if (/未识别|结束|请先|失败/.test(s)) {
+              textEl.classList.add("placeholder");
+            }
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>

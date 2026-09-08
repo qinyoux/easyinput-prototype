@@ -1,0 +1,42 @@
+[package]
+name = "easyop"
+version = "0.2.0"
+description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
+authors = ["easyop"]
+edition = "2021"
+
+[lib]
+name = "easyop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_UI_Shell",
+] }
+
+# 云端流式识别相关
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+http = "1"
+cpal = "0.15"
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
