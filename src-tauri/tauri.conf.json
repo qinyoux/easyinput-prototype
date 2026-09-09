@@ -26,7 +26,15 @@
     "withGlobalTauri": true
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": [],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "copyright": "Copyright (c) 2026 easyop",
+    "category": "Utility",
+    "shortDescription": "easyop · ESP32 按键配置与语音输入工具",
+    "longDescription": "easyop 是一款配合 ESP32_S3_BOT 使用的桌面配置工具，支持按键方案管理、语音输入（ASR）与 LLM 文本编辑。"
   }
 }
