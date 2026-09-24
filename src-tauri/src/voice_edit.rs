@@ -25,7 +25,7 @@ async fn wait_for_target_focus(app: &tauri::AppHandle, max_ms: u64) {
     let mut elapsed = 0u64;
 
     // 获取自身窗口句柄集合，用于判断前台窗口是否是本应用。
-    let our_hwnds: Vec<usize> = ["overlay", "edit_overlay", "main"]
+    let our_hwnds: Vec<usize> = ["overlay", "edit_overlay", "workbench", "main"]
         .iter()
         .filter_map(|label| app.get_webview_window(label))
         .filter_map(|w| w.hwnd().ok())

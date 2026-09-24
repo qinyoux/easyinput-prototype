@@ -1,27 +1,55 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>easyop 语音编辑</title>
     <style>
-      :root {
-        --panel: rgba(12, 10, 18, 0.82);
-        --panel-edge: rgba(255, 255, 255, 0.14);
-        --ink: #ffffff;
-        --ink-dim: rgba(255, 255, 255, 0.5);
-        --ink-acc: #cdb3ff;
-        --accent: #8f6bff;
-        --accent-green: #4ade80;
-        --accent-amber: #fbbf24;
+      /*
+       * 独立页面（不走 Vite 打包），令牌按 styles.css 的深/浅两套各抄一份最小集，
+       * 只保留这里真正用到的键。主题来源与主窗口一致：localStorage `easyop.theme`
+       * + `prefers-color-scheme`，靠 `storage` 事件跟随主窗口的实时切换。
+       */
+      :root,
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --panel-rgb: 23, 27, 44;
+        --border: rgba(255, 255, 255, 0.12);
+        --text: #e8eaf2;
+        --text-dim: #98a0b8;
+        --text-accent: #ffc2a8;
+        --accent-solid: #ff6b35;
+        --accent-rgb: 255, 107, 53;
+        --shadow: rgba(0, 0, 0, 0.55);
+        --success: #34d399;
+        --error: #fbbf24;
+        --panel-idle: rgba(var(--panel-rgb), 0.65);
+        --panel-active: rgba(var(--panel-rgb), 0.88);
       }
+      [data-theme="light"] {
+        color-scheme: light;
+        --panel-rgb: 255, 255, 255;
+        --border: rgba(0, 0, 0, 0.08);
+        --text: #1c1917;
+        --text-dim: #78716c;
+        --text-accent: #c2410c;
+        --accent-solid: #c2410c;
+        --accent-rgb: 255, 107, 53;
+        --shadow: rgba(28, 25, 23, 0.22);
+        --success: #059669;
+        --error: #d97706;
+        --panel-idle: rgba(var(--panel-rgb), 0.75);
+        --panel-active: rgba(var(--panel-rgb), 0.95);
+      }
+
       * { box-sizing: border-box; }
+
       html, body {
         margin: 0;
         height: 100%;
         overflow: hidden;
         background: transparent;
-        font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
         -webkit-font-smoothing: antialiased;
       }
 
@@ -38,66 +66,129 @@
         cursor: default;
       }
 
+      /* ---------- 面板 ---------- */
       .panel {
         position: relative;
         z-index: 2;
         width: 100%;
         padding: 8px 12px;
-        background: var(--panel);
-        border: 1px solid var(--panel-edge);
+        background: var(--panel-idle);
+        border: 1px solid var(--border);
         border-radius: 10px;
-        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 16px rgba(143, 107, 255, 0.12);
-        backdrop-filter: blur(4px);
+        box-shadow: 0 4px 14px var(--shadow), inset 0 0 12px rgba(var(--accent-rgb), 0.06);
+        backdrop-filter: blur(10px) saturate(1.4);
+        -webkit-backdrop-filter: blur(10px) saturate(1.4);
+        transition: background 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+      }
+      .panel.listening {
+        background: var(--panel-active);
+        box-shadow: 0 6px 20px var(--shadow), inset 0 0 16px rgba(var(--accent-rgb), 0.12);
+        border-color: rgba(var(--accent-rgb), 0.35);
+      }
+      .panel.editing {
+        background: var(--panel-active);
+      }
+      /* 识别中：与 listening 同色。⚠️ 少了这条，`setState("recognizing")` 会把面板
+         打回 idle 的半透明底 —— 正在出字幕时反而"看暗了"，像已经停了。 */
+      .panel.recognizing {
+        background: var(--panel-active);
+      }
+      .panel.done {
+        background: var(--panel-active);
+      }
+      .panel.error {
+        background: var(--panel-active);
       }
 
+      /* ---------- 状态栏 ---------- */
       .status {
         display: flex;
         align-items: center;
         gap: 6px;
         font-size: 10px;
         letter-spacing: 0.04em;
-        color: var(--ink-acc);
+        color: var(--text-dim);
         margin-bottom: 4px;
+        transition: color 0.2s ease;
       }
-      .status::before {
-        content: "";
+      .status .dot {
         width: 6px;
         height: 6px;
         border-radius: 50%;
-        background: var(--accent);
-        box-shadow: 0 0 8px var(--accent);
-        animation: pulse 1.3s ease-in-out infinite;
+        background: var(--text-dim);
         flex-shrink: 0;
+        transition: background 0.2s ease, box-shadow 0.2s ease;
       }
-      .status.done::before { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); animation: none; }
-      .status.error::before { background: var(--accent-amber); box-shadow: 0 0 8px var(--accent-amber); animation: none; }
+      .status.listening { color: var(--text-accent); }
+      .status.listening .dot {
+        background: var(--accent-solid);
+        box-shadow: 0 0 8px var(--accent-solid);
+        animation: pulse 1.3s ease-in-out infinite;
+      }
+      .status.editing { color: var(--text-accent); }
+      .status.editing .dot {
+        background: var(--accent-solid);
+        box-shadow: 0 0 8px var(--accent-solid);
+        animation: pulseFast 0.8s ease-in-out infinite;
+      }
+      .status.recognizing { color: var(--text-accent); }
+      .status.recognizing .dot {
+        background: var(--accent-solid);
+        box-shadow: 0 0 8px var(--accent-solid);
+        animation: pulse 1.3s ease-in-out infinite;
+      }
+      .status.done { color: var(--success); }
+      .status.done .dot {
+        background: var(--success);
+        box-shadow: 0 0 6px var(--success);
+      }
+      .status.error { color: var(--error); }
+      .status.error .dot {
+        background: var(--error);
+        box-shadow: 0 0 6px var(--error);
+      }
       @keyframes pulse {
         0%, 100% { opacity: 1; transform: scale(1); }
         50% { opacity: 0.45; transform: scale(0.82); }
       }
+      @keyframes pulseFast {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.5; transform: scale(0.75); }
+      }
 
+      /* ---------- 原文预览 ---------- */
       .selected-text {
         font-size: 11px;
-        color: var(--ink-dim);
+        color: var(--text-dim);
         line-height: 1.3;
         margin-bottom: 4px;
         max-height: 28px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        opacity: 0;
+        max-height: 0;
+        margin-bottom: 0;
+        transition: opacity 0.2s ease, max-height 0.2s ease, margin 0.2s ease;
       }
-      .selected-text .label { color: var(--ink-acc); margin-right: 4px; }
+      .selected-text.show {
+        opacity: 1;
+        max-height: 28px;
+        margin-bottom: 4px;
+      }
+      .selected-text .label { color: var(--text-accent); margin-right: 4px; font-weight: 600; }
 
+      /* ---------- 文本区 ---------- */
       .text {
-        font-size: 14px;
-        font-weight: 700;
-        line-height: 1.3;
-        color: var(--ink);
-        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95);
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1.35;
+        color: var(--text);
         white-space: pre-wrap;
         word-break: break-all;
         max-height: 48px;
         overflow: hidden;
+        transition: color 0.15s ease;
       }
       .text .cursor {
         display: inline-block;
@@ -105,7 +196,7 @@
         height: 1em;
         margin-left: 2px;
         vertical-align: -0.14em;
-        background: #ffffff;
+        background: var(--accent-solid);
         animation: blink 1s steps(2) infinite;
       }
       @keyframes blink { 50% { opacity: 0; } }
@@ -113,17 +204,66 @@
       .text.placeholder {
         font-weight: 500;
         font-size: 12px;
-        color: var(--ink-dim);
-        text-shadow: none;
+        color: var(--text-dim);
+      }
+
+      /* 流式输出中：末尾柔和发光 */
+      .text.streaming .cursor {
+        box-shadow: 0 0 6px var(--accent-solid);
+      }
+
+      /* 完成：文字闪绿 */
+      .text.flash-done { animation: flashDone 0.9s ease; }
+      @keyframes flashDone {
+        0%   { transform: scale(0.98); color: var(--success); }
+        30%  { transform: scale(1.01); color: var(--success); }
+        100% { transform: scale(1); color: var(--text); }
+      }
+
+      /* 错误：抖动 */
+      .text.shake { animation: shake 0.4s ease; }
+      @keyframes shake {
+        0%, 100% { transform: translateX(0); }
+        25% { transform: translateX(-3px); }
+        75% { transform: translateX(3px); }
+      }
+
+      /* ---------- 进度条（编辑中） ---------- */
+      .progress {
+        height: 2px;
+        margin-top: 4px;
+        background: transparent;
+        border-radius: 2px;
+        overflow: hidden;
+        opacity: 0;
+        transition: opacity 0.2s ease;
+      }
+      .progress.show { opacity: 1; }
+      .progress::before {
+        content: "";
+        display: block;
+        width: 30%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, var(--accent-solid), transparent);
+        border-radius: 2px;
+        animation: slide 1.5s ease-in-out infinite;
+      }
+      @keyframes slide {
+        0%   { transform: translateX(-100%); }
+        100% { transform: translateX(400%); }
       }
     </style>
   </head>
   <body>
     <div class="stage">
-      <div class="panel">
-        <div class="status" id="status">等待编辑…</div>
-        <div class="selected-text" id="selected" style="display:none"><span class="label">原文：</span><span id="selected-content"></span></div>
+      <div class="panel" id="panel">
+        <div class="status" id="status">
+          <span class="dot"></span>
+          <span id="status-text">等待编辑…</span>
+        </div>
+        <div class="selected-text" id="selected"><span class="label">原文</span><span id="selected-content"></span></div>
         <div class="text placeholder" id="text">选中文本后按编辑键，说出修改要求</div>
+        <div class="progress" id="progress"></div>
       </div>
     </div>
 
@@ -131,19 +271,130 @@
       (function () {
         var textEl = document.getElementById("text");
         var statusEl = document.getElementById("status");
+        var statusTextEl = document.getElementById("status-text");
+        var panelEl = document.getElementById("panel");
         var selectedEl = document.getElementById("selected");
         var selectedContentEl = document.getElementById("selected-content");
+        var progressEl = document.getElementById("progress");
 
-        var llmText = "";
+        // ---------- 主题跟随 ----------
+        var THEME_STORAGE_KEY = "easyop.theme";
+
+        function readThemeMode() {
+          try {
+            var raw = localStorage.getItem(THEME_STORAGE_KEY);
+            if (raw === "dark" || raw === "light" || raw === "system") return raw;
+          } catch (err) {}
+          return "system";
+        }
+
+        function applyTheme() {
+          var mode = readThemeMode();
+          var resolved = mode;
+          if (mode === "system") {
+            resolved =
+              window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          }
+          document.documentElement.dataset.theme = resolved;
+        }
+
+        applyTheme();
+
+        window.addEventListener("storage", function (e) {
+          if (!e.key || e.key === THEME_STORAGE_KEY) applyTheme();
+        });
+
+        if (window.matchMedia) {
+          var media = window.matchMedia("(prefers-color-scheme: dark)");
+          var onSystemChange = function () {
+            if (readThemeMode() === "system") applyTheme();
+          };
+          if (media.addEventListener) media.addEventListener("change", onSystemChange);
+          else if (media.addListener) media.addListener(onSystemChange);
+        }
+
+        // ---------- 状态管理 ----------
+        var currentState = "idle"; // idle | fetching | listening | recognizing | editing | replacing | done | error
+
+        function setState(state, statusText) {
+          currentState = state;
+          if (statusText !== undefined) statusTextEl.textContent = statusText;
+
+          statusEl.className = "status " + state;
+          panelEl.className = "panel " + state;
+
+          // 进度条：编辑中显示
+          if (state === "editing" || state === "replacing") {
+            progressEl.classList.add("show");
+          } else {
+            progressEl.classList.remove("show");
+          }
+
+          // 文本类名清理
+          textEl.classList.remove("streaming", "flash-done", "shake");
+        }
+
+        function setSelectedText(text) {
+          if (text) {
+            selectedContentEl.textContent = text.length > 60 ? text.slice(0, 60) + "…" : text;
+            selectedEl.classList.add("show");
+          } else {
+            selectedEl.classList.remove("show");
+          }
+        }
 
         function setText(payload) {
           textEl.classList.remove("placeholder");
           textEl.textContent = payload;
         }
 
+        /**
+         * 把一段 ASR 识别结果贴到字幕上（编辑模式的"修改要求"）。
+         *
+         * ⛔ `setText` 必须**无条件**执行，只有"状态跃迁"才做判断。
+         *
+         * 曾经的写法把 `setText` 也塞进判据里：
+         * `if (currentState === "listening") { setText(...); setState("recognizing", ...); }`
+         * —— 它被自己的副作用挡住了：第一段 partial 把状态推到 `recognizing`，
+         * 第二段起就不满足 `listening`，字幕**停在最前面一两个字**不动。
+         * 用户看到的是"识别没出结果"，实际是显示层把自己锁死了（识别本身是好的，
+         * 所以第二次按下编辑键后完整文本立刻出现）。
+         *
+         * 唯一该拦的情况：识别早已收尾、已经进入改写阶段 —— 那时再来的迟到 partial
+         * 是上一轮的残响，不能盖掉正在流式输出的改写结果。
+         */
+        function applyAsrPartial(payload) {
+          if (currentState === "editing" || currentState === "replacing" || currentState === "done") {
+            return;
+          }
+          setText(payload);
+          if (currentState === "listening" || currentState === "idle") {
+            setState("recognizing", "识别修改要求…");
+          }
+        }
+
+        function triggerDoneFlash() {
+          textEl.classList.remove("flash-done");
+          void textEl.offsetWidth;
+          textEl.classList.add("flash-done");
+        }
+
+        function triggerErrorShake() {
+          textEl.classList.remove("shake");
+          void textEl.offsetWidth;
+          textEl.classList.add("shake");
+        }
+
+        // ---------- LLM 流式输出 ----------
+        var llmText = "";
+
         function appendLlmChunk(chunk) {
           if (llmText === "") {
             textEl.classList.remove("placeholder");
+            textEl.classList.add("streaming");
+            setState("editing", "编辑中…");
           }
           llmText += chunk;
           textEl.innerHTML = llmText + '<span class="cursor"></span>';
@@ -153,61 +404,89 @@
           llmText = "";
           textEl.classList.add("placeholder");
           textEl.textContent = "选中文本后按编辑键，说出修改要求";
-          selectedEl.style.display = "none";
-          statusEl.className = "status";
-          statusEl.textContent = "等待编辑…";
+          selectedEl.classList.remove("show");
+          setState("idle", "等待编辑…");
         }
 
+        // ---------- Tauri 事件 ----------
         var tauri = window.__TAURI__;
         if (tauri && tauri.event && tauri.event.listen) {
+          // 编辑状态变化
           tauri.event.listen("edit-state", function (e) {
             var s = e.payload || "";
-            // 编辑开始时重置全部状态，清除上次残留的 llmText / 字幕
-            if (/聆听/.test(s)) {
+            statusTextEl.textContent = s;
+
+            if (/正在提取/.test(s)) {
+              setState("fetching", s);
+              textEl.classList.add("placeholder");
+              textEl.textContent = "正在提取选中文本…";
+            } else if (/聆听/.test(s)) {
               reset();
+              setState("listening", s);
+              textEl.classList.remove("placeholder");
+              textEl.textContent = "";
+            } else if (/识别完成|正在编辑/.test(s)) {
+              setState("editing", s);
+            } else if (/正在替换/.test(s)) {
+              setState("replacing", s);
+            } else if (/完成/.test(s)) {
+              setState("done", s);
+              textEl.classList.remove("streaming");
+              triggerDoneFlash();
+            } else if (/失败|错误|不可用/.test(s)) {
+              setState("error", s);
+              textEl.classList.add("placeholder");
+              triggerErrorShake();
+            } else if (/未识别/.test(s)) {
+              setState("idle", s);
+              textEl.classList.add("placeholder");
+            } else {
+              statusEl.className = "status " + currentState;
             }
-            statusEl.textContent = s;
-            statusEl.className = "status";
-            if (/完成/.test(s)) statusEl.classList.add("done");
-            else if (/失败|错误|不可用/.test(s)) statusEl.classList.add("error");
           });
 
-          tauri.event.listen("edit-partial", function (e) {
-            setText(e.payload);
+          // ASR 流式字幕（编辑模式的"修改要求"）。
+          //
+          // ⛔ **只有一条通道**：后端 `asr::run_recognition` 发的是全局 `asr-partial`，
+          //    从来**没有** `edit-partial` 这个事件（全仓库 grep 不到发射点）。
+          //    原先这里挂着一个永远收不到的 `edit-partial` 监听 + 一个"兜底"的
+          //    `asr-partial` 监听 —— 后者把 `setText` 也放进了状态判断，于是
+          //    字幕只显示第一段。**死通道的存在本身就在诱导这种错误**，一并删掉。
+          tauri.event.listen("asr-partial", function (e) {
+            applyAsrPartial(e.payload);
           });
 
+          // 选中文本
           tauri.event.listen("edit-selected", function (e) {
-            var s = e.payload || "";
-            if (s) {
-              selectedContentEl.textContent = s.length > 60 ? s.slice(0, 60) + "…" : s;
-              selectedEl.style.display = "block";
-            }
+            setSelectedText(e.payload || "");
           });
 
+          // LLM 流式增量
           tauri.event.listen("edit-llm-chunk", function (e) {
             appendLlmChunk(e.payload);
           });
 
+          // 编辑完成
           tauri.event.listen("edit-done", function (e) {
             var r = e.payload;
             if (r && r.modified) {
+              textEl.classList.remove("streaming");
               textEl.innerHTML = r.modified;
             }
-            statusEl.textContent = "编辑完成";
-            statusEl.className = "status done";
+            setState("done", "编辑完成");
+            triggerDoneFlash();
           });
 
+          // 全局 asr-state（编辑模式下也会触发）
           tauri.event.listen("asr-state", function (e) {
             var s = e.payload || "";
             if (/正在听|聆听/.test(s)) {
-              statusEl.textContent = "正在听修改要求…";
-              statusEl.className = "status";
+              statusTextEl.textContent = "正在听修改要求…";
+              setState("listening", "正在听修改要求…");
               llmText = "";
+              textEl.classList.remove("placeholder");
+              textEl.textContent = "";
             }
-          });
-
-          tauri.event.listen("asr-partial", function (e) {
-            setText(e.payload);
           });
         }
       })();

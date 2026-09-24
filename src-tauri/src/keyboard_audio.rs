@@ -107,7 +107,22 @@ impl KeyboardAudioManager {
         *self.inner.audio_tx.lock().unwrap() = None;
     }
 
-    /// 停止监听线程（APP 退出时调用）。
+    /// 停止监听线程（进程退出时显式调用）。
+    ///
+    /// ⛔ **刻意不挂在 `Drop` 上。** 本类型是 `Clone` 的（内部 `Arc<Inner>`），
+    /// 而录音路径每次都只是 `keyboard_audio_clone()` 取一份**局部**克隆 ——
+    /// 一旦在 `Drop` 里停线程，那份局部克隆在函数返回时被释放，就会把
+    /// **全局唯一**的监听线程杀掉。
+    ///
+    /// 真实故障（2026-09-21）：`start_hold` 里 `let ka = self.keyboard_audio_clone();`
+    /// 在 `use_keyboard == false` 分支没有被 move，函数一返回就 drop ⇒ `shutdown()`
+    /// ⇒ 监听线程退出 ⇒ `last_heartbeat_ms` 再不更新 ⇒ `is_online()` **恒为 false**
+    /// ⇒ 板子麦克风永久失效、所有录音静默退回电脑麦克风。
+    /// 用户看到的是"按着板子上的键说话没反应"（对着板子说，电脑麦克风采不到），
+    /// 而日志里只有一行"监听线程已退出"，界面上一个字都没有 —— 典型的静默故障。
+    ///
+    /// 正确的生命周期模型：**监听线程 = 进程生命周期**，随进程退出自然结束；
+    /// 需要主动停时显式调用本函数。
     pub fn shutdown(&self) {
         self.inner.stop_flag.store(true, Ordering::Relaxed);
     }
@@ -127,11 +142,25 @@ impl KeyboardAudioManager {
             log_buffer::warn(format!("keyboard_audio: EICC 发送失败 action={action} err={e}"));
         }
     }
-}
 
-impl Drop for KeyboardAudioManager {
-    fn drop(&mut self) {
-        self.shutdown();
+    /// 一句话说明"板子音频通道现在是什么状态"，给日志与界面提示用。
+    ///
+    /// 为什么不直接看 `is_online()` 那个 bool：**"从没连上过"和"刚刚掉线"
+    /// 是两种病**，处置方向完全不同 —— 前者查板子的 Wi-Fi / 固件有没有在推流，
+    /// 后者查信号与供电。只给一个是非判断，排查就只能从零开始猜。
+    pub fn status_note(&self) -> String {
+        let last = self.inner.last_heartbeat_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return "从未收到开发板心跳（板子没连同一 Wi-Fi，或固件没在推流）".to_string();
+        }
+        let ago = now_ms().saturating_sub(last);
+        format!("最近一次心跳在 {ago} ms 前（超过 5 秒即判离线）")
+    }
+
+    /// 监听线程是否还在跑。**仅测试用** —— 存在的唯一理由就是给下面那条回归钉子提供判据。
+    #[cfg(test)]
+    pub fn is_listening(&self) -> bool {
+        !self.inner.stop_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -196,4 +225,57 @@ fn listen_loop(inner: Arc<Inner>) {
     }
 
     log_buffer::info("keyboard_audio: 监听线程已退出");
+}
+
+#[cfg(test)]
+mod tests {
+    //! 这一节存在的唯一理由：**监听线程是共享资源，不能被任何一次"局部借用结束"带走。**
+    //!
+    //! 它的失效方式是彻底静默的 —— 没有报错、没有弹窗，只是板子麦克风从此不可用，
+    //! 而录音静静地退回电脑麦克风。用户按着板子说话，声音却从另一个设备收，
+    //! 表现就是"语音识别坏了"，而日志里只有一行谁也不会注意的"监听线程已退出"。
+    use super::*;
+
+    /// ⛔ 回归钉子：**drop 一个 clone 不许停掉共享的监听线程**。
+    ///
+    /// 真实故障（2026-09-21）：本类型曾实现 `Drop` 并无条件 `shutdown()`。
+    /// 录音路径拿到的只是 `keyboard_audio_clone()` 产生的**局部**克隆，
+    /// 函数一返回就被 drop ⇒ 监听线程退出 ⇒ `is_online()` 恒为 false。
+    /// 当天 9 次"语音输入"全部失败、4 次"语音编辑"成功 3 次 —— 差异全部来自这里。
+    #[test]
+    fn dropping_a_clone_must_not_kill_the_shared_listener() {
+        // port = 0 ⇒ 让系统分配空闲端口，测试之间不会互相抢 17333。
+        let Ok(m) = KeyboardAudioManager::new(0) else {
+            return; // 环境不许绑 UDP 时跳过：环境问题不该变成一条红测
+        };
+
+        let borrowed = m.clone();
+        drop(borrowed);
+
+        assert!(
+            m.is_listening(),
+            "drop 一个 clone 不能停掉共享的监听线程 —— 录音函数拿到的就是局部 clone，\
+             停了它板子麦克风就永久失效，而且界面上完全看不出来"
+        );
+
+        m.shutdown();
+        assert!(!m.is_listening(), "显式 shutdown 才该真的停");
+    }
+
+    /// 状态说明必须能区分"从没连上过"和"刚掉线" —— 这两者的排查方向相反。
+    #[test]
+    fn status_note_distinguishes_never_connected_from_dropped() {
+        let Ok(m) = KeyboardAudioManager::new(0) else {
+            return;
+        };
+        let note = m.status_note();
+        assert!(
+            note.contains("从未收到"),
+            "没有心跳时应明确说\"从未连上\"，而不是含糊地报\"离线\"：{note}"
+        );
+        assert!(
+            !m.is_online(),
+            "没有任何心跳时绝不许判在线 —— 判在线会让宿主把静音当成\"用户没说话\""
+        );
+    }
 }

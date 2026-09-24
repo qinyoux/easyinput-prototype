@@ -47,7 +47,9 @@ src/
     ├── HotkeyBuilder.tsx     # 组合键编辑器（Ctrl+Alt+A 形式）
     ├── AppLibrary.tsx        # 本机应用页签：从开始菜单枚举 / 手动添加 / 测试打开
     ├── VoicePanel.tsx        # 语音输入页签：PTT 模式切换 / 录音控制
-    ├── VoiceSettings.tsx     # 语音设置页签：ASR / LLM / Wi-Fi / 蓝牙配置
+    ├── GeneralSettings.tsx   # 设置页签：通信 / 主题 / Everything / 文本注入 / 终端启动（非模型/服务类）
+    ├── ApiSettings.tsx       # 「模型配置」页签：ASR / 语音编辑 LLM / TTS / 执行器
+    ├── DriverEditor.tsx      # 执行器编辑区：按形态分流字段 + 增删 + 探测（被 ApiSettings 引用）
     └── LogPanel.tsx          # 日志面板（折叠式）
 ```
 
@@ -62,7 +64,9 @@ src/
 | `validation.ts` | 下发前的前端预校验，拦截不合法配置 |
 | `RemapEditor.tsx` | 按键配置核心交互：选键 → 编辑动作 → 下发 |
 | `VoicePanel.tsx` | 语音 PTT 触发、模式切换、浮层开关 |
-| `VoiceSettings.tsx` | ASR / LLM 连接配置与测试 |
+| `GeneralSettings.tsx` | 非 API 的通用设置：设备通信 / 主题 / Everything / 文本注入 / 终端启动 |
+| `ApiSettings.tsx` | 所有外部模型/服务配置（ASR / 语音编辑 LLM / TTS / 执行器），按键立即生效、凭据显式保存 |
+| `DriverEditor.tsx` | **执行器的唯一编辑入口**：Api 型只露 4 字段、Cli 型 3 字段，其余收进「高级选项」；含按需添加 / 删除（连带清槽位绑定）/ 探测 |
 
 ## 三、后端 `src-tauri/src/`
 
@@ -81,6 +85,12 @@ src-tauri/src/
 ├── state.rs                 # 共享状态与持久化（配置文件读写）
 ├── system_apps.rs           # 本机应用枚举（从开始菜单 / 注册表扫描）
 ├── validate.rs              # 后端配置校验（与前端 validation.ts 对齐）
+├── pinyin.rs                # 拼音全拼 / 简拼 / 单词缩写匹配
+├── everything.rs            # Everything 命令行集成（可选，未安装自动降级）
+├── ss_palette.rs            # ⌘SS 命令面板：三层评分搜索 + 执行 + 内置工具表
+├── mini_apps.rs             # 小程序注册表：外部 App / Web 项目 / 项目目录的集成与启动
+├── screenshot.rs            # 全屏抓取（GDI BitBlt）+ 手写 PNG 编码
+├── workbench.rs             # KEY4 浮窗提示词库（随方案切换的提示词增删改 + 上屏）
 ├── ptt_hook.rs              # WH_KEYBOARD_LL 低级键盘钩子（PTT 触发引擎）
 ├── session.rs               # 录音识别会话状态机（Hold / Call 两种模式）
 ├── audio.rs                 # 电脑麦克风采集 + 重采样（cpal）
@@ -101,7 +111,7 @@ src-tauri/src/
 |------|------|------|
 | **入口** | `main.rs`, `lib.rs` | 程序启动、Tauri 命令注册、托盘菜单、浮层窗口、PTT 调度 |
 | **命令层** | `commands.rs` | 前端 invoke 的后端入口，映射到各业务模块 |
-| **数据模型** | `model.rs`, `state.rs` | ActionSpec / Profile / AppEntry 定义 + 持久化 |
+| **数据模型** | `model.rs`, `state.rs` | ActionSpec / Profile（含提示词 `prompts`）/ AppEntry 定义 + 持久化 |
 | **固件通信** | `payload.rs`, `transport.rs`, `device.rs`, `constants.rs` | HID 枚举、配置下发、回执解析、协议常量 |
 | **Host Action** | `host_action.rs`, `launcher.rs`, `system_apps.rs` | 后台监听 0x11 报文 → UUID 查找 → 打开目标 |
 | **语音输入** | `ptt_hook.rs`, `session.rs`, `audio.rs`, `asr.rs`, `text_delivery.rs` | PTT 钩子 → 会话状态机 → 麦克风采集 → 流式识别 → 文本注入 |

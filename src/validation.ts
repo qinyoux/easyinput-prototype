@@ -1,5 +1,6 @@
 // 前端预校验，严格镜像后端 `validate.rs` / 固件判定；后端仍是最终真源。
 import type { ActionSpec, AppTarget } from "./types";
+import { DESK_SLOT_OPTIONS } from "./constants";
 
 /** 去掉空格/下划线/连字符并转小写，与固件 `normalize` 一致。 */
 export function normalizeToken(token: string): string {
@@ -152,6 +153,12 @@ export function validateAction(
       return validateText(action.value, maxTextBytes);
     case "host_action":
       return validateHostAction(action.value, prefix);
+    case "task_desk":
+      // 槽位号取自 `DESK_SLOT_OPTIONS`（与后端 `desk_slot()` 的 1..=4 同源），
+      // 不在这里再写一遍数字：多一处字面量就多一个"改了 A 忘了 B"的机会。
+      return DESK_SLOT_OPTIONS.some((o) => o.value === action.value)
+        ? null
+        : `任务台槽位非法：${action.value || "（空）"}（应为 1–4，即 S1–S4）`;
     default:
       return "未知动作类型";
   }

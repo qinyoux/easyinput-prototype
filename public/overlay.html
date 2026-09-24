@@ -1,24 +1,55 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>easyop 字幕</title>
     <style>
-      :root {
-        --panel: rgba(12, 10, 18, 0.72);
-        --panel-edge: rgba(255, 255, 255, 0.14);
-        --ink: #ffffff;
-        --ink-acc: #cdb3ff;
-        --accent: #8f6bff;
+      /*
+       * 独立页面（不走 Vite 打包），令牌按 styles.css 的深/浅两套各抄一份最小集，
+       * 只保留这里真正用到的键。主题来源与主窗口一致：localStorage `easyop.theme`
+       * + `prefers-color-scheme`，靠 `storage` 事件跟随主窗口的实时切换。
+       */
+      :root,
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --panel-rgb: 23, 27, 44;
+        --border: rgba(255, 255, 255, 0.12);
+        --text: #e8eaf2;
+        --text-dim: #98a0b8;
+        --text-accent: #ffc2a8;
+        --accent-solid: #ff6b35;
+        --accent-rgb: 255, 107, 53;
+        --shadow: rgba(0, 0, 0, 0.55);
+        --success: #34d399;
+        --error: #fbbf24;
+        --panel-idle: rgba(var(--panel-rgb), 0.6);
+        --panel-active: rgba(var(--panel-rgb), 0.82);
       }
+      [data-theme="light"] {
+        color-scheme: light;
+        --panel-rgb: 255, 255, 255;
+        --border: rgba(0, 0, 0, 0.08);
+        --text: #1c1917;
+        --text-dim: #78716c;
+        --text-accent: #c2410c;
+        --accent-solid: #c2410c;
+        --accent-rgb: 255, 107, 53;
+        --shadow: rgba(28, 25, 23, 0.22);
+        --success: #059669;
+        --error: #d97706;
+        --panel-idle: rgba(var(--panel-rgb), 0.7);
+        --panel-active: rgba(var(--panel-rgb), 0.9);
+      }
+
       * { box-sizing: border-box; }
+
       html, body {
         margin: 0;
         height: 100%;
         overflow: hidden;
         background: transparent;
-        font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
         -webkit-font-smoothing: antialiased;
       }
 
@@ -30,7 +61,7 @@
         flex-direction: column;
         justify-content: flex-end;
         align-items: center;
-        padding: 10px;
+        padding: 8px;
         user-select: none;
         -webkit-user-select: none;
         cursor: default;
@@ -43,7 +74,10 @@
         pointer-events: none;
         overflow: hidden;
         z-index: 0;
+        opacity: 0;
+        transition: opacity 0.4s ease;
       }
+      .notes.on { opacity: 1; }
       .note {
         position: absolute;
         bottom: -40px;
@@ -62,55 +96,100 @@
         100% { transform: translateY(-130px) translateX(-14px) rotate(-24deg) scale(1.15); opacity: 0; }
       }
 
-      /* 字幕面板：高对比白字，与彩色音符背景不冲突 */
+      /* ---------- 面板 ---------- */
       .panel {
         position: relative;
         z-index: 2;
         width: 100%;
         max-width: 100%;
         padding: 6px 10px;
-        background: var(--panel);
-        border: 1px solid var(--panel-edge);
+        background: var(--panel-idle);
+        border: 1px solid var(--border);
         border-radius: 10px;
-        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 16px rgba(143, 107, 255, 0.12);
-        backdrop-filter: blur(4px);
+        box-shadow: 0 4px 14px var(--shadow), inset 0 0 12px rgba(var(--accent-rgb), 0.06);
+        backdrop-filter: blur(10px) saturate(1.4);
+        -webkit-backdrop-filter: blur(10px) saturate(1.4);
+        transition: background 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+      }
+      .panel.listening {
+        background: var(--panel-active);
+        box-shadow: 0 6px 20px var(--shadow), inset 0 0 16px rgba(var(--accent-rgb), 0.12);
+        border-color: rgba(var(--accent-rgb), 0.35);
+      }
+      .panel.done {
+        background: var(--panel-active);
+      }
+      /* 识别中：与 listening 同色。⚠️ 少了这条，`setState("recognizing")` 会把面板
+         打回 idle 的半透明底 —— 正在出字幕时反而"看暗了"，像已经停了。 */
+      .panel.recognizing {
+        background: var(--panel-active);
+      }
+      .panel.error {
+        background: var(--panel-active);
       }
 
+      /* ---------- 状态栏 ---------- */
       .status {
         display: flex;
         align-items: center;
         gap: 6px;
         font-size: 9px;
         letter-spacing: 0.04em;
-        color: var(--ink-acc);
+        color: var(--text-dim);
         margin-bottom: 3px;
-        opacity: 0.9;
+        opacity: 0.85;
+        transition: color 0.2s ease;
       }
-      .status::before {
-        content: "";
+      .status .dot {
         width: 6px;
         height: 6px;
         border-radius: 50%;
-        background: var(--accent);
-        box-shadow: 0 0 8px var(--accent);
-        animation: pulse 1.3s ease-in-out infinite;
+        background: var(--text-dim);
         flex-shrink: 0;
+        transition: background 0.2s ease, box-shadow 0.2s ease;
+      }
+      .status.listening { color: var(--text-accent); }
+      .status.listening .dot {
+        background: var(--accent-solid);
+        box-shadow: 0 0 8px var(--accent-solid);
+        animation: pulse 1.3s ease-in-out infinite;
+      }
+      .status.done { color: var(--success); opacity: 1; }
+      .status.recognizing { color: var(--text-accent); }
+      .status.recognizing .dot {
+        background: var(--accent-solid);
+        box-shadow: 0 0 8px var(--accent-solid);
+        animation: pulse 1.3s ease-in-out infinite;
+      }
+      .status.done .dot {
+        background: var(--success);
+        box-shadow: 0 0 6px var(--success);
+      }
+      .status.error { color: var(--error); opacity: 1; }
+      .status.error .dot {
+        background: var(--error);
+        box-shadow: 0 0 6px var(--error);
       }
       @keyframes pulse {
         0%, 100% { opacity: 1; transform: scale(1); }
         50% { opacity: 0.45; transform: scale(0.82); }
       }
 
+      /* ---------- 文本区 ---------- */
       .text {
-        font-size: 15px;
-        font-weight: 700;
-        line-height: 1.2;
-        color: var(--ink);
-        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.8);
+        font-size: 14px;
+        font-weight: 600;
+        line-height: 1.25;
+        color: var(--text);
+        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
         white-space: nowrap;
         overflow-x: auto;
         overflow-y: hidden;
         scrollbar-width: none;
+        transition: color 0.15s ease;
+      }
+      [data-theme="light"] .text {
+        text-shadow: 0 1px 4px rgba(255, 255, 255, 0.6);
       }
       .text::-webkit-scrollbar { display: none; }
       .text .cursor {
@@ -119,7 +198,7 @@
         height: 1em;
         margin-left: 2px;
         vertical-align: -0.14em;
-        background: #ffffff;
+        background: var(--accent-solid);
         animation: blink 1s steps(2) infinite;
       }
       @keyframes blink { 50% { opacity: 0; } }
@@ -127,22 +206,53 @@
       .text.placeholder {
         font-weight: 500;
         font-size: 12px;
-        color: rgba(255, 255, 255, 0.55);
+        color: var(--text-dim);
         text-shadow: none;
       }
-      .text.flash { animation: flash 0.8s ease; }
-      @keyframes flash {
-        0% { transform: scale(0.985); color: var(--ink-acc); }
-        100% { transform: scale(1); color: var(--ink); }
+
+      /* 上屏成功：文字闪一下绿色 */
+      .text.flash-success { animation: flashSuccess 0.9s ease; }
+      @keyframes flashSuccess {
+        0%   { transform: scale(0.98); color: var(--success); }
+        30%  { transform: scale(1.01); color: var(--success); }
+        100% { transform: scale(1); color: var(--text); }
+      }
+
+      /* 错误：文字轻微抖动 */
+      .text.shake { animation: shake 0.4s ease; }
+      @keyframes shake {
+        0%, 100% { transform: translateX(0); }
+        25% { transform: translateX(-3px); }
+        75% { transform: translateX(3px); }
+      }
+
+      /* 正在识别：文字末尾呼吸光点 */
+      .text.recognizing::after {
+        content: "";
+        display: inline-block;
+        width: 4px;
+        height: 4px;
+        margin-left: 4px;
+        vertical-align: middle;
+        background: var(--accent-solid);
+        border-radius: 50%;
+        animation: breathe 1.2s ease-in-out infinite;
+      }
+      @keyframes breathe {
+        0%, 100% { opacity: 0.3; transform: scale(0.8); }
+        50% { opacity: 1; transform: scale(1.2); }
       }
     </style>
   </head>
   <body>
     <div class="stage">
       <div class="notes" id="notes"></div>
-      <div class="panel">
-        <div class="status" id="status">等待语音…</div>
-        <div class="text placeholder" id="text">按 PTT 键说话，这里实时显示识别文字</div>
+      <div class="panel" id="panel">
+        <div class="status" id="status">
+          <span class="dot"></span>
+          <span id="status-text">等待语音…</span>
+        </div>
+        <div class="text placeholder" id="text">按 PTT 键说话，实时显示识别文字</div>
       </div>
     </div>
 
@@ -150,10 +260,81 @@
       (function () {
         var textEl = document.getElementById("text");
         var statusEl = document.getElementById("status");
+        var statusTextEl = document.getElementById("status-text");
+        var panelEl = document.getElementById("panel");
         var notesEl = document.getElementById("notes");
 
+        // ---------- 主题跟随 ----------
+        var THEME_STORAGE_KEY = "easyop.theme";
+
+        function readThemeMode() {
+          try {
+            var raw = localStorage.getItem(THEME_STORAGE_KEY);
+            if (raw === "dark" || raw === "light" || raw === "system") return raw;
+          } catch (err) {}
+          return "system";
+        }
+
+        function applyTheme() {
+          var mode = readThemeMode();
+          var resolved = mode;
+          if (mode === "system") {
+            resolved =
+              window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          }
+          document.documentElement.dataset.theme = resolved;
+        }
+
+        applyTheme();
+
+        window.addEventListener("storage", function (e) {
+          if (!e.key || e.key === THEME_STORAGE_KEY) applyTheme();
+        });
+
+        if (window.matchMedia) {
+          var media = window.matchMedia("(prefers-color-scheme: dark)");
+          var onSystemChange = function () {
+            if (readThemeMode() === "system") applyTheme();
+          };
+          if (media.addEventListener) media.addEventListener("change", onSystemChange);
+          else if (media.addListener) media.addListener(onSystemChange);
+        }
+
+        // ---------- 状态管理 ----------
+        var currentState = "idle"; // idle | listening | recognizing | done | error
+
+        function setState(state, statusText) {
+          currentState = state;
+          if (statusText !== undefined) statusTextEl.textContent = statusText;
+
+          // 状态栏样式
+          statusEl.className = "status " + state;
+
+          // 面板样式
+          panelEl.className = "panel " + state;
+
+          // 音符动画：聆听时开启
+          if (state === "listening" || state === "recognizing") {
+            notesEl.classList.add("on");
+            if (!noteTimer) startNotes();
+          } else {
+            notesEl.classList.remove("on");
+            stopNotes();
+          }
+
+          // 文本区样式
+          textEl.classList.remove("recognizing", "flash-success", "shake");
+          if (state === "recognizing") {
+            textEl.classList.add("recognizing");
+          }
+        }
+
+        // ---------- 音符动画 ----------
         var glyphs = ["♪", "♫", "♩", "♬", "♭", "♮", "𝄞", "𝄢"];
-        var hues = [265, 300, 210, 340, 185, 255, 320];
+        var hues = [20, 30, 40, 15, 25, 35, 45];  // 珊瑚橙系色调
+        var noteTimer = null;
 
         function spawnNote() {
           var el = document.createElement("span");
@@ -162,16 +343,29 @@
           el.style.left = Math.random() * 100 + "%";
           el.style.fontSize = 16 + Math.random() * 26 + "px";
           var hue = hues[Math.floor(Math.random() * hues.length)];
-          el.style.color = "hsl(" + hue + ", 88%, 66%)";
+          el.style.color = "hsl(" + hue + ", 90%, 62%)";
           var dur = 5 + Math.random() * 4;
           el.style.animationDuration = dur + "s";
-          el.style.animationDelay = "0s";
           notesEl.appendChild(el);
           el.addEventListener("animationend", function () { el.remove(); });
         }
-        for (var i = 0; i < 5; i++) { spawnNote(); }
-        setInterval(spawnNote, 380);
 
+        function startNotes() {
+          if (noteTimer) return;
+          for (var i = 0; i < 3; i++) {
+            setTimeout(spawnNote, i * 150);
+          }
+          noteTimer = setInterval(spawnNote, 400);
+        }
+
+        function stopNotes() {
+          if (noteTimer) {
+            clearInterval(noteTimer);
+            noteTimer = null;
+          }
+        }
+
+        // ---------- 文本更新 ----------
         function setText(payload) {
           textEl.classList.remove("placeholder");
           textEl.textContent = payload;
@@ -179,25 +373,70 @@
           textEl.scrollLeft = textEl.scrollWidth;
         }
 
-        // 通过 withGlobalTauri 注入的全局 Tauri API 监听事件
+        function triggerSuccessFlash() {
+          textEl.classList.remove("flash-success");
+          void textEl.offsetWidth;
+          textEl.classList.add("flash-success");
+        }
+
+        function triggerErrorShake() {
+          textEl.classList.remove("shake");
+          void textEl.offsetWidth;
+          textEl.classList.add("shake");
+        }
+
+        // ---------- Tauri 事件 ----------
         var tauri = window.__TAURI__;
         if (tauri && tauri.event && tauri.event.listen) {
-          tauri.event.listen("asr-partial", function (e) { setText(e.payload); });
+          // 部分识别结果 → 识别中
+          tauri.event.listen("asr-partial", function (e) {
+            // ⛔ **空帧不能上屏**。本机 ASR 走的是 `.../bigmodel_nostream` 端点，
+            //    识别过程中服务端回的每一帧文本都是空的（实测 #1~#22 全为 `""`）。
+            //    照单全收就会用空格把已有内容一遍遍擦掉 —— 浮层看起来"什么都没显示"，
+            //    而后端日志里"识别成功 N 字"一切正常。真正的文本由 `asr-final` 给出。
+            var t = e.payload == null ? "" : String(e.payload);
+            if (!t.trim()) return;
+            setText(t);
+            if (currentState === "listening" || currentState === "idle") {
+              setState("recognizing", "识别中…");
+            }
+          });
+
+          // 最终结果：**只贴文本，不下"已注入"的结论**。
+          //
+          // ⛔ 浮层没有资格断言"已经进输入框"：`asr-final` 是在**注入之前**发的
+          // （后端先让用户看到识别结果，再做注入），而注入完全可能失败。
+          // 真正的结论由随后那两条 status 给出 —— `已注入输入框…` 或注入失败的告警。
           tauri.event.listen("asr-final", function (e) {
             setText(e.payload);
-            statusEl.textContent = "已上屏";
-            textEl.classList.remove("flash");
-            void textEl.offsetWidth;
-            textEl.classList.add("flash");
+            setState("done", "识别完成");
+            triggerSuccessFlash();
           });
+
+          // 状态变化
           tauri.event.listen("asr-state", function (e) {
             var s = e.payload || "";
-            statusEl.textContent = s;
-            if (/正在|通话|聆听/.test(s)) {
+            statusTextEl.textContent = s;
+
+            if (/正在听|聆听|通话中/.test(s)) {
+              // 开始聆听
+              setState("listening", s);
               textEl.classList.remove("placeholder");
-              textEl.textContent = "";  // 清空上次残留字幕
-            } else if (/未识别|结束|请先|失败/.test(s)) {
+              textEl.textContent = "";
+            } else if (/正在上屏|正在识别/.test(s)) {
+              setState("recognizing", s);
+            } else if (/已注入|已上屏|完成/.test(s)) {
+              setState("done", s);
+            } else if (/失败|错误|不可用/.test(s)) {
+              setState("error", s);
               textEl.classList.add("placeholder");
+              triggerErrorShake();
+            } else if (/未识别|结束|请先|请稍候/.test(s)) {
+              setState("idle", s);
+              textEl.classList.add("placeholder");
+            } else {
+              // 其他状态保持原状，只更新文案
+              statusEl.className = "status " + currentState;
             }
           });
         }

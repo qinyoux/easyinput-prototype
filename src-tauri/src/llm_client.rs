@@ -11,10 +11,41 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 use crate::log_buffer;
+
+/// 请求体预览（截断后进日志）。
+///
+/// 日志里只写"prompt 长度 173"是没法排查的 —— 出的错往往是**内容**引起的
+/// （模板少了占位符、上下文里混进了别的语言、模型名写错）。截断到 600 字符
+/// 足以看清结构，又不至于让一条日志刷满整屏。
+fn body_preview(body: &serde_json::Value) -> String {
+    const MAX: usize = 600;
+    let s = serde_json::to_string(body).unwrap_or_default();
+    if s.chars().count() <= MAX {
+        return s;
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}…（共 {} 字符）", s.chars().count())
+}
+
+/// 响应头里可用于向服务端追查的 ID。
+///
+/// 提工单时对方第一句话就是"给我 request id"。没有它，服务端侧的日志翻不出来，
+/// 而这类查不动的故障最容易被归为"偶发"然后搁置。
+fn trace_id(resp: &reqwest::Response) -> String {
+    for k in ["x-request-id", "x-tt-logid", "x-tt-log-id", "request-id", "x-trace-id"] {
+        if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
+            if !v.is_empty() {
+                return format!("{k}={v}");
+            }
+        }
+    }
+    "-".to_string()
+}
 
 /// LLM 后端类型。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +84,67 @@ impl Default for LlmConfig {
             timeout_secs: 30,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 通用对话接口（Capability Core 的 `chat` / `chat_stream`）
+//
+// `stream_edit` 是特化的单轮编辑（system prompt 写死为"文本编辑助手"），只服务
+// 语音编辑那一条链路。插件体系的 `eo.chat`、内容台的生成/润色都需要**通用**补全，
+// 因此这里补一对与后端解耦的通用接口。两者共用同一份 `LlmConfig` 与连接池。
+// ---------------------------------------------------------------------------
+
+/// 通用对话消息（OpenAI 兼容的 role/content 二元组）。
+///
+/// 需要 `Deserialize`：前端经 `invoke` 传入时直接反序列化。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: "system".to_string(), content: content.into() }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: "user".to_string(), content: content.into() }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant".to_string(), content: content.into() }
+    }
+}
+
+/// 通用对话选项。全部字段可选，缺省即走后端默认。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ChatOptions {
+    /// 前置 system 提示词。与 `messages` 里已有的 system 并存（它排在最前）。
+    #[serde(default)]
+    pub system: Option<String>,
+    /// 采样温度。仅当显式给出时才写入请求体——避免给不支持该参数的模型添乱。
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// 输出上限。同上，仅显式给出时才写。
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// 是否对输出做清理（去 markdown 围栏、去首尾配对引号）。缺省 true。
+    /// 生成正文时保持 true；生成 JSON / 代码时应显式传 false。
+    #[serde(default)]
+    pub clean: Option<bool>,
+}
+
+/// 构建 chat/completions 的 messages 数组（含可选的前置 system）。
+fn build_chat_messages(messages: &[ChatMessage], opts: &ChatOptions) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(sys) = opts.system.as_ref().filter(|s| !s.trim().is_empty()) {
+        out.push(serde_json::json!({ "role": "system", "content": sys }));
+    }
+    for m in messages {
+        out.push(serde_json::json!({ "role": m.role, "content": m.content }));
+    }
+    out
 }
 
 /// LLM 编辑请求。
@@ -165,6 +257,7 @@ impl LlmClient {
             req.voice_text.len(),
             config.api_key.len()
         ));
+        log_buffer::info(format!("LLM 请求体: {}", body_preview(&body)));
 
         // clone Client（内部 Arc，开销极低）后立即释放 MutexGuard，避免跨 await 持有非 Send 锁。
         let http_client = self.inner.client.lock().unwrap().clone();
@@ -183,21 +276,34 @@ impl LlmClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let tid = trace_id(&resp);
             let bytes = resp.bytes().await.unwrap_or_default();
             let text = String::from_utf8_lossy(&bytes);
             let err = format!("LLM 返回错误 {status}: {text}");
-            log_buffer::err(format!("{err}"));
+            log_buffer::err(format!(
+                "{err}｜endpoint={}｜耗时={}ms｜{tid}",
+                config.endpoint,
+                start.elapsed().as_millis()
+            ));
             return Err(err);
         }
 
         log_buffer::info(format!(
-            "LLM 响应: status={} content-type={:?} content-length={:?}",
+            "LLM 响应: status={} content-type={:?} content-length={:?} 耗时={}ms {tid}",
             resp.status(),
             resp.headers().get("content-type").map(|v| v.to_str().unwrap_or("?")),
             resp.headers().get("content-length").map(|v| v.to_str().unwrap_or("?")),
+            start.elapsed().as_millis(),
+            tid = trace_id(&resp),
         ));
 
         let mut full_text = String::new();
+
+        // ⛔ 明确告诉前端"改写流开始"：前端的字幕区在识别阶段显示的是 ASR 原话，
+        // 从这一刻起要换成 LLM 的流式输出。少了这个信号，前端把 LLM 增量**追加**
+        // 到还没清掉的原话后面，用户看到的就是"字幕里混进了别的字"——
+        // 两段语义完全不同、来源也不同的文本被拼成了一段。
+        let _ = app.emit("edit-llm-start", ());
 
         // 用 bytes() + from_utf8_lossy 代替 text()，绕过 reqwest 在 rustls-tls
         // (default-features=false) 下 text() 的 "error decoding response body" 问题。
@@ -253,6 +359,209 @@ impl LlmClient {
             duration_ms,
             fallback: None,
         })
+    }
+
+    /// 通用补全（非流式）。返回清理后的纯文本。
+    ///
+    /// 这是插件 `eo.chat` 与内容台生成链路的统一落点，与 `stream_edit` 共用
+    /// 同一份 `LlmConfig` 与 reqwest 连接池。
+    pub async fn chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        opts: ChatOptions,
+    ) -> Result<String, String> {
+        let config = self.config();
+        if config.api_key.is_empty() {
+            return Err("LLM API Key 未配置，请在设置中填写".to_string());
+        }
+
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "stream": false,
+            "messages": build_chat_messages(&messages, &opts),
+        });
+        if let Some(t) = opts.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(mt) = opts.max_tokens {
+            body["max_tokens"] = serde_json::json!(mt);
+        }
+
+        let start = std::time::Instant::now();
+        log_buffer::info(format!(
+            "LLM chat 请求: model={} endpoint={} msgs={} temperature={:?} max_tokens={:?}",
+            config.model, config.endpoint, messages.len(), opts.temperature, opts.max_tokens
+        ));
+        log_buffer::info(format!("LLM chat 请求体: {}", body_preview(&body)));
+        let http_client = self.inner.client.lock().unwrap().clone();
+        let resp = http_client
+            .post(&config.endpoint)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("LLM 请求失败: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let tid = trace_id(&resp); // 必须在 bytes() 消费 resp 之前取
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let err = format!("LLM 返回错误 {status}: {}", String::from_utf8_lossy(&bytes));
+            log_buffer::err(format!(
+                "{err}｜endpoint={}｜耗时={}ms｜{tid}",
+                config.endpoint,
+                start.elapsed().as_millis()
+            ));
+            return Err(err);
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| format!("响应读取失败: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("响应解析失败: {e}"))?;
+        let content = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if content.trim().is_empty() {
+            return Err("LLM 返回空内容".to_string());
+        }
+
+        let out = if opts.clean.unwrap_or(true) {
+            clean_llm_output(&content)
+        } else {
+            content.trim().to_string()
+        };
+        log_buffer::info(format!(
+            "LLM chat 完成: duration={}ms out_len={} msgs={}",
+            start.elapsed().as_millis(),
+            out.len(),
+            messages.len()
+        ));
+        Ok(out)
+    }
+
+    /// 通用补全（真流式）。每个增量文本块通过 `on_delta` 回调抛出，返回拼接后的完整文本。
+    ///
+    /// 与 `stream_edit` 的关键区别：`stream_edit` 用 `bytes()` 整读响应体后再按行切 SSE，
+    /// 首字延迟等于整段生成时间；这里走 `bytes_stream()` 逐块解析，是真流式。
+    /// 生成 950 字正文这类长输出时必须用这个，否则用户要干等十几秒才见到第一个字。
+    pub async fn chat_stream<F>(
+        &self,
+        messages: Vec<ChatMessage>,
+        opts: ChatOptions,
+        mut on_delta: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str),
+    {
+        let config = self.config();
+        if config.api_key.is_empty() {
+            return Err("LLM API Key 未配置，请在设置中填写".to_string());
+        }
+
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "stream": true,
+            "messages": build_chat_messages(&messages, &opts),
+        });
+        if let Some(t) = opts.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(mt) = opts.max_tokens {
+            body["max_tokens"] = serde_json::json!(mt);
+        }
+
+        let start = std::time::Instant::now();
+        log_buffer::info(format!(
+            "LLM stream 请求: model={} endpoint={} msgs={} temperature={:?} max_tokens={:?}",
+            config.model, config.endpoint, messages.len(), opts.temperature, opts.max_tokens
+        ));
+        log_buffer::info(format!("LLM stream 请求体: {}", body_preview(&body)));
+        let http_client = self.inner.client.lock().unwrap().clone();
+        let resp = http_client
+            .post(&config.endpoint)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("LLM 请求失败: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let tid = trace_id(&resp); // 必须在 bytes() 消费 resp 之前取
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let err = format!("LLM 返回错误 {status}: {}", String::from_utf8_lossy(&bytes));
+            log_buffer::err(format!(
+                "{err}｜endpoint={}｜耗时={}ms｜{tid}",
+                config.endpoint,
+                start.elapsed().as_millis()
+            ));
+            return Err(err);
+        }
+
+        let mut full_text = String::new();
+        // chunk 边界可能切断一行 SSE，因此用行缓冲：只有遇到换行才解析。
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("SSE 读取失败: {e}"))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string();
+                buf.drain(..pos + 1);
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    if let Some(delta) = parse_sse_delta(data) {
+                        if !delta.is_empty() {
+                            full_text.push_str(&delta);
+                            on_delta(&delta);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 收尾：处理最后一行没有换行结尾的残留。
+        let tail = buf.trim();
+        if let Some(data) = tail.strip_prefix("data: ") {
+            if data != "[DONE]" {
+                if let Some(delta) = parse_sse_delta(data) {
+                    full_text.push_str(&delta);
+                    on_delta(&delta);
+                }
+            }
+        }
+
+        if full_text.trim().is_empty() {
+            return Err("LLM 返回空内容".to_string());
+        }
+
+        let out = if opts.clean.unwrap_or(true) {
+            clean_llm_output(&full_text)
+        } else {
+            full_text.trim().to_string()
+        };
+        log_buffer::info(format!(
+            "LLM chat_stream 完成: duration={}ms out_len={} msgs={}",
+            start.elapsed().as_millis(),
+            out.len(),
+            messages.len()
+        ));
+        Ok(out)
     }
 
     /// 测试连接（非流式，发送简短请求验证 API Key）。

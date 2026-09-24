@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<title>内容台面板预览（真渲染）</title>
+<!--
+  面板渲染验证页。用途：不启动 easyop，就把 plugins/builtin/studio 的面板 UI 真渲染一遍。
+
+  做法与宿主一致：给出 `context`（含桩 eo.*），动态 import index.js，activate，再执行 studio.toggle。
+  然后把这个文件用 Chrome headless 截图，肉眼确认布局/主题令牌/层级都对。
+
+  这是**渲染验证**，不是逻辑验证——逻辑归 test/harness.mjs 管。
+-->
+<style>
+  /* 复制 easyop 的主题令牌（src/styles.css 的 [data-theme] 块），
+     这样面板里的 var(--panel) 等能取到真值，而不是落到兜底色。 */
+  [data-theme="dark"] {
+    --bg: #0f1220; --panel: #171b2c; --panel-2: #1f2438;
+    --border: #2a3048; --text: #e8eaf2; --text-dim: #98a0b8;
+    --accent: #ff6b35; --accent-text: #ff6b35;
+    --ok: #35c28a; --err: #ff5a6e;
+    --shadow: rgba(0,0,0,.4);
+    --radius-sm: 8px; --radius-md: 10px; --radius-lg: 12px;
+    --font-sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--font-sans); font-size: 13px;
+  }
+  /* 模拟 easyop 主窗的内容区（面板是挂在主窗里的浮层，所以要看它盖在什么上面） */
+  .fake-app { padding: 16px; }
+  .fake-app h1 { font-size: 15px; font-weight: 500; margin: 0 0 4px; }
+  .fake-app p  { color: var(--text-dim); margin: 0 0 12px; }
+  .fake-card {
+    border: 1px solid var(--border); background: var(--panel);
+    border-radius: var(--radius-md); padding: 10px; margin-bottom: 8px;
+  }
+</style>
+</head>
+<body>
+  <div class="fake-app">
+    <h1>easyop 主窗（模拟）</h1>
+    <p>右侧浮层即内容台面板。数据为桩 eo.* 提供。</p>
+    <div class="fake-card">方案库 · Vinno 超声</div>
+    <div class="fake-card">按键映射 · 4×2 + 编码器</div>
+    <div class="fake-card">语音设置 · 豆包 ASR / LLM</div>
+  </div>
+
+<script type="module">
+  // ── 桩 eo.*：数据固定，便于目视比对 ──
+  const store = {
+    topics: [
+      { id: 't1', title: '82Ω 串联电阻怎么选', chosenTitle: '82Ω 串联电阻到底该怎么选',
+        stage: 'humanized', source: '实测记录',
+        intel: { angle: ['阻抗失配会引起振铃', '82Ω 是经验值但要看走线'],
+                 fact: ['实测过冲 18%，加 82Ω 后降到 7%'],
+                 quote: ['阻抗匹配不是算出来的，是量出来的'], risk: [] },
+        titles: ['直给：82Ω 到底该怎么选', '提问：82Ω 真的是最优值吗？', '场景：示波器上的那圈振铃'],
+        body: '（一段正文）', humanized: '（去 AI 味后的正文）'.repeat(6) },
+      { id: 't2', title: 'AFE 电源温升 50-70℃', stage: 'intel',
+        intel: { angle: ['LDO 压差太大'], fact: ['VIN 2.2V / VOUT 1.15V'], quote: [], risk: ['供应链'] },
+        titles: [], body: '', humanized: '' },
+      { id: 't3', title: 'ESD 接触放电与 AFE', stage: 'inspiration',
+        intel: { angle: [], fact: [], quote: [], risk: [] }, titles: [], body: '', humanized: '' },
+    ],
+    meta: { schemaVersion: 1, currentId: 't1' },
+  };
+
+  const context = {
+    pluginId: 'studio',
+    pluginDir: 'X:/plugins/studio',
+    registerCommand: (id, fn) => { commands[id] = fn; },
+    api: {
+      get_selection: async () => '',
+      replace_selection: async () => {},
+      inject: async () => {},
+      storage: {
+        get: async (k) => (k in store ? store[k] : null),
+        set: async (k, v) => { store[k] = v; },
+      },
+      log: { info: async () => {}, warn: async () => {}, error: async () => {} },
+      chat: async () => '（桩回复）',
+      run: async () => ({ exit_code: 0, stdout: '', stderr: '', timed_out: false, cancelled: false }),
+    },
+  };
+  const commands = {};
+
+  const mod = await import('../index.js');
+  await mod.activate(context);
+
+  const lines = [];
+  const say = (s) => { lines.push(s); };
+
+  const r1 = await commands['studio.toggle']();
+  say(`toggle#1 → ${r1.ok ? 'ok' : r1.code}：${r1.message}`);
+
+  const countPanels = () => document.querySelectorAll('[data-studio="panel"]').length;
+  say(`面板节点数 = ${countPanels()}（应为 1）`);
+
+  const r2 = await commands['studio.toggle']();
+  say(`toggle#2（再点一次，应收起）→ ${r2.ok ? 'ok' : r2.code}：${r2.message}；剩余节点 = ${countPanels()}`);
+
+  const r3 = await commands['studio.toggle']();
+  say(`toggle#3（重新打开）→ ${r3.ok ? 'ok' : r3.code}：${r3.message}；节点 = ${countPanels()}（应为 1）`);
+
+  const st = await commands['studio.state']();
+  say(`state → ${st.ok ? 'ok' : st.code}：${JSON.stringify(st.data)}`);
+
+  // 列表与详情真的渲染出内容了吗
+  const rows = document.querySelectorAll('.studio-panel .sp-item').length;
+  const secs = document.querySelectorAll('.studio-panel .sp-sec').length;
+  const chips = document.querySelectorAll('.studio-panel .sp-chip').length;
+  const btns = document.querySelectorAll('.studio-panel .sp-acts .sp-btn').length;
+  say(`渲染：选题行 ${rows} / 详情块 ${secs} / 标题候选 ${chips} / 动作按钮 ${btns}`);
+
+  document.title = `面板预览 · ${Object.keys(commands).length} 命令 · 面板 ${countPanels()}`;
+
+  const box = document.createElement('div');
+  box.className = 'fake-card';
+  box.style.cssText = 'border-color:' + (countPanels() === 1 && rows > 0 ? 'var(--ok)' : 'var(--err)') +
+    ';white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;';
+  box.textContent = lines.join('\n');
+  document.querySelector('.fake-app').appendChild(box);
+
+  window.__studioReady = true;
+</script>
+</body>
+</html>

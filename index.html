@@ -4,6 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>easyop</title>
+    <meta name="color-scheme" content="dark light" />
+    <script>
+      // 防主题闪烁：在首屏渲染前抢先落主题。键名与解析逻辑需与 src/theme.ts 保持一致。
+      (function () {
+        var KEY = "easyop.theme";
+        var mode = "system";
+        try {
+          var saved = localStorage.getItem(KEY);
+          if (saved === "dark" || saved === "light" || saved === "system") mode = saved;
+        } catch (e) {}
+        var resolved = mode;
+        if (mode === "system") {
+          resolved = "dark";
+          try {
+            if (!window.matchMedia("(prefers-color-scheme: dark)").matches) resolved = "light";
+          } catch (e) {}
+        }
+        document.documentElement.setAttribute("data-theme", resolved);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

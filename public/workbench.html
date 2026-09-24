@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>easyop 提示词库</title>
+    <style>
+      /*
+       * 独立页面（不走 Vite 打包），因此令牌按 styles.css 的深/浅两套各抄一份最小集，
+       * 只保留这里真正用到的键。主题来源与主窗口一致：localStorage `easyop.theme`
+       * + `prefers-color-scheme`，靠 `storage` 事件跟随主窗口的实时切换。
+       */
+      :root,
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --panel-rgb: 23, 27, 44;
+        --panel-2: #1f2438;
+        --border: #2a3048;
+        --text: #e8eaf2;
+        --text-dim: #98a0b8;
+        --accent-solid: #ff6b35;
+        --accent-rgb: 255, 107, 53;
+        --on-accent: #fff;
+        --danger: #ff6b6b;
+        --shadow: rgba(0, 0, 0, 0.55);
+      }
+      [data-theme="light"] {
+        color-scheme: light;
+        --panel-rgb: 255, 255, 255;
+        --panel-2: #f5f5f4;
+        --border: #e7e5e4;
+        --text: #1c1917;
+        --text-dim: #78716c;
+        --accent-solid: #c2410c;
+        --accent-rgb: 255, 107, 53;
+        --on-accent: #fff;
+        --danger: #dc2626;
+        --shadow: rgba(28, 25, 23, 0.22);
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      body {
+        padding: 8px;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+      }
+
+      .panel {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        background: rgba(var(--panel-rgb), 0.95);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: 0 10px 30px var(--shadow);
+        overflow: hidden;
+      }
+
+      /* ---------- 顶栏 ---------- */
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 11px 8px;
+        border-bottom: 1px solid var(--border);
+      }
+      .mark {
+        width: 5px;
+        height: 18px;
+        border-radius: 999px;
+        background: var(--accent-solid);
+        flex-shrink: 0;
+      }
+      .title {
+        font-size: 12.5px;
+        font-weight: 700;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: move;
+      }
+      .count {
+        font-size: 10.5px;
+        color: var(--text-dim);
+        font-variant-numeric: tabular-nums;
+        flex-shrink: 0;
+      }
+      .spacer { flex: 1; }
+
+      .add {
+        flex-shrink: 0;
+        font-size: 10.5px;
+        line-height: 1;
+        padding: 5px 10px;
+        border-radius: 999px;
+        border: 1px dashed var(--border);
+        color: var(--text-dim);
+        background: transparent;
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+      }
+      .add:hover:not(:disabled) {
+        background: rgba(var(--accent-rgb), 0.14);
+        border-color: rgba(var(--accent-rgb), 0.55);
+        color: var(--text);
+      }
+      .add:disabled { opacity: 0.4; cursor: default; }
+
+      /* ---------- 列表 ---------- */
+      .list {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 6px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        scrollbar-width: thin;
+      }
+      .list::-webkit-scrollbar { width: 6px; }
+      .list::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 999px;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 0 9px;
+        min-height: 34px;
+        border-radius: 9px;
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: background 0.1s ease, border-color 0.1s ease;
+      }
+      .row:hover { background: var(--panel-2); }
+      .row.active {
+        background: rgba(var(--accent-rgb), 0.15);
+        border-color: rgba(var(--accent-rgb), 0.55);
+      }
+      /* 编辑 / 新增行：输入框自己承担交互，整行不再响应鼠标。 */
+      .row.editing { cursor: default; }
+      .row.editing:hover { background: transparent; }
+
+      .body {
+        flex: 1;
+        min-width: 0;
+        font-size: 12.5px;
+        line-height: 1.3;
+        color: var(--text);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        word-break: break-word;
+      }
+      .row.active .body { font-weight: 700; }
+
+      .hint-dot {
+        flex-shrink: 0;
+        font-size: 9.5px;
+        color: var(--accent-solid);
+        opacity: 0;
+        transition: opacity 0.12s ease;
+      }
+      .row.active .hint-dot { opacity: 1; }
+
+      /* ---------- 行内操作 ---------- */
+      .row-acts {
+        flex-shrink: 0;
+        display: flex;
+        gap: 4px;
+        opacity: 0;
+        transition: opacity 0.12s ease;
+      }
+      .row:hover .row-acts,
+      .row.active .row-acts { opacity: 1; }
+      .act {
+        font-size: 10px;
+        line-height: 1;
+        padding: 5px 7px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        color: var(--text-dim);
+        background: transparent;
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+      }
+      .act:hover {
+        color: var(--text);
+        background: rgba(var(--accent-rgb), 0.16);
+        border-color: rgba(var(--accent-rgb), 0.45);
+      }
+      .act.danger:hover {
+        color: var(--on-accent);
+        background: var(--accent-solid);
+        border-color: transparent;
+      }
+      .act:disabled { opacity: 0.4; cursor: default; }
+
+      /* ---------- 行内输入框 ---------- */
+      .editor {
+        flex: 1;
+        min-width: 0;
+        height: 24px;
+        padding: 0 8px;
+        border-radius: 7px;
+        border: 1px solid rgba(var(--accent-rgb), 0.6);
+        background: var(--panel-2);
+        color: var(--text);
+        font-family: inherit;
+        font-size: 12.5px;
+        outline: none;
+        /* 面板整体禁用了选择，输入框必须单独放开。 */
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .editor::placeholder { color: var(--text-dim); }
+      .editor:focus { border-color: var(--accent-solid); }
+
+      /* ---------- 空态 ---------- */
+      .empty {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        gap: 7px;
+        padding: 0 30px;
+        text-align: center;
+      }
+      .empty-title {
+        font-size: 12.5px;
+        font-weight: 700;
+        color: var(--text-dim);
+      }
+      .empty-tip {
+        font-size: 11px;
+        line-height: 1.5;
+        color: var(--text-dim);
+        opacity: 0.85;
+      }
+      .hidden { display: none !important; }
+
+      /* ---------- 底栏 ---------- */
+      .foot {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 11px 7px;
+        border-top: 1px solid var(--border);
+        font-size: 10.5px;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .foot .sep { opacity: 0.4; }
+      .msg {
+        margin-left: auto;
+        flex-shrink: 0;
+        max-width: 62%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--accent-solid);
+        font-weight: 700;
+      }
+      .msg.err { color: var(--danger); }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <div class="head">
+        <div class="mark"></div>
+        <div class="title" id="title" data-tauri-drag-region>提示词库</div>
+        <div class="count" id="count"></div>
+        <div class="spacer"></div>
+        <button class="add" id="add" type="button">＋ 新增</button>
+      </div>
+
+      <div class="list" id="list"></div>
+
+      <div class="empty" id="empty">
+        <div class="empty-title" id="empty-title">正在读取提示词…</div>
+        <div class="empty-tip" id="empty-tip"></div>
+      </div>
+
+      <div class="foot">
+        <span id="hint"></span>
+        <span class="msg hidden" id="msg"></span>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        var tauri = window.__TAURI__ || {};
+        var invoke = tauri.core && tauri.core.invoke;
+
+        var listEl = document.getElementById("list");
+        var emptyEl = document.getElementById("empty");
+        var emptyTitleEl = document.getElementById("empty-title");
+        var emptyTipEl = document.getElementById("empty-tip");
+        var titleEl = document.getElementById("title");
+        var countEl = document.getElementById("count");
+        var addEl = document.getElementById("add");
+        var hintEl = document.getElementById("hint");
+        var msgEl = document.getElementById("msg");
+
+        /** 底栏提示：常态 / 编辑态两套，编辑时优先讲保存与取消。 */
+        var HINT_IDLE = "旋钮 选择  ·  按下 上屏  ·  Tab 新增  ·  Esc 收起";
+        var HINT_EDIT = "回车 保存  ·  Esc 取消";
+
+        var state = {
+          profile: "",     // 方案展示名
+          profileId: "",   // 方案 ID：增 / 删 / 改都要回传，否则改不动正确的方案
+          items: [],       // 当前方案的提示词（来自 board-input / workbench_list / 命令返回值）
+          cursor: 0,       // 高亮下标
+          loaded: false,   // 是否已拿到第一份快照
+          sawEvent: false, // 是否已收到过推送（决定快照是否还该覆盖）
+          pending: false,  // 上屏命令在途，避免连点重复注入
+          busy: false,     // 一次增删改在途，避免重复提交
+          editing: null    // { mode: "edit" | "new", id: string } —— null 表示没有行内输入
+        };
+
+        /** 当前正在编辑的输入框；每次 render 重建列表时重新指认。 */
+        var editorEl = null;
+        /** 本次 render 后要不要把焦点交给输入框（只在刚打开时做一次）。 */
+        var wantFocus = false;
+        var msgTimer = null;
+
+        // ---------- 提示 ----------
+
+        function showMsg(text, isError, autoHideMs) {
+          if (msgTimer) {
+            clearTimeout(msgTimer);
+            msgTimer = null;
+          }
+          msgEl.textContent = text;
+          msgEl.classList.toggle("err", !!isError);
+          msgEl.classList.remove("hidden");
+          if (autoHideMs > 0) {
+            msgTimer = setTimeout(function () {
+              msgEl.classList.add("hidden");
+              msgTimer = null;
+            }, autoHideMs);
+          }
+        }
+
+        function hideMsg() {
+          if (msgTimer) {
+            clearTimeout(msgTimer);
+            msgTimer = null;
+          }
+          msgEl.classList.add("hidden");
+        }
+
+        // ---------- 选择与上屏 ----------
+
+        function currentItem() {
+          return state.items[state.cursor] || null;
+        }
+
+        function clampCursor() {
+          if (state.cursor < 0) state.cursor = 0;
+          if (state.cursor >= state.items.length) {
+            state.cursor = Math.max(0, state.items.length - 1);
+          }
+        }
+
+        function move(delta) {
+          // 正在编辑时不动高亮：输入框还握着焦点，跳走只会让人以为内容丢了。
+          if (state.editing) return;
+          if (state.items.length === 0) return;
+          // 环绕：列表不长，从头绕到尾比撞墙更省一次操作。
+          state.cursor =
+            (state.cursor + delta + state.items.length) % state.items.length;
+          render();
+        }
+
+        function commit() {
+          if (state.pending || state.editing) return;
+          var item = currentItem();
+          if (!item) return;
+          state.pending = true;
+          showMsg("上屏中…", false, 0);
+
+          // 命令内部会先收起浮窗、把焦点还给原应用，再用剪贴板注入正文。
+          invoke("workbench_commit", { text: item.text })
+            .then(function () {
+              showMsg("已上屏", false, 1200);
+            })
+            .catch(function (err) {
+              showMsg("失败：" + err, true, 2600);
+            })
+            .then(function () {
+              // 无论成败都解锁；窗口此时大概已经隐藏，用户重新唤起时可再次操作。
+              state.pending = false;
+            });
+        }
+
+        function hideSelf() {
+          if (invoke) invoke("workbench_hide");
+        }
+
+        // ---------- 增删改 ----------
+
+        function openComposer() {
+          if (!state.profileId || state.busy) return;
+          state.editing = { mode: "new", id: "" };
+          wantFocus = true;
+          render();
+        }
+
+        function openEditor(item) {
+          if (!item || state.busy) return;
+          state.editing = { mode: "edit", id: item.id };
+          wantFocus = true;
+          render();
+        }
+
+        function cancelEdit() {
+          if (!state.editing) return;
+          state.editing = null;
+          editorEl = null;
+          render();
+        }
+
+        function submitEdit() {
+          var editing = state.editing;
+          if (!editing || state.busy) return;
+
+          var text = editorEl ? editorEl.value.trim() : "";
+          if (!text) {
+            // 与后端 validate_prompts 的文案一致，先说清楚再让人继续敲。
+            showMsg("提示词内容不能为空", true, 2600);
+            if (editorEl) editorEl.focus();
+            return;
+          }
+
+          var isNew = editing.mode === "new";
+          state.busy = true;
+          setBusyUi(true);
+
+          var call = isNew
+            ? invoke("workbench_prompt_add", { profileId: state.profileId, text: text })
+            : invoke("workbench_prompt_update", {
+                profileId: state.profileId,
+                id: editing.id,
+                text: text
+              });
+
+          call
+            .then(function (snapshot) {
+              state.editing = null;
+              editorEl = null;
+              if (isNew) {
+                // 新条目追加在末尾，直接把高亮送过去，省一次旋钮转动。
+                state.cursor = Math.max(0, (snapshot && snapshot.items ? snapshot.items.length : 1) - 1);
+              }
+              applyAuthoritative(snapshot);
+              showMsg(isNew ? "已添加" : "已保存", false, 1200);
+            })
+            .catch(function (err) {
+              // 失败时留在编辑态，人可以直接改字重试。
+              showMsg(String(err), true, 2600);
+              if (editorEl) editorEl.focus();
+            })
+            .then(function () {
+              state.busy = false;
+              setBusyUi(false);
+            });
+        }
+
+        function removeItem(item) {
+          if (!item || state.busy) return;
+          state.busy = true;
+          setBusyUi(true);
+
+          invoke("workbench_prompt_remove", { profileId: state.profileId, id: item.id })
+            .then(function (snapshot) {
+              if (state.editing && state.editing.id === item.id) {
+                state.editing = null;
+                editorEl = null;
+              }
+              applyAuthoritative(snapshot);
+              showMsg("已删除", false, 1200);
+            })
+            .catch(function (err) {
+              showMsg(String(err), true, 2600);
+            })
+            .then(function () {
+              state.busy = false;
+              setBusyUi(false);
+            });
+        }
+
+        /** 增删改在途时把入口和行内按钮一起按住，避免重复提交。 */
+        function setBusyUi(busy) {
+          addEl.disabled = busy || !state.profileId;
+        }
+
+        // ---------- 渲染 ----------
+
+        function makeAct(label, danger, onClick) {
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "act" + (danger ? " danger" : "");
+          btn.textContent = label;
+          btn.disabled = state.busy;
+          btn.addEventListener("click", function (e) {
+            // 行本身也响应点击：不拦住，点按钮会顺带选中 / 上屏该行。
+            e.preventDefault();
+            e.stopPropagation();
+            onClick();
+          });
+          return btn;
+        }
+
+        function makeEditor(value) {
+          var input = document.createElement("input");
+          input.className = "editor";
+          input.type = "text";
+          input.spellcheck = false;
+          input.value = value || "";
+          input.placeholder = "输入提示词，回车保存";
+          input.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.stopPropagation();
+              submitEdit();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              cancelEdit();
+            }
+          });
+          return input;
+        }
+
+        function buildNormalRow(item, index) {
+          var row = document.createElement("div");
+          row.className = "row" + (index === state.cursor ? " active" : "");
+          row.title = item.text;
+
+          var body = document.createElement("span");
+          body.className = "body";
+          body.textContent = item.text;
+
+          var dot = document.createElement("span");
+          dot.className = "hint-dot";
+          dot.textContent = "上屏 ▸";
+
+          var acts = document.createElement("span");
+          acts.className = "row-acts";
+          acts.appendChild(makeAct("编辑", false, function () { openEditor(item); }));
+          acts.appendChild(makeAct("删除", true, function () { removeItem(item); }));
+
+          row.appendChild(body);
+          row.appendChild(dot);
+          row.appendChild(acts);
+
+          row.addEventListener("click", function () {
+            if (state.busy) return;
+            if (index === state.cursor) {
+              commit();
+            } else {
+              state.cursor = index;
+              render();
+            }
+          });
+
+          return row;
+        }
+
+        function buildEditRow(item) {
+          var row = document.createElement("div");
+          row.className = "row editing";
+          var input = makeEditor(item.text);
+          row.appendChild(input);
+          row.appendChild(makeAct("保存", false, submitEdit));
+          row.appendChild(makeAct("取消", false, cancelEdit));
+          editorEl = input;
+          return row;
+        }
+
+        function buildComposerRow() {
+          var row = document.createElement("div");
+          row.className = "row editing";
+          var input = makeEditor("");
+          row.appendChild(input);
+          row.appendChild(makeAct("添加", false, submitEdit));
+          row.appendChild(makeAct("取消", false, cancelEdit));
+          editorEl = input;
+          return row;
+        }
+
+        function renderEmpty() {
+          listEl.classList.add("hidden");
+          emptyEl.classList.remove("hidden");
+
+          if (!state.loaded) {
+            emptyTitleEl.textContent = "正在读取提示词…";
+            emptyTipEl.textContent = "";
+            return;
+          }
+          if (!state.profileId) {
+            // 方案库为空时后端给的是默认快照，此时没有可写入的目标。
+            emptyTitleEl.textContent = "没有可用的方案";
+            emptyTipEl.textContent = "先在主窗口新建一个方案，再回来维护它的提示词。";
+            return;
+          }
+          emptyTitleEl.textContent =
+            "方案「" + state.profile + "」还没有提示词";
+          emptyTipEl.textContent =
+            "点右上角「新增」或按 Tab 添加常用语；在这里选中后按下，正文就会上屏。";
+        }
+
+        function render() {
+          titleEl.textContent = state.profile || "提示词库";
+          countEl.textContent = state.items.length ? state.items.length + " 条" : "";
+          setBusyUi(state.busy);
+
+          var editing = state.editing;
+          var composing = !!editing && editing.mode === "new";
+          hintEl.textContent = editing ? HINT_EDIT : HINT_IDLE;
+
+          if (state.items.length === 0 && !composing) {
+            renderEmpty();
+            return;
+          }
+          listEl.classList.remove("hidden");
+          emptyEl.classList.add("hidden");
+
+          // 全量重建：条数上限 60，且每次改动都整份回来，不值得做 diff。
+          listEl.textContent = "";
+          editorEl = null;
+
+          if (composing) listEl.appendChild(buildComposerRow());
+
+          state.items.forEach(function (item, index) {
+            var inEdit = !!editing && editing.mode === "edit" && editing.id === item.id;
+            listEl.appendChild(inEdit ? buildEditRow(item) : buildNormalRow(item, index));
+          });
+
+          var active = listEl.querySelector(".row.active");
+          if (active && active.scrollIntoView) {
+            active.scrollIntoView({ block: "nearest" });
+          }
+
+          if (wantFocus && editorEl) {
+            wantFocus = false;
+            editorEl.focus();
+            editorEl.select();
+          }
+        }
+
+        // ---------- 快照 ----------
+
+        function absorb(payload) {
+          state.items = Array.isArray(payload.items) ? payload.items : [];
+          state.profile = payload.profile || "";
+          state.profileId = payload.profile_id || "";
+          state.loaded = true;
+          clampCursor();
+        }
+
+        /** 应用一份列表快照。只在没有更新的推送到达时覆盖，避免回退到旧数据。 */
+        function applySnapshot(payload, fromEvent) {
+          if (!payload) return;
+          if (fromEvent === true) {
+            state.sawEvent = true;
+          } else if (state.sawEvent) {
+            // 事件比快照新，忽略这份可能过期的拉取结果。
+            return;
+          }
+          // 换方案或条目消失后，原来那行编辑已经没有落点，直接作废。
+          var incomingId = payload.profile_id || "";
+          if (state.editing && state.editing.mode === "edit") {
+            var stillThere = (payload.items || []).some(function (item) {
+              return item.id === state.editing.id;
+            });
+            if (incomingId !== state.profileId || !stillThere) {
+              state.editing = null;
+              editorEl = null;
+            }
+          }
+          absorb(payload);
+          render();
+        }
+
+        /**
+         * 应用命令的返回值。这是刚写完的权威数据，比 `sawEvent` 见过的任何事件都新，
+         * 因此绕过防旧判断直接覆盖。
+         */
+        function applyAuthoritative(payload) {
+          if (!payload) {
+            render();
+            return;
+          }
+          absorb(payload);
+          render();
+        }
+
+        /** 硬件直接上屏某条提示词时，把高亮跳到正文相同的那一行。 */
+        function activateByText(text) {
+          if (!text) return;
+          for (var i = 0; i < state.items.length; i++) {
+            if (state.items[i].text === text) {
+              if (state.editing) cancelEdit();
+              state.cursor = i;
+              render();
+              return;
+            }
+          }
+        }
+
+        // ---------- 事件 ----------
+
+        function listen(name, handler) {
+          if (tauri.event && tauri.event.listen) {
+            tauri.event.listen(name, handler);
+          }
+        }
+
+        listen("board-input", function (e) {
+          applySnapshot(e.payload, true);
+        });
+
+        listen("workbench-command", function (e) {
+          var payload = e.payload || {};
+          switch (payload.command) {
+            case "prev":
+              move(-1);
+              break;
+            case "next":
+              move(1);
+              break;
+            case "confirm":
+              commit();
+              break;
+            case "activate":
+              // 后端传的是触发源的正文，不是条目 ID。
+              activateByText(payload.text);
+              break;
+            default:
+              break;
+          }
+        });
+
+        // 真实焦点到来时解锁：上一轮上屏可能被取消，窗口又留在了可见状态。
+        window.addEventListener("focus", function () {
+          state.pending = false;
+          hideMsg();
+        });
+
+        addEl.addEventListener("click", function (e) {
+          e.preventDefault();
+          openComposer();
+        });
+
+        document.addEventListener("keydown", function (e) {
+          if (state.editing) {
+            // 编辑态只保留取消；保存键由输入框自己处理。
+            if (e.key === "Tab" || e.key === "Escape") {
+              e.preventDefault();
+              if (e.key === "Escape") cancelEdit();
+            }
+            return;
+          }
+          switch (e.key) {
+            case "Tab":
+              // 拦截 Tab：浮窗里没有需要键盘走查的表单，Tab 的用途是新增条目。
+              e.preventDefault();
+              openComposer();
+              break;
+            case "ArrowUp":
+              e.preventDefault();
+              move(-1);
+              break;
+            case "ArrowDown":
+              e.preventDefault();
+              move(1);
+              break;
+            case "Enter":
+              e.preventDefault();
+              commit();
+              break;
+            case "Escape":
+              e.preventDefault();
+              hideSelf();
+              break;
+            default:
+              break;
+          }
+        });
+
+        // ---------- 主题跟随 ----------
+        // 与主窗口同源，因此直接复用它的存储键；主窗口切换时 storage 事件会推过来。
+
+        var THEME_STORAGE_KEY = "easyop.theme";
+
+        function readThemeMode() {
+          try {
+            var raw = localStorage.getItem(THEME_STORAGE_KEY);
+            if (raw === "dark" || raw === "light" || raw === "system") return raw;
+          } catch (err) {
+            /* localStorage 不可用时按跟随系统处理 */
+          }
+          return "system";
+        }
+
+        function applyTheme() {
+          var mode = readThemeMode();
+          var resolved = mode;
+          if (mode === "system") {
+            resolved =
+              window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          }
+          document.documentElement.dataset.theme = resolved;
+        }
+
+        applyTheme();
+        window.addEventListener("storage", function (e) {
+          if (!e.key || e.key === THEME_STORAGE_KEY) applyTheme();
+        });
+        if (window.matchMedia) {
+          var media = window.matchMedia("(prefers-color-scheme: dark)");
+          var onSystemChange = function () {
+            if (readThemeMode() === "system") applyTheme();
+          };
+          if (media.addEventListener) media.addEventListener("change", onSystemChange);
+          else if (media.addListener) media.addListener(onSystemChange);
+        }
+
+        // ---------- 启动 ----------
+        // 先拉一次快照：`board-input` 是在「下发方案」那一刻发出的，浮窗那时可能还没
+        // 创建，事件收不到。监听器已在上方挂好，晚到的事件会用 `sawEvent` 挡住旧快照。
+
+        render();
+
+        if (invoke) {
+          invoke("workbench_list")
+            .then(function (snapshot) {
+              applySnapshot(snapshot, false);
+            })
+            .catch(function () {
+              // 拉取失败时退化为纯事件驱动，空态提示仍可读。
+              state.loaded = true;
+              render();
+            });
+        } else {
+          state.loaded = true;
+          render();
+        }
+      })();
+    </script>
+  </body>
+</html>

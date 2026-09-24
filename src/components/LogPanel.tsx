@@ -53,6 +53,14 @@ export default function LogPanel({ onClose }: Props) {
     }
   }
 
+  async function handleOpenDir() {
+    try {
+      await api.openLogDir();
+    } catch (e) {
+      setPollError(String(e));
+    }
+  }
+
   return (
     <div className="modal-backdrop log-backdrop" onClick={onClose}>
       <div className="modal log-panel" onClick={(e) => e.stopPropagation()}>
@@ -69,6 +77,13 @@ export default function LogPanel({ onClose }: Props) {
             </label>
             <button className="btn-ghost" onClick={handleClear}>
               清空
+            </button>
+            <button
+              className="btn-ghost"
+              onClick={handleOpenDir}
+              title="日志同时按天落盘，关掉程序也在；出事时把这一份发出来即可"
+            >
+              打开日志目录
             </button>
             <button className="btn-ghost" onClick={onClose}>
               关闭

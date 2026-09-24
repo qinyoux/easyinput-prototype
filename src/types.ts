@@ -2,7 +2,7 @@
 // 序列化规则来自 `model.rs` 的 serde 标签：
 //   ActionSpec  -> { kind, value }   （Disabled 只有 kind）
 //   AppTarget   -> { kind, ... }
-//   Profile     -> { id, name, keys, encoder }
+//   Profile     -> { id, name, keys, encoder, prompts }
 
 /** 一个输入（键）上的动作，kind + value 判别式。 */
 export type ActionSpec =
@@ -10,7 +10,9 @@ export type ActionSpec =
   | { kind: "named"; value: string }
   | { kind: "hotkey"; value: string }
   | { kind: "text"; value: string }
-  | { kind: "host_action"; value: string };
+  | { kind: "host_action"; value: string }
+  /** Agent 任务台槽位按键。value 是槽位号字符串 "1"–"4"。 */
+  | { kind: "task_desk"; value: string };
 
 /** 本机应用库的打开目标。 */
 export type AppTarget =
@@ -34,12 +36,26 @@ export interface SystemApp {
   kind: "app" | "shell";
 }
 
+/**
+ * 一条提示词（KEY4 浮窗提示词库的条目）。
+ *
+ * 与「固定文本动作」（`ActionSpec` 的 `text`）是两回事：固定文本动作挂在某个按键上，
+ * 会被下发到固件；提示词只是主机端的一份常用语清单，不下发固件，只服务于浮窗。
+ * `id` 由主机端生成，用于定位「改哪一条 / 删哪一条」。
+ */
+export interface Prompt {
+  id: string;
+  text: string;
+}
+
 /** 一个按键方案（profile）。keys: KEY1..KEY8，encoder: left/right/press。 */
 export interface Profile {
   id: string;
   name: string;
   keys: Record<string, ActionSpec>;
   encoder: Record<string, ActionSpec>;
+  /** 该方案专属的提示词库，随方案切换。旧配置里没有这个字段，读到时按空数组处理。 */
+  prompts: Prompt[];
 }
 
 /** 固件配置下发回执（0x11，kind 0x03）。 */
@@ -91,3 +107,561 @@ export interface LlmConfig {
 
 /** 语音编辑阶段。 */
 export type EditPhase = "idle" | "listening" | "processing";
+// ── 使用记录（工作台"使用记录中心"）──
+
+/** 一条使用记录。 */
+export interface UsageEntry {
+  ts: string;
+  kind: "asr" | "ss_exec" | "prompt_use" | "key_action" | string;
+  text: string;
+  source: string;
+  profile?: string;
+}
+
+/** 日历统计：某天的记录数与类型分布。 */
+export interface DailyCount {
+  date: string;
+  count: number;
+  by_kind: Record<string, number>;
+}
+
+// ── ASR 自定义词库 ──
+
+/** 一条热词。 */
+export interface VocabWord {
+  text: string;
+  weight: number;
+}
+
+// ── Agent 任务台 ──
+//
+// 与 Rust 侧 `agent_desk::config` 一一对应。改动任一侧都要同步另一侧，
+// 因为 serde 的字段名就是这里的字段名（没有中间层做转译）。
+
+/** 执行器形态。 */
+export type DriverKind = "api" | "cli";
+
+/** 任务能力分类——"路由"要判的就是它。 */
+export type Capability = "text" | "code" | "image" | "video" | "search" | "vision";
+
+/** 完成信号来源。铁律：`process_exit_zero` 单独出现时可信度只有「未校验」。 */
+export type CompletionKind =
+  | "http_stream_end"
+  | "log_pattern"
+  | "process_exit_zero"
+  | "async_task_poll";
+
+/** 完成判定配置。 */
+export interface CompletionSignal {
+  kind: CompletionKind;
+  /**
+   * `log_pattern` 用的匹配串。
+   *
+   * 支持 **多个候选，`;` 分隔，任一命中即完成**（不含分隔符时就是单串，与旧值兼容）。
+   * 上游工具的日志格式会随版本变，绑死一个串等于上游一改名，全部任务集体判失败。
+   */
+  pattern: string;
+  /** 世界门禁命令：非空时只有它退出码 0 才算真完成，可信度升为「已校验」。 */
+  evidence_cmd: string;
+}
+
+/** 一个可被调度的执行器（模型 API 或 Agent CLI）。 */
+export interface DriverConfig {
+  id: string;
+  label: string;
+  kind: DriverKind;
+  enabled: boolean;
+  /** Api 形态：端点。 */
+  endpoint: string;
+  /** Api 形态：模型名。 */
+  model: string;
+  /** Api 形态：密钥（默认空，由用户填写）。 */
+  api_key: string;
+  /** Cli 形态：可执行文件。 */
+  command: string;
+  /** Cli 形态：参数模板，必须含 `{prompt}`。 */
+  args: string[];
+  /** Cli 形态：环境变量 `KEY=VALUE`，CLI 必须显式给 `HOME`。 */
+  env: string[];
+  /** Cli 形态：工作目录。 */
+  cwd: string;
+  /**
+   * 单次执行超时（毫秒）。**0 = 用后端默认**（180000，即 180 秒）。
+   *
+   * ⚠️ 后端是 `#[serde(default)]` 反序列化的：**前端不认识这个字段就会在
+   * 回存配置时把它静默清零**（读进来时是 900000，点保存后变 0）。所以两侧必须同改。
+   */
+  timeout_ms: number;
+  completion: CompletionSignal;
+  /**
+   * 会话续接配置。让多轮对话**接着上一轮**，而不是每次都重开会话。
+   *
+   * - `null` = 这个执行器不支持 / 未配置续接；
+   * - `{}` 里的三个字段说明"会话 id 藏在哪、怎么带回去"。
+   *
+   * ⚠️ 与 `timeout_ms` 同一个坑：后端是 `#[serde(default)]` 反序列化，
+   * **前端不认识这个字段就会在回存时把它静默清零** —— 表现为
+   * "保存一次之后 codex 就不再续接了"。所以前端表单必须原样带着它。
+   */
+  continuation: ContinuationSpec | null;
+  capabilities: Capability[];
+  /**
+   * 产物过滤（可选 glob，如 `out/*.png`）。空 = 只按时间窗判定，不做名字过滤。
+   *
+   * ⚠️ **相对「工作目录」匹配**，不是相对磁盘根：
+   * `*.md` 只命中工作目录**根下**的 markdown；`**` 才跨层，`*` 不跨分隔符。
+   * 没配工作目录时**不会扫盘**（拿 easyop 自己的目录顶替会打开一堆无关文件）。
+   */
+  artifact_glob: string;
+  /**
+   * 任务成功后是否自动打开产物。
+   *
+   * 打开策略：只扫到 1 个 ⇒ 直接打开它；多个 ⇒ 打开所在文件夹并选中**最新**那个。
+   * 只在**任务成功**且**确实扫到**时才动作 —— 它会抢焦点，抢错了比不打开烦人得多。
+   *
+   * ⚠️ 与 `timeout_ms` 同一个坑：后端是 `#[serde(default = "default_true")]`，
+   * **前端不认识这个字段就会在回存时把它静默清零**。而且这个字段的"零"是 `false`，
+   * 不是后端默认的 `true` —— 表现就是"保存一次之后自动打开产物就悄悄关了"。
+   */
+  artifact_open: boolean;
+  note: string;
+}
+
+/**
+ * 会话续接配置。
+ *
+ * 三个字段回答同一件事的三个分段：**id 从哪来 / 叫什么 / 怎么带回去**。
+ * 不同工具的形态不同（codex 用子命令 `resume <id>`，别的可能是 `--session <id>`），
+ * 所以它是数据而不是代码。
+ */
+export interface ContinuationSpec {
+  /** 会话 id 出现在哪种 stdout 事件里（比对 JSONL 的 `"type"` 字段）。空 = 不启用。 */
+  id_event_type: string;
+  /** 会话 id 在那个事件里的键名。 */
+  id_field: string;
+  /** 续接时追加的参数模板，含 `{id}` 的元素会被替换。 */
+  args: string[];
+}
+
+/**
+ * 某槽正在续接的会话摘要（界面显示用，**不含完整 id**）。
+ */
+export interface SessionView {
+  driver_id: string;
+  /** id 前 8 位 —— 够用来确认"这两轮是不是同一段对话"。 */
+  id_short: string;
+  at_ms: number;
+}
+
+/** 槽位绑定——三种取值就是"人选执行器 / 模型选能力 / 全自动"三层。 */
+export type SlotBinding =
+  | { mode: "empty" }
+  | { mode: "exact"; driver: string }
+  | { mode: "capability"; capability: Capability; prefer: string[] }
+  | { mode: "auto" };
+
+/** 任务完成后的总结配置。 */
+export interface SummaryConfig {
+  /** 用哪个执行器做总结。空 = 复用语音编辑的 LLM 通道。 */
+  driver_id: string;
+  prompt_template: string;
+  max_chars: number;
+  fallback_truncate: boolean;
+}
+
+/** 状态播报配置。Notice 不产生未读，与 Result 严格分离。 */
+export interface NoticeConfig {
+  /** 总开关。**只管喇叭，不管灯。** */
+  enabled: boolean;
+  on_start: boolean;
+  /** 进度类（正在推进 / 已运行 N 分钟）。单独一档，方便"只关吵的那一类"。 */
+  on_progress: boolean;
+  on_complete: boolean;
+  on_fail: boolean;
+  /** 同类 Notice 最小间隔（秒）。0 = 不限。只约束进度类。 */
+  min_interval_secs: number;
+  /**
+   * 「已运行 N 分钟」的固定档位（秒），升序。
+   *
+   * ⚠️ **档数上限由后端语料闭集决定**（当前 3 档 = 1/5/15 分钟）。多写的会被
+   * 后端静默截断，因为每档都要有一句固定语料并预合成成音频。
+   */
+  progress_marks_secs: number[];
+}
+
+/** TTS 服务商。`volc` = 豆包语音合成大模型（火山引擎），`bailian` = 阿里云百炼。 */
+export type TtsProvider = "volc" | "bailian";
+
+/**
+ * TTS 配置。交付采样率恒为 48000（固件要求）。
+ *
+ * 两个 provider 协议不同，字段分两套（见 Rust 侧 `tts::TtsConfig` 的表格）：
+ * `resource_id` / `explicit_language` 属豆包，`model` / `language_type` 属百炼。
+ */
+export interface TtsConfig {
+  provider: TtsProvider;
+  endpoint: string;
+  /** 豆包专用：`X-Api-Resource-Id`（seed-tts-1.0 / seed-tts-2.0）。 */
+  resource_id: string;
+  /** 百炼专用：模型名。 */
+  model: string;
+  api_key: string;
+  /** 音色名——豆包填 speaker ID，百炼填 voice 名，两者不通用。 */
+  voice: string;
+  /** 豆包专用：`additions.explicit_language`，空则不传。 */
+  explicit_language: string;
+  /** 百炼专用：`input.language_type`。 */
+  language_type: string;
+  target_sample_rate: number;
+  max_chars: number;
+  timeout_secs: number;
+}
+
+/** Agent 任务台总配置。 */
+export interface DeskConfig {
+  schema: number;
+  enabled: boolean;
+  /** 产物交付目录。空 = 用配置目录旁的 agent_desk_out。 */
+  output_dir: string;
+  tts: TtsConfig;
+  summary: SummaryConfig;
+  notice: NoticeConfig;
+  /** 外部会话监工（C：盯 codex 的 rollout 日志）。 */
+  probe: ProbeConfig;
+  drivers: DriverConfig[];
+  slots: SlotBinding[];
+}
+
+/** 外部会话监工（C 方案）。 */
+export interface ProbeConfig {
+  /** 总开关。默认开：没装 codex 时根目录不存在 ⇒ 零副作用。 */
+  enabled: boolean;
+  /** rollout 根目录。留空 = 用 `%USERPROFILE%\.codex\sessions`。 */
+  root: string;
+}
+
+/** 执行器的 UI 视图（**不含密钥**）。 */
+export interface DriverView {
+  id: string;
+  label: string;
+  kind: string;
+  enabled: boolean;
+  configured: boolean;
+  /** 能否被调度（校验无错 + 已启用 + 配置完整）。与 configured 不是一回事。 */
+  schedulable: boolean;
+  completion_label: string;
+  confidence: string;
+  gated: boolean;
+  capabilities: string[];
+  /** 硬错误：会导致拒绝调度，必须展示。 */
+  errors: string[];
+  /** 软警告：能跑但有风险（可信度中 / 缺 HOME），必须展示而不是静默吞掉。 */
+  warnings: string[];
+  note: string;
+}
+
+/** 槽位视图。 */
+export interface SlotView {
+  index: number;
+  mode: string;
+  detail: string;
+  /** 需要注意但不阻塞的事（如"能力路由尚未实现"）。 */
+  notes: string[];
+}
+
+/** 任务台总览。 */
+export interface DeskSnapshot {
+  enabled: boolean;
+  ready: boolean;
+  /** 未就绪的具体原因，逐条列。 */
+  blockers: string[];
+  tts_configured: boolean;
+  tts_model: string;
+  output_dir: string;
+  config_path: string;
+  drivers: DriverView[];
+  slots: SlotView[];
+}
+
+// ---------------------------------------------------------------------------
+// 任务台运行时（Phase 2：队列 + 未读 + 播放租约）
+//
+// 与 Rust 侧 `agent_desk::{queue,unread,state}` 的视图结构一一对应。
+// 字段名一律保持 snake_case，跟其它接口一致，不做驼峰转换。
+// ---------------------------------------------------------------------------
+
+/** 队列里的一条任务。 */
+export interface QueuedTask {
+  id: number;
+  slot: number;
+  prompt: string;
+  driver_id: string;
+  enqueued_at_ms: number;
+}
+
+/** 正在执行的一条任务。 */
+export interface RunningTask {
+  task: QueuedTask;
+  started_at_ms: number;
+}
+
+export interface SlotQueueView {
+  index: number;
+  running?: RunningTask | null;
+  pending: QueuedTask[];
+  depth: number;
+}
+
+export interface QueueSnapshot {
+  /** 正在执行的**槽位数**，不是任务条目数。第 5 颗灯的输入。 */
+  running_count: number;
+  total_pending: number;
+  active_drivers: string[];
+  completed: number;
+  failed: number;
+  slots: SlotQueueView[];
+}
+
+export interface SlotUnreadView {
+  index: number;
+  pending: number;
+  generation: number;
+  leased: boolean;
+}
+
+export interface UnreadSnapshot {
+  total_pending: number;
+  /** 正在持有播放租约的槽位；null/undefined = 喇叭空闲。 */
+  playing_slot?: number | null;
+  slots: SlotUnreadView[];
+}
+
+/** 运行时总快照（事件 `agent-desk-state` 的载荷）。 */
+export interface RuntimeSnapshot {
+  queue: QueueSnapshot;
+  unread: UnreadSnapshot;
+  busy: boolean;
+  /** 完全空闲（没在跑、也没排队）。注意与 `!busy` 不等价。 */
+  idle: boolean;
+  any_unread: boolean;
+}
+
+/** 派发结果：立刻开始 或 排队等待。 */
+export type DispatchOutcome =
+  | { state: "started"; task_id: number; depth: number }
+  | { state: "queued"; task_id: number; ahead: number };
+
+/** 播放租约。 */
+export interface Lease {
+  slot: number;
+  token: number;
+  granted_at_ms: number;
+  generation: number;
+  granted_pending: number;
+}
+
+/** 一次成功回执的结果。 */
+export interface ConsumeOutcome {
+  slot: number;
+  remaining: number;
+}
+
+/** 统一返回信封（对应 Rust 的 `ApiEnvelope`）。 */
+export interface ApiEnvelope<T> {
+  ok: boolean;
+  code: string;
+  data?: T;
+  message?: string;
+}
+
+/** TTS 试合成报告。 */
+export interface TtsTestReport {
+  sample_rate: number;
+  samples: number;
+  duration_ms: number;
+  characters?: number;
+  /** 落盘的 WAV 绝对路径。 */
+  wav_path: string;
+}
+
+/** 执行器探测报告。`scope` 说明本次只做了哪一层检查。 */
+export interface DriverProbe {
+  id: string;
+  ready: boolean;
+  scope: string;
+  detail: string;
+}
+
+// ---------------------------------------------------------------------------
+// 任务台播报（Phase 3 第二段「后声」）
+//
+// ⛔ 一条要记住的边界：状态播报（Notice）**不产生未读**。
+// 收到 Notice 只说明"发生了什么"，不代表"有结果等你听" ——
+// 后者看 RuntimeSnapshot.unread。两者是两条独立通道，别混。
+// ---------------------------------------------------------------------------
+
+/** 状态播报的固定语料（闭合集，与 Rust 的 `NoticeKind` 一一对应）。 */
+export type NoticeKind =
+  | "task_started"
+  | "progressing"
+  | "running_1min"
+  | "running_5min"
+  | "completed"
+  | "completed_artifact_failed"
+  | "failed"
+  | "needs_confirmation"
+  | "timed_out"
+  | "lost_contact";
+
+/** 一条语料的缓存状态。 */
+export interface NoticeItemView {
+  kind: NoticeKind;
+  code: number;
+  /** 固定语料文本。 */
+  text: string;
+  /** 是否已有可用缓存（存在且长度合理）⇒ 能离线播。 */
+  cached: boolean;
+  path?: string;
+  bytes?: number;
+}
+
+export interface NoticeStatusReport {
+  dir: string;
+  total: number;
+  cached: number;
+  /** 全部就绪 ⇒ **离线播报可用**（拔网线也能播状态）。 */
+  offline_ready: boolean;
+  /** TTS 未配置 ⇒ 无法预合成，必须让用户看到原因。 */
+  tts_configured: boolean;
+  /** 上一条真的播出去的通知（诊断"为什么刚才没响"的第一站）。 */
+  last_spoken?: NoticeKind;
+  items: NoticeItemView[];
+}
+
+export interface NoticePrepareFailure {
+  kind: NoticeKind;
+  reason: string;
+}
+
+export interface NoticePrepareReport {
+  synthesized: NoticeKind[];
+  already_cached: NoticeKind[];
+  failed: NoticePrepareFailure[];
+  offline_ready: boolean;
+  duration_ms: number;
+}
+
+export interface NoticePlayReport {
+  kind: NoticeKind;
+  text: string;
+  /** 是否完整播完（被抢占则为 false）。 */
+  completed: boolean;
+  duration_ms: number;
+  played_samples: number;
+  total_samples: number;
+}
+
+export interface RenderResultReport {
+  slot: number;
+  task_id?: number;
+  /** 真正送给 TTS 的文本 —— 回传是为了可核对"它到底念了什么"。 */
+  spoken: string;
+  success: boolean;
+  result_at_ms: number;
+  completed: boolean;
+  lease_token: number;
+  /** ⭐ 只有完整播完才为 true。被中断时未读必须留着。 */
+  consumed: boolean;
+  unread_left: number;
+  duration_ms: number;
+}
+
+/** `agent-desk-notice` 事件的载荷。 */
+export interface NoticeEventPayload {
+  slot?: number;
+  kind: NoticeKind;
+  text: string;
+  /** 是否终态（值得打断的判据）。 */
+  terminal: boolean;
+  audio_path?: string;
+  /** 补充文本（C：外部会话的最终回复摘要）。**不参与语音**，只用于字幕。 */
+  detail?: string;
+}
+
+// ---------------------------------------------------------------------------
+// 文本注入（A″：语音打进终端 / TUI 场景）
+// ---------------------------------------------------------------------------
+
+/**
+ * 模拟粘贴时按哪一组键。
+ *
+ * 为什么必须可配：`Ctrl+V` 是**图形界面**的约定；终端里的 TUI 程序（codex 等）
+ * 把终端置于 raw mode 直接读按键字节，`Ctrl+V` 在那里是字面量 0x16，会被 TUI
+ * 当成自己的快捷键吃掉 —— **粘不进去**。
+ *
+ * ⚠️ 而终端该用哪一组键**没有统一答案**（本机实测 09-20）：
+ * Windows Terminal → `Ctrl+Shift+V`；Git Bash（mintty）→ `Shift+Insert`。
+ *
+ * `auto` 是默认值：由**焦点窗口的类名**自动决定（按实测表选键），不必手动切。
+ */
+export type PasteStyle = "auto" | "ctrl_v" | "shift_insert" | "ctrl_shift_v";
+
+/** 每种方式的界面说明（顺序 = 下拉框顺序）。 */
+export const PASTE_STYLE_OPTIONS: { value: PasteStyle; label: string; hint: string }[] = [
+  {
+    value: "auto",
+    label: "自动（推荐）",
+    hint: "看当前焦点窗口：Windows Terminal → Ctrl+Shift+V，Git Bash → Shift+Insert，其余（含认不出的终端）→ Ctrl+V",
+  },
+  { value: "ctrl_v", label: "Ctrl+V", hint: "图形界面约定。强制使用，不看焦点窗口" },
+  {
+    value: "shift_insert",
+    label: "Shift+Insert",
+    hint: "Git Bash / mintty 的粘贴键（实测可用）。TUI 程序（codex / vim 等）必须用终端级粘贴",
+  },
+  {
+    value: "ctrl_shift_v",
+    label: "Ctrl+Shift+V",
+    hint: "Windows Terminal 的粘贴键（实测可用，Shift+Insert 在那里不保证能用）",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// 「启动终端并预置命令」
+// ---------------------------------------------------------------------------
+
+/**
+ * 用哪个终端承载预置命令。
+ *
+ * `auto` 的判定是"**看文件在不在**"（优先 Windows Terminal，没有则 cmd），
+ * 而不是"试着起一个、失败再换" —— 后者会先弹一个空窗口再弹一个，用户看到两个窗口闪。
+ */
+export type TerminalKind = "auto" | "wt" | "cmd" | "powershell";
+
+/** 终端选项的界面说明（顺序 = 下拉框顺序）。 */
+export const TERMINAL_KIND_OPTIONS: { value: TerminalKind; label: string; hint: string }[] = [
+  {
+    value: "auto",
+    label: "自动检测（推荐）",
+    hint: "优先 Windows Terminal（实测粘贴键 Ctrl+Shift+V），没有则用 cmd.exe",
+  },
+  { value: "wt", label: "Windows Terminal", hint: "强制用 wt.exe 开新窗口" },
+  { value: "cmd", label: "cmd.exe", hint: "经典命令提示符（ConsoleWindowClass，粘贴键回落 Ctrl+V）" },
+  { value: "powershell", label: "Windows PowerShell", hint: "powershell.exe 新窗口" },
+];
+
+/**
+ * 「启动终端」配置（后端 `cli_terminal.json`）。
+ *
+ * ⚠️ `command` 是**命令前缀**，不是完整命令 —— 语音说出的内容会接在它后面。
+ * 所以界面文案必须说清这一点，否则用户会以为"按一下就跑了"。
+ */
+export interface CliTerminalConfig {
+  /** 要预置到输入框里的命令（不含回车；末尾的空格由后端补）。 */
+  command: string;
+  /** 工作目录（空 = 用户主目录）。 */
+  cwd: string;
+  terminal: TerminalKind;
+  /** 打完是否直接回车执行。默认 false（预置前缀，等语音补全）。 */
+  auto_run: boolean;
+}

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<title>内容台 · 页签模式预览（真渲染）</title>
+<!--
+  页签模式（路径 A）渲染验证页。与 panel-preview.html 的分工：
+    · panel-preview.html       —— ⌘SS 浮层模式（暗色，340px 窄栏）
+    · panel-preview-page.html  —— 宿主主窗页签模式（亮色，填充整块内容区）  ← 本文件
+
+  这一版专门验三件浮层版验不到的事：
+    1. 页签模式下 .studio-panel **不带 position:fixed**（契约 P2）
+    2. 面板**真实填满**宿主容器（尺寸断言，不是"看起来像"）
+    3. 「收起」按钮在页签模式下被隐藏（宿主管关闭）
+
+  用法：Chrome headless 截图本文件，肉眼 + 页面内断言框一起看。
+-->
+<style>
+  /* 亮色令牌逐字抄自 src/styles.css 的 [data-theme="light"]，
+     这样 var(--panel) 等取到的是**真值**，预览才可信。 */
+  [data-theme="light"] {
+    --bg: #fafaf9; --panel: #fff; --panel-2: #f5f5f4;
+    --border: #e7e5e4; --text: #1c1917; --text-dim: #78716c;
+    --accent: #ff6b35; --accent-text: #c2410c;
+    --ok: #15803d; --err: #dc2626;
+    --shadow: rgba(28, 25, 23, 0.12);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 13px;
+    --radius-sm: 8px; --radius-md: 10px; --radius-lg: 12px;
+    --font-sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+
+  /* ── 模拟 easyop 主窗：左侧页签栏 + 右侧内容区 ── */
+  .app { display: flex; height: 100vh; }
+  .side {
+    width: 136px; flex: none; padding: 10px 8px;
+    border-right: 1px solid var(--border); background: var(--bg);
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .side .brand { font-weight: 500; font-size: 13px; padding: 2px 8px 8px; }
+  .nav {
+    padding: 5px 8px; border-radius: var(--radius-sm);
+    color: var(--text-dim); cursor: default;
+  }
+  .nav.is-active { background: var(--panel-2); color: var(--text); font-weight: 500; }
+  .nav.is-plugin { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 9px; }
+  .side .note { margin-top: auto; font-size: 11px; color: var(--text-dim); padding: 4px 8px; }
+
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    height: 34px; flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 0 12px; border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--text-dim);
+  }
+  .topbar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+  /* 关键：宿主要给页签容器一个**确定的**高度，面板的 height:100% 才有依据 */
+  #studioMount { flex: 1; min-height: 0; }
+
+  /* 断言框 */
+  #report {
+    position: fixed; left: 148px; bottom: 10px; right: 10px; max-height: 24%;
+    overflow: auto; padding: 8px 10px; border-radius: var(--radius-md);
+    border: 1px solid var(--border); background: var(--panel);
+    font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+    white-space: pre-wrap; line-height: 1.55;
+  }
+</style>
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand">easyop</div>
+      <div class="nav">工作台</div>
+      <div class="nav">按键重映射</div>
+      <div class="nav">应用管理</div>
+      <div class="nav">语音</div>
+      <div class="nav">方案</div>
+      <div class="nav">设置</div>
+      <div class="nav is-plugin">内容台 · 页签</div>
+      <div class="note">静态 6 项 + 插件页（order 50）</div>
+    </aside>
+
+    <div class="main">
+      <div class="topbar">
+        <span class="dot"></span>
+        <span>内容台 —— 页签模式（填充内容区，非浮层）</span>
+      </div>
+      <div id="studioMount"></div>
+    </div>
+  </div>
+
+<script type="module">
+  // ── 桩 eo.*：数据固定，便于目视比对 ──
+  const store = {
+    topics: [
+      { id: 't1', title: '82Ω 串联电阻怎么选', chosenTitle: '82Ω 串联电阻到底该怎么选',
+        stage: 'humanized', source: '实测记录',
+        intel: { angle: ['阻抗失配会引起振铃', '82Ω 是经验值但要看走线'],
+                 fact: ['实测过冲 18%，加 82Ω 后降到 7%'],
+                 quote: ['阻抗匹配不是算出来的，是量出来的'], risk: [] },
+        titles: ['直给：82Ω 到底该怎么选', '提问：82Ω 真的是最优值吗？', '场景：示波器上的那圈振铃'],
+        body: '（一段正文）', humanized: '（去 AI 味后的正文）'.repeat(6) },
+      { id: 't2', title: 'AFE 电源温升 50-70℃', stage: 'intel',
+        intel: { angle: ['LDO 压差太大'], fact: ['VIN 2.2V / VOUT 1.15V'], quote: [], risk: ['供应链'] },
+        titles: [], body: '', humanized: '' },
+      { id: 't3', title: 'ESD 接触放电与 AFE', stage: 'inspiration',
+        intel: { angle: [], fact: [], quote: [], risk: [] }, titles: [], body: '', humanized: '' },
+    ],
+    meta: { schemaVersion: 1, currentId: 't1' },
+  };
+
+  const commands = {};
+  const pages = {};
+  const context = {
+    pluginId: 'studio',
+    pluginDir: 'X:/plugins/studio',
+    registerCommand: (id, fn) => { commands[id] = fn; },
+    // 模拟「宿主侧已完成 H4」：提供 registerPage
+    registerPage: (id, fn) => { pages[id] = fn; },
+    api: {
+      get_selection: async () => '',
+      replace_selection: async () => {},
+      inject: async () => {},
+      storage: {
+        get: async (k) => (k in store ? store[k] : null),
+        set: async (k, v) => { store[k] = v; },
+      },
+      log: { info: async () => {}, warn: async () => {}, error: async () => {} },
+      chat: async () => '（桩回复）',
+      run: async () => ({ exit_code: 0, stdout: '', stderr: '', timed_out: false, cancelled: false }),
+    },
+  };
+
+  const mod = await import('../index.js');
+  await mod.activate(context);
+
+  const lines = [];
+  const ok = (cond, label, extra) =>
+    lines.push(`${cond ? '✔' : '✘'} ${label}${extra ? `  —— ${extra}` : ''}`);
+
+  const PAGE_ID = 'studio.board';
+  ok(typeof pages[PAGE_ID] === 'function', `registerPage('${PAGE_ID}') 被调用（共 ${Object.keys(pages).length} 个页）`);
+
+  // ── 真渲染进宿主容器 ──
+  const mount = document.getElementById('studioMount');
+  const life = pages[PAGE_ID](mount);
+  ok(!(life instanceof Promise), 'P1 渲染函数同步返回（非 Promise）');
+  ok(!!life && typeof life.refresh === 'function' && typeof life.dispose === 'function',
+     'P1 返回 { refresh, dispose }');
+
+  const panel = mount.querySelector('[data-studio="panel"]');
+  ok(!!panel, '面板根节点已挂进宿主容器');
+  ok(panel && panel.getAttribute('data-studio-mode') === 'page', 'data-studio-mode = page');
+  ok(panel && panel.classList.contains('is-page'), '带 .is-page 修饰类');
+
+  // ── P2：绝不能是 fixed ──
+  const pos = panel ? getComputedStyle(panel).position : 'n/a';
+  ok(pos === 'static', 'P2 面板 position 为 static（不是 fixed）', `实测 ${pos}`);
+
+  // ── 真实填满容器（尺寸断言）──
+  const pr = panel.getBoundingClientRect();
+  const cr = mount.getBoundingClientRect();
+  const dx = Math.abs(pr.width - cr.width);
+  const dy = Math.abs(pr.height - cr.height);
+  ok(dx <= 1 && dy <= 1, '面板真实填满宿主容器',
+     `面板 ${pr.width.toFixed(0)}×${pr.height.toFixed(0)} vs 容器 ${cr.width.toFixed(0)}×${cr.height.toFixed(0)}`);
+
+  // ── 收起按钮在页签模式下应被隐藏 ──
+  const closeBtn = panel && panel.querySelector('[data-sp="close"]');
+  ok(!!closeBtn && getComputedStyle(closeBtn).display === 'none',
+     '页签模式下「收起」按钮已隐藏（宿主管关闭）');
+
+  // ── 内容真渲染出来了吗 ──
+  // ⚠️ 时序：renderPage 是**同步返回**的（契约 P1），台账数据由 refreshPanel 异步填充。
+  // 所以这里必须等一拍再数——否则数到的是"还没填数据的空壳"，会误报 0。
+  await new Promise((r) => setTimeout(r, 150));
+  const rows = mount.querySelectorAll('.sp-item').length;
+  const secs = mount.querySelectorAll('.sp-sec').length;
+  const chips = mount.querySelectorAll('.sp-chip').length;
+  const btns = mount.querySelectorAll('.sp-acts .sp-btn').length;
+  ok(rows === 3, `选题行 = ${rows}（应 3）`);
+  ok(secs >= 4, `详情块 = ${secs}（应 ≥4）`);
+  ok(chips === 3, `标题候选 = ${chips}（应 3）`);
+  ok(btns === 8, `动作按钮 = ${btns}（应 8）`);
+
+  // ── 幂等 + dispose ──
+  pages[PAGE_ID](mount);
+  ok(mount.querySelectorAll('[data-studio="panel"]').length === 1,
+     `重复渲染后仍只有一份面板（实测 ${mount.querySelectorAll('[data-studio="panel"]').length} 份）`);
+
+  const before = mount.querySelectorAll('[data-studio="style"]').length;
+  pages[PAGE_ID](mount).dispose();
+  const afterPanel = mount.querySelectorAll('[data-studio="panel"]').length;
+  const afterStyle = document.head.querySelectorAll('[data-studio="style"]').length;
+  ok(afterPanel === 0, `dispose 后容器清空（残留面板 ${afterPanel}）`);
+  ok(afterStyle === 0, `dispose 后样式摘除（注入过 ${before} 份，残留 ${afterStyle}）`);
+
+  // 复原一份用于截图
+  pages[PAGE_ID](mount);
+
+  document.title = `页签模式预览 · ${Object.keys(commands).length} 命令 · ${Object.keys(pages).length} 页`;
+  const bad = lines.filter((l) => l.startsWith('✘')).length;
+  const rep = document.createElement('div');
+  rep.id = 'report';
+  rep.style.borderColor = bad ? 'var(--err)' : 'var(--ok)';
+  rep.textContent = `断言 ${lines.length - bad}/${lines.length} 通过\n\n` + lines.join('\n');
+  document.body.appendChild(rep);
+
+  window.__pagePreviewReady = true;
+</script>
+</body>
+</html>

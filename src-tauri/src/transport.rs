@@ -226,6 +226,42 @@ pub fn send_command(json: &str) -> Result<(), String> {
     Err(last_err)
 }
 
+/// 下发一条**已构造好的** Feature Report（首字节即 Report ID），不等待任何回执。
+///
+/// 与 [`send_command`] 的区别：那个把入参当"配置载荷"分块（带 Magic / CRC / 分块头），
+/// 这个只负责"把这串字节送到支持 Feature Report 的集合上"。**协议含义由调用方负责**
+/// —— 例如任务台的 `0x16` 逐像素帧、`0x12` Agent 状态帧。
+///
+/// 与 `send_command` 同理，只打开支持 Feature Report 的集合（app-command 集合），
+/// 跳过键盘集合：打开键盘集合会干扰系统键盘事件路由。
+pub fn send_feature_report(report: &[u8]) -> Result<(), String> {
+    if report.is_empty() {
+        return Err("Feature Report 不能为空".to_string());
+    }
+    let paths = device::enumerate_device_paths();
+    if paths.is_empty() {
+        return Err(format!(
+            "未找到开发板（VID {:04X} / PID {:04X}），请确认已通过 USB 连接",
+            VID, PID
+        ));
+    }
+    let mut last_err = "所有候选 HID 设备均无法下发该 Feature Report".to_string();
+    for path in paths {
+        let Some(handle) = device::open_matching(&path) else { continue };
+        if !device::has_feature_report(handle) {
+            device::close_handle(handle);
+            continue;
+        }
+        let result = send_feature(handle, report);
+        device::close_handle(handle);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

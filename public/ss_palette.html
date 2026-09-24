@@ -1,0 +1,2923 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>⌘SS 命令面板</title>
+    <style>
+      /*
+       * 独立页面（不走 Vite 打包），令牌按 styles.css 的深/浅两套各抄一份最小集，
+       * 只保留这里真正用到的键。主题来源与主窗口一致：localStorage `easyop.theme`
+       * + `prefers-color-scheme`，靠 `storage` 事件跟随主窗口的实时切换。
+       */
+      :root,
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --panel-rgb: 23, 27, 44;
+        --panel-2: #1f2438;
+        --border: #2a3048;
+        --text: #e8eaf2;
+        --text-dim: #98a0b8;
+        --accent-solid: #ff6b35;
+        --accent-rgb: 255, 107, 53;
+        --on-accent: #fff;
+        --shadow: rgba(0, 0, 0, 0.55);
+        --search-bg: rgba(255, 255, 255, 0.04);
+        --err: #ff5a6e;
+        --ok: #22c55e;
+      }
+      [data-theme="light"] {
+        color-scheme: light;
+        --panel-rgb: 255, 255, 255;
+        --panel-2: #f5f5f4;
+        --border: #e7e5e4;
+        --text: #1c1917;
+        --text-dim: #78716c;
+        --accent-solid: #c2410c;
+        --accent-rgb: 255, 107, 53;
+        --on-accent: #fff;
+        --shadow: rgba(28, 25, 23, 0.22);
+        --search-bg: rgba(0, 0, 0, 0.02);
+        --err: #dc2626;
+        --ok: #16a34a;
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      body {
+        display: flex;
+        /* 顶部对齐：结果变多、窗口向下长高时，搜索框的位置保持不动。 */
+        align-items: flex-start;
+        justify-content: center;
+        /* 四周留白：给面板的边框和阴影留出呼吸空间，避免贴住窗口边缘被裁掉。 */
+        padding: 12px;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+      }
+
+      /* ---------- 面板容器 ---------- */
+      /*
+       * 高度不再写死：面板按内容自然撑开，前端量出真实高度后同步窗口尺寸
+       * （见 adjustWindowHeight）。这样内容永远不会超出窗口、边框被裁掉。
+       */
+      .palette {
+        width: 600px;
+        flex: 0 0 auto;
+        display: flex;
+        flex-direction: column;
+        background: rgba(var(--panel-rgb), 0.82);
+        backdrop-filter: blur(22px) saturate(1.4);
+        -webkit-backdrop-filter: blur(22px) saturate(1.4);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: 0 4px 16px var(--shadow), 0 1px 3px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+      }
+
+      /* ---------- 搜索框 ---------- */
+      .search-wrap {
+        position: relative;
+        padding: 12px 14px 10px;
+        flex-shrink: 0;
+      }
+
+      .search-icon {
+        position: absolute;
+        left: 24px;
+        top: 32px; /* 12px 上内边距 + 40px 输入框高度的一半 */
+        transform: translateY(-50%);
+        width: 16px;
+        height: 16px;
+        color: var(--text-dim);
+        pointer-events: none;
+        flex-shrink: 0;
+      }
+
+      .search-input {
+        width: 100%;
+        height: 40px;
+        padding: 0 14px 0 40px;
+        background: var(--search-bg);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        font-size: 14px;
+        font-family: inherit;
+        outline: none;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      .search-input:focus {
+        border-color: rgba(var(--accent-rgb), 0.5);
+        /* 光晕收窄：输入框始终处于聚焦态，光晕过重会让搜索框显得更“大”。 */
+        box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.12);
+      }
+
+      .search-input::placeholder {
+        color: var(--text-dim);
+      }
+
+      /* ---------- 小程序图标区 ---------- */
+      /*
+       * 搜索框正下方：已集成的小程序（外部 App / Web 项目 / 项目目录）摊成一格一格的图标，
+       * 点一下即启动，形态对齐微信小程序入口。
+       *
+       * 这块区域只在「还没输入关键词」时存在，一开始搜索就整块收起（见 triggerSearch），
+       * 所以它既不占搜索结果的位，也不会和搜索词抢键盘输入。
+       */
+      .apps {
+        flex-shrink: 0;
+        padding: 0 12px 6px;
+      }
+      .apps.hidden { display: none; }
+
+      .apps-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px 4px;
+        /* 与搜索框之间拉一条分隔线，免得图标看起来像搜索框的一部分 */
+        border-top: 1px solid var(--border);
+        padding: 10px 2px 6px;
+        /* 集成项很多时不让面板无限长高：超过两行就在这块内部滚动（窗口高度同步见 adjustWindowHeight） */
+        max-height: 156px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+      .apps-grid::-webkit-scrollbar { width: 6px; }
+      .apps-grid::-webkit-scrollbar-track { background: transparent; }
+      .apps-grid::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 999px;
+      }
+
+      .app-cell {
+        width: 58px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        padding: 4px 2px 2px;
+        border-radius: 10px;
+        cursor: pointer;
+        user-select: none;
+        -webkit-user-select: none;
+        transition: background 0.1s ease;
+      }
+
+      .app-cell:hover {
+        background: var(--panel-2);
+      }
+
+      .app-icon {
+        width: 40px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        border-radius: 10px;
+        background: var(--panel-2);
+        overflow: hidden;
+        flex-shrink: 0;
+      }
+      .app-icon img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      /* 按集成类型区分底色，一眼看出点下去开的是「程序」「网页」还是「目录」 */
+      .app-icon.k-app    { background: rgba(99, 102, 241, 0.18); color: #6366f1; }
+      .app-icon.k-url    { background: rgba(59, 130, 246, 0.18); color: #3b82f6; }
+      .app-icon.k-folder { background: rgba(255, 193, 7, 0.18);  color: #f59e0b; }
+
+      /*
+       * 名称：默认看不见，鼠标移上去才淡入 —— 图标区默认只有图标，保持紧凑。
+       * 占位高度照留，所以名称出现不会把下面的东西顶来顶去（悬停时元素不会跳）。
+       */
+      .app-name {
+        max-width: 100%;
+        font-size: 11px;
+        line-height: 1.3;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        opacity: 0;
+        transition: opacity 0.12s ease;
+        pointer-events: none;
+      }
+      .app-cell:hover .app-name {
+        opacity: 1;
+        color: var(--text);
+      }
+
+      /* ---------- 结果列表 ---------- */
+      .results {
+        overflow-y: auto;
+        overflow-x: hidden;
+        /* 最多露出 8 条（8×44 + 7×2 + 上下内边距），超出滚动。 */
+        max-height: 376px;
+        padding: 2px 12px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+      .results::-webkit-scrollbar { width: 6px; }
+      .results::-webkit-scrollbar-track { background: transparent; }
+      .results::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 999px;
+      }
+
+      .result-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 12px;
+        height: 44px;
+        border-radius: 10px;
+        cursor: pointer;
+        position: relative;
+        transition: background 0.1s ease;
+      }
+
+      .result-item:hover {
+        background: var(--panel-2);
+      }
+
+      .result-item.active {
+        background: rgba(var(--accent-rgb), 0.14);
+      }
+
+      /* 选中项左侧强调色竖条 */
+      .result-item.active::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 8px;
+        bottom: 8px;
+        width: 3px;
+        border-radius: 999px;
+        background: var(--accent-solid);
+      }
+
+      .result-icon {
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        flex-shrink: 0;
+        background: var(--panel-2);
+        border-radius: 8px;
+      }
+
+      /* 文件类型图标背景色，一眼区分类别 */
+      .result-icon.type-folder  { background: rgba(255, 193, 7, 0.18);  color: #f59e0b; }
+      .result-icon.type-exe     { background: rgba(99, 102, 241, 0.18);  color: #6366f1; }
+      .result-icon.type-doc     { background: rgba(59, 130, 246, 0.18);  color: #3b82f6; }
+      .result-icon.type-code    { background: rgba(16, 185, 129, 0.18);  color: #10b981; }
+      .result-icon.type-image   { background: rgba(236, 72, 153, 0.18);  color: #ec4899; }
+      .result-icon.type-audio   { background: rgba(139, 92, 246, 0.18);  color: #8b5cf6; }
+      .result-icon.type-video   { background: rgba(239, 68, 68, 0.18);   color: #ef4444; }
+      .result-icon.type-archive { background: rgba(245, 158, 11, 0.18);  color: #f59e0b; }
+      .result-icon.type-other   { background: var(--panel-2);             color: var(--text-dim); }
+      /* 内置工具（计算器 / 待办 / 截图 / 翻译）的入口用强调色，和「能打开的项」区分开 */
+      .result-icon.type-miniapp { background: rgba(var(--accent-rgb), 0.16); color: var(--accent-solid); }
+      /* 插件命令：独立的青色系 —— 与内置工具（强调色）、系统应用（靛蓝）都不撞色 */
+      .result-icon.type-plugin  { background: rgba(20, 184, 166, 0.18);  color: #14b8a6; }
+
+      .result-text {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .result-title {
+        font-size: 13.5px;
+        color: var(--text);
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .result-item.active .result-title {
+        font-weight: 600;
+      }
+
+      .result-title .match {
+        color: var(--accent-solid);
+        font-weight: 600;
+      }
+
+      .result-subtitle {
+        font-size: 11.5px;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ---------- 空态 ---------- */
+      /* 高度随内容走（不再 flex:1 撑开），窗口高度由 JS 同步，避免内容溢出被裁。 */
+      .empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        padding: 8px 32px 16px;
+        text-align: center;
+      }
+
+      .empty-icon {
+        font-size: 14px;
+        margin-right: 4px;
+        opacity: 0.7;
+      }
+
+      .empty-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-dim);
+      }
+
+      .empty-tip {
+        font-size: 11.5px;
+        line-height: 1.45;
+        color: var(--text-dim);
+        opacity: 0.75;
+      }
+
+      .hidden { display: none !important; }
+
+      /* ---------- 底部状态栏 ---------- */
+      .status-bar {
+        height: 30px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 14px;
+        border-top: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+        flex-shrink: 0;
+      }
+
+      .status-bar b {
+        color: var(--text);
+        font-weight: 600;
+      }
+
+      .status-bar .sep {
+        opacity: 0.4;
+      }
+
+      .status-spin {
+        margin-left: auto;
+        flex-shrink: 0;
+        color: var(--accent-solid);
+        font-weight: 600;
+        font-size: 11.5px;
+      }
+
+      /* 搜索中微动画 */
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .status-spin.spinning::before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-right: 6px;
+        border: 2px solid rgba(var(--accent-rgb), 0.3);
+        border-top-color: var(--accent-solid);
+        border-radius: 50%;
+        vertical-align: -1px;
+        animation: spin 0.7s linear infinite;
+      }
+
+      /* ---------- 内置工具视图 ---------- */
+      /*
+       * 内置工具不是独立窗口，而是把面板主体从「搜索结果列表」换成一块自绘 UI：
+       * 搜索框与结果列表整体隐藏，由 #miniapp 接管，Esc 回到搜索视图。
+       */
+      .miniapp {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 0 12px 10px;
+      }
+
+      /* 顶部窄工具栏：返回键 + 工具名 + 一行右侧提示 */
+      .miniapp-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 26px;
+        padding: 0 2px;
+      }
+
+      .miniapp-back {
+        width: 24px;
+        height: 24px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--panel-2);
+        color: var(--text-dim);
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease;
+      }
+
+      .miniapp-back:hover {
+        background: rgba(var(--accent-rgb), 0.16);
+        color: var(--accent-solid);
+      }
+
+      .miniapp-head-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .miniapp-head-hint {
+        margin-left: auto;
+        min-width: 0;
+        font-size: 11px;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .miniapp-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-height: 36px;
+      }
+
+      /* 通用控件：几个内置工具共用，视觉与搜索框保持一致 */
+      .mini-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .mini-input {
+        flex: 1;
+        min-width: 0;
+        height: 36px;
+        padding: 0 12px;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        background: var(--search-bg);
+        color: var(--text);
+        font-family: inherit;
+        font-size: 13px;
+        outline: none;
+        /* body 上是 user-select: none，不显式放开的话输入框里选不了字 */
+        user-select: text;
+        -webkit-user-select: text;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      .mini-input::placeholder {
+        color: var(--text-dim);
+      }
+
+      .mini-input:focus {
+        border-color: rgba(var(--accent-rgb), 0.5);
+        box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.12);
+      }
+
+      .mini-btn {
+        height: 36px;
+        padding: 0 14px;
+        flex-shrink: 0;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        background: var(--accent-solid);
+        color: var(--on-accent);
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: filter 0.12s ease, background 0.12s ease, color 0.12s ease,
+          border-color 0.12s ease;
+      }
+
+      .mini-btn:hover {
+        filter: brightness(1.08);
+      }
+
+      .mini-btn.ghost {
+        background: var(--panel-2);
+        color: var(--text-dim);
+        border-color: var(--border);
+        font-weight: 500;
+      }
+
+      .mini-btn.ghost:hover {
+        color: var(--accent-solid);
+        border-color: rgba(var(--accent-rgb), 0.45);
+        filter: none;
+      }
+
+      .mini-btn:disabled {
+        opacity: 0.45;
+        cursor: default;
+        filter: none;
+      }
+
+      /* 多行说明文字；在 flex 行里会自动占满剩余空间 */
+      .mini-note {
+        flex: 1;
+        min-width: 0;
+        font-size: 11.5px;
+        line-height: 1.5;
+        color: var(--text-dim);
+      }
+
+      /* 计算器：大号结果 */
+      .mini-calc-out {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        min-height: 40px;
+        padding: 2px 4px 0;
+      }
+
+      .mini-calc-value {
+        font-size: 26px;
+        font-weight: 600;
+        line-height: 1.2;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+        word-break: break-all;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+
+      /* 出错时缩成一行小字，和答案在视觉上区分开 */
+      .mini-calc-value.err {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--err);
+      }
+
+      /* 待办清单 */
+      .mini-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        max-height: 240px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .mini-list::-webkit-scrollbar { width: 6px; }
+      .mini-list::-webkit-scrollbar-track { background: transparent; }
+      .mini-list::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 999px;
+      }
+
+      .mini-todo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        height: 38px;
+        padding: 0 10px;
+        border-radius: 9px;
+        transition: background 0.1s ease;
+      }
+
+      .mini-todo:hover {
+        background: var(--panel-2);
+      }
+
+      .mini-todo-check {
+        width: 18px;
+        height: 18px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 1.5px solid var(--border);
+        border-radius: 5px;
+        color: transparent;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+      }
+
+      .mini-todo-check:hover {
+        border-color: rgba(var(--accent-rgb), 0.6);
+      }
+
+      .mini-todo.done .mini-todo-check {
+        background: var(--accent-solid);
+        border-color: var(--accent-solid);
+        color: var(--on-accent);
+      }
+
+      .mini-todo-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 13px;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .mini-todo.done .mini-todo-text {
+        color: var(--text-dim);
+        text-decoration: line-through;
+      }
+
+      .mini-todo-del {
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-dim);
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.1s ease, background 0.1s ease, color 0.1s ease;
+      }
+
+      .mini-todo:hover .mini-todo-del { opacity: 1; }
+      .mini-todo-del:hover {
+        background: rgba(255, 90, 110, 0.16);
+        color: var(--err);
+      }
+
+      /* 小程序：已集成列表
+         「小程序」= 外部应用的集成入口（见文件顶部说明），每行要同时交代
+         「它叫什么」和「它指向哪里」，所以不能沿用 `.mini-todo-text` 的单行省略，
+         另起一套两行结构。 */
+      .mini-app {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 46px;
+        padding: 6px 10px;
+        border-radius: 9px;
+        cursor: pointer;
+        transition: background 0.1s ease;
+      }
+
+      .mini-app:hover { background: var(--panel-2); }
+
+      .mini-app-main {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .mini-app-name {
+        font-size: 13px;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .mini-app-sub {
+        margin-top: 2px;
+        font-size: 11.5px;
+        color: var(--text-dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .mini-app-kind {
+        flex-shrink: 0;
+        height: 20px;
+        padding: 0 8px;
+        display: flex;
+        align-items: center;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--text-dim);
+        font-size: 10.5px;
+        white-space: nowrap;
+      }
+
+      .mini-app-del {
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-dim);
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.1s ease, background 0.1s ease, color 0.1s ease;
+      }
+
+      .mini-app:hover .mini-app-del { opacity: 1; }
+      .mini-app-del:hover {
+        background: rgba(255, 90, 110, 0.16);
+        color: var(--err);
+      }
+
+      /* 小程序：添加表单 */
+      .mini-form {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+      }
+
+      /* 「名字」不用占一半宽度，挤一挤把空间留给更长的目标 */
+      .mini-form .mini-input.narrow { flex: 0 0 148px; }
+
+      .mini-suggest {
+        display: flex;
+        flex-direction: column;
+        max-height: 128px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .mini-suggest:empty { display: none; }
+
+      .mini-suggest-item {
+        padding: 6px 8px;
+        border-radius: 7px;
+        font-size: 12.5px;
+        color: var(--text);
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .mini-suggest-item:hover {
+        background: rgba(var(--accent-rgb), 0.12);
+        color: var(--accent-solid);
+      }
+
+      /* 分区小标题（已集成 / 添加） */
+      .mini-sect {
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        color: var(--text-dim);
+      }
+
+      /* 翻译：语言方向胶囊 */
+      .mini-dirs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .mini-chip {
+        height: 26px;
+        padding: 0 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: transparent;
+        color: var(--text-dim);
+        font-family: inherit;
+        font-size: 11.5px;
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+      }
+
+      .mini-chip:hover {
+        color: var(--text);
+        border-color: rgba(var(--accent-rgb), 0.4);
+      }
+
+      .mini-chip.on {
+        background: rgba(var(--accent-rgb), 0.16);
+        border-color: rgba(var(--accent-rgb), 0.5);
+        color: var(--accent-solid);
+        font-weight: 600;
+      }
+
+      /* 截图结果路径 */
+      .mini-path {
+        padding: 9px 11px;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        background: var(--panel-2);
+        color: var(--text);
+        font-size: 12px;
+        line-height: 1.5;
+        word-break: break-all;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+
+      .mini-path.dim {
+        background: transparent;
+        border-style: dashed;
+        color: var(--text-dim);
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      /*
+       * 进入内置工具后，搜索框 / 结果列表 / 空态 / 底部状态栏整体让位：
+       * 面板主体交给 #miniapp，操作反馈改走 .miniapp-head-hint。
+       */
+      .palette.miniapp-mode .search-wrap,
+      .palette.miniapp-mode .apps,
+      .palette.miniapp-mode .results,
+      .palette.miniapp-mode .empty,
+      .palette.miniapp-mode .status-bar {
+        display: none;
+      }
+
+      /* ---------- 精简右键菜单 ---------- */
+      .compact-menu {
+        position: fixed;
+        z-index: 9999;
+        min-width: 220px;
+        padding: 6px;
+        /* 这里原本写的 --panel-1 在整套令牌里从未定义，声明无效 → 菜单背景是透明的。
+           改成与面板一致的 --panel-2。 */
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        font-size: 13px;
+        user-select: none;
+      }
+      .compact-menu.hidden { display: none; }
+      .compact-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 7px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        color: var(--text);
+      }
+      .compact-menu-item:hover {
+        background: rgba(var(--accent-rgb), 0.12);
+      }
+      .compact-menu-item.danger {
+        color: var(--text-dim);
+      }
+      .compact-menu-item.danger:hover {
+        background: rgba(239, 68, 68, 0.12);
+        color: var(--text);
+      }
+      .cm-icon {
+        width: 18px;
+        text-align: center;
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+      .cm-text {
+        flex: 1;
+        white-space: nowrap;
+      }
+      .compact-sep {
+        height: 1px;
+        margin: 4px 2px;
+        background: var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="palette">
+      <!-- 搜索框 -->
+      <div class="search-wrap">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input
+          type="text"
+          class="search-input"
+          id="searchInput"
+          placeholder="搜索应用、应用库、系统命令…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <!-- 小程序图标区：搜索框正下方摊开已集成的小程序，点一下即启动；
+           一旦开始搜索就整块隐藏，不干扰搜索结果（见 triggerSearch / showIdleView） -->
+      <div class="apps hidden" id="apps">
+        <div class="apps-grid" id="appsGrid"></div>
+      </div>
+
+      <!-- 内置工具视图（计算器 / 待办 / 截图 / 翻译 / 小程序管理页）：默认隐藏，进入后接管整块面板 -->
+      <div class="miniapp hidden" id="miniapp">
+        <div class="miniapp-head">
+          <button class="miniapp-back" id="miniappBack" title="返回搜索（Esc）">←</button>
+          <span class="miniapp-head-title" id="miniappTitle">工具</span>
+          <span class="miniapp-head-hint" id="miniappHint"></span>
+        </div>
+        <div class="miniapp-body" id="miniappBody"></div>
+      </div>
+
+      <!-- 结果列表 -->
+      <div class="results" id="results"></div>
+
+      <!-- 空态 -->
+      <div class="empty hidden" id="empty">
+        <div class="empty-title">
+          <span class="empty-icon" id="empty-icon">🔍</span><span id="empty-title">输入关键词开始搜索</span>
+        </div>
+        <div class="empty-tip" id="empty-tip">支持应用 / 应用库 / 系统命令</div>
+      </div>
+
+      <!-- 底部状态栏 -->
+      <div class="status-bar">
+        <span><b>↑↓</b> 选择</span>
+        <span class="sep">·</span>
+        <span><b>Enter</b> 执行</span>
+        <span class="sep">·</span>
+        <span><b>Esc</b> 关闭</span>
+        <span class="status-spin hidden" id="statusSpin"></span>
+      </div>
+    </div>
+
+    <!-- 精简右键菜单（Everything 风格，自绘 8 项） -->
+    <div class="compact-menu hidden" id="compactMenu">
+      <div class="compact-menu-item" data-action="open">
+        <span class="cm-icon">📂</span><span class="cm-text">打开</span>
+      </div>
+      <div class="compact-menu-item" data-action="openas">
+        <span class="cm-icon">🔧</span><span class="cm-text">打开方式</span>
+      </div>
+      <div class="compact-menu-item" data-action="locate">
+        <span class="cm-icon">📁</span><span class="cm-text">打开文件所在位置</span>
+      </div>
+      <div class="compact-sep"></div>
+      <div class="compact-menu-item" data-action="copypath">
+        <span class="cm-icon">📋</span><span class="cm-text">复制路径</span>
+      </div>
+      <div class="compact-menu-item" data-action="properties">
+        <span class="cm-icon">ℹ️</span><span class="cm-text">属性</span>
+      </div>
+      <div class="compact-sep"></div>
+      <div class="compact-menu-item danger" data-action="fullmenu">
+        <span class="cm-icon">⚙️</span><span class="cm-text">更多选项（完整菜单）</span>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        // ---------- Tauri 引用 ----------
+        var tauri = window.__TAURI__ || {};
+        var invoke = tauri.core && tauri.core.invoke;
+        var shell = tauri.shell;
+
+        // ---------- DOM 引用 ----------
+        var paletteEl = document.querySelector(".palette");
+        var searchInput = document.getElementById("searchInput");
+        var resultsEl = document.getElementById("results");
+        var emptyEl = document.getElementById("empty");
+        var emptyIconEl = document.getElementById("empty-icon");
+        var emptyTitleEl = document.getElementById("empty-title");
+        var emptyTipEl = document.getElementById("empty-tip");
+        var appsEl = document.getElementById("apps");
+        var appsGridEl = document.getElementById("appsGrid");
+        var statusSpinEl = document.getElementById("statusSpin");
+        var compactMenuEl = document.getElementById("compactMenu");
+        var miniappEl = document.getElementById("miniapp");
+        var miniappBodyEl = document.getElementById("miniappBody");
+        var miniappTitleEl = document.getElementById("miniappTitle");
+        var miniappHintEl = document.getElementById("miniappHint");
+        var miniappBackEl = document.getElementById("miniappBack");
+
+        // ---------- 状态 ----------
+        var state = {
+          results: [],
+          cursor: 0,
+          query: "",
+          searching: false,
+          debounceTimer: null,
+          // 搜索令牌：每次发起搜索自增，异步回调只在令牌未变时才写回结果，
+          // 避免「本地结果先出、Everything 结果后到」时的乱序覆盖。
+          searchToken: 0,
+          // 本地搜索（ss_search）结果与 Everything 结果分开保存，最后合并成 state.results。
+          // 分开存是为了让两者可以任意先后到达而不互相覆盖（首搜时本地慢、Everything 更慢）。
+          localResults: [],
+          esResults: [],
+          // 最近一次“执行选中项”的时间戳，用于去重（双击 / 长按回车都会重复触发）
+          lastExecuteAt: 0,
+          // 回车是否处于“按住”状态：长按回车时系统会连续派发 keydown，用它保证一次按下只执行一次
+          enterHeld: false,
+          // 兜底定时器：万一 keyup 丢失，用它复位 enterHeld，避免回车一直失灵
+          enterResetTimer: null,
+          // 精简右键菜单开关（从设置加载）
+          compactContextMenu: false,
+          // 当前右键操作对应的结果索引
+          contextMenuIndex: -1,
+          // 当前打开的内置工具：{ id, payload }；null 表示停留在搜索结果视图
+          miniapp: null,
+          // 搜索框下方图标区展示的已集成小程序（mini_apps_list 的原始返回）
+          miniApps: [],
+          // 图标点击的启动意图是否已发出：面板会立刻收起，用它挡掉连点造成的重复启动
+          launching: false
+        };
+
+        // 一次打开意图的去重窗口（毫秒）：浏览器双击会派发 click×2 + dblclick，
+        // 长按回车也会连续 keydown，若不去重 .exe 之类的目标会被启动多次。
+        var EXECUTE_DEDUPE_MS = 500;
+
+        // ---------- 图标映射 ----------
+        var KIND_ICONS = {
+          app: "📱",
+          library: "📁",
+          system: "⚙️",
+          file: "📄",
+          folder: "📂",
+          miniapp: "✨",
+          plugin: "🧩"
+        };
+
+        // ---------- 文件类型分类与图标 ----------
+        //
+        // Everything 搜索结果按扩展名归入这些类别，每个类别有独立的图标和背景色，
+        // 方便在结果列表里一眼区分文件夹 / 可执行 / 文档 / 音视频 / 图片 / 压缩包。
+        var FILE_TYPE_MAP = {
+          // 文件夹
+          folder: { icon: "📂", cls: "type-folder" },
+          // 可执行文件
+          exe:    { icon: "⚡", cls: "type-exe" },
+          // 文档（Office / PDF / 文本）
+          doc:    { icon: "📄", cls: "type-doc" },
+          // 代码 / 脚本
+          code:   { icon: "💻", cls: "type-code" },
+          // 图片
+          image:  { icon: "🖼️", cls: "type-image" },
+          // 音频
+          audio:  { icon: "🎵", cls: "type-audio" },
+          // 视频
+          video:  { icon: "🎬", cls: "type-video" },
+          // 压缩包
+          archive:{ icon: "📦", cls: "type-archive" },
+          // 其它
+          other:  { icon: "📄", cls: "type-other" }
+        };
+
+        // 扩展名 → 类型映射（小写，不含点）
+        var EXT_TO_TYPE = (function () {
+          var map = {};
+          function add(list, type) {
+            for (var i = 0; i < list.length; i++) {
+              map[list[i].toLowerCase()] = type;
+            }
+          }
+          add(["exe", "msi", "bat", "cmd", "com", "ps1", "vbs", "scr", "reg"], "exe");
+          add(["doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "txt", "rtf", "odt", "ods", "odp", "csv", "md", "wps", "et", "dps"], "doc");
+          add(["js", "ts", "tsx", "jsx", "py", "java", "c", "cpp", "h", "hpp", "cs", "go", "rs", "rb", "php", "sql", "html", "htm", "css", "scss", "less", "json", "xml", "yml", "yaml", "sh", "bash", "swift", "kt", "dart", "vue"], "code");
+          add(["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "tif", "heic", "heif", "raw", "psd", "ai"], "image");
+          add(["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "ape", "opus", "mid", "midi"], "audio");
+          add(["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "rmvb", "rm"], "video");
+          add(["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "z", "tgz", "tbz2", "cab", "iso"], "archive");
+          return map;
+        })();
+
+        // 根据结果项返回 { icon, cls }
+        function getFileTypeInfo(item) {
+          // 内置工具必须最先判断：它的 target 形如 "calculator:12*34"，
+          // 若落到下面的扩展名分支会被当成扩展名而误归为「其它」。
+          if (item.kind === "miniapp") {
+            return { icon: KIND_ICONS.miniapp, cls: "type-miniapp" };
+          }
+          // 插件命令：target 是命令 id（`<namespace>.<action>`），含点号，
+          // 若落到下面的扩展名分支会被当成扩展名误判，所以必须在这里先拦。
+          if (item.kind === "plugin") {
+            return { icon: KIND_ICONS.plugin, cls: "type-plugin" };
+          }
+          if (item.kind === "folder" || item.kind === "library") {
+            return FILE_TYPE_MAP.folder;
+          }
+          if (item.kind === "app" || item.kind === "system") {
+            return { icon: KIND_ICONS[item.kind] || "📱", cls: "type-exe" };
+          }
+          // file 类：按扩展名判断
+          var name = (item.title || item.name || item.target || "").toLowerCase();
+          var dot = name.lastIndexOf(".");
+          if (dot >= 0 && dot < name.length - 1) {
+            var ext = name.substring(dot + 1);
+            var type = EXT_TO_TYPE[ext];
+            if (type) return FILE_TYPE_MAP[type];
+          }
+          // is_dir 兜底
+          if (item.is_dir || item.category === "folder") {
+            return FILE_TYPE_MAP.folder;
+          }
+          return FILE_TYPE_MAP.other;
+        }
+
+        // ---------- 匹配高亮 ----------
+        // 把标题中 match_indices 指定的字符用 <span class="match"> 包裹。
+        // match_indices 是 Rust 端返回的字符索引数组（连续区间）。
+        function highlightMatch(text, indices) {
+          if (!indices || indices.length === 0) {
+            return escapeHtml(text);
+          }
+          // 索引可能是连续的（prefix/contains/pinyin 都是连续匹配）
+          // 找出起始和结束位置
+          var start = indices[0];
+          var end = indices[indices.length - 1] + 1;
+          var chars = Array.from(text);  // 按字符分割（处理 emoji/中文）
+          var before = chars.slice(0, start).join("");
+          var matched = chars.slice(start, end).join("");
+          var after = chars.slice(end).join("");
+          return escapeHtml(before) + '<span class="match">' + escapeHtml(matched) + '</span>' + escapeHtml(after);
+        }
+
+        function escapeHtml(s) {
+          return s.replace(/[&<>"']/g, function (c) {
+            return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+          });
+        }
+
+        // ---------- 主题跟随 ----------
+        var THEME_STORAGE_KEY = "easyop.theme";
+
+        function readThemeMode() {
+          try {
+            var raw = localStorage.getItem(THEME_STORAGE_KEY);
+            if (raw === "dark" || raw === "light" || raw === "system") return raw;
+          } catch (err) {}
+          return "system";
+        }
+
+        function applyTheme() {
+          var mode = readThemeMode();
+          var resolved = mode;
+          if (mode === "system") {
+            resolved =
+              window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          }
+          document.documentElement.dataset.theme = resolved;
+        }
+
+        applyTheme();
+
+        window.addEventListener("storage", function (e) {
+          if (!e.key || e.key === THEME_STORAGE_KEY) applyTheme();
+        });
+
+        if (window.matchMedia) {
+          var media = window.matchMedia("(prefers-color-scheme: dark)");
+          var onSystemChange = function () {
+            if (readThemeMode() === "system") applyTheme();
+          };
+          if (media.addEventListener) media.addEventListener("change", onSystemChange);
+          else if (media.addListener) media.addListener(onSystemChange);
+        }
+
+        // ---------- 搜索逻辑 ----------
+
+        // 合并「本地结果 + Everything 结果」到 state.results（前端展示用的最终列表）
+        function applyResults(keepCursor) {
+          state.results = (state.localResults || []).concat(state.esResults || []);
+          if (!keepCursor || state.cursor >= state.results.length) state.cursor = 0;
+        }
+
+        function doSearch(query) {
+          state.query = query;
+          state.searching = true;
+          statusSpinEl.textContent = "搜索中";
+          statusSpinEl.classList.add("spinning");
+          statusSpinEl.classList.remove("hidden");
+
+          var token = ++state.searchToken;
+          state.localResults = [];
+          state.esResults = [];
+
+          function endSearch() {
+            if (token !== state.searchToken) return;
+            state.searching = false;
+            statusSpinEl.classList.add("hidden");
+            statusSpinEl.classList.remove("spinning");
+          }
+
+          if (invoke) {
+            // ── 本地搜索：先渲染，不等 Everything ──
+            // 旧实现用 Promise.all 把两者绑在一起，而首次搜索时
+            // 「Everything 可用性探测 + 启动 es.exe」常要几百毫秒，
+            // 结果就是第一次输入时面板迟迟不出内容 —— 这是卡顿体感的主要来源。
+            invoke("ss_search", { query: query })
+              .then(function (localResults) {
+                if (token !== state.searchToken) return;
+                state.localResults = Array.isArray(localResults) ? localResults : [];
+                applyResults(false);
+                render();
+                endSearch();
+              })
+              .catch(function (err) {
+                if (token !== state.searchToken) return;
+                state.localResults = [];
+                state.esResults = [];
+                applyResults(false);
+                showEmpty("⚠️", "搜索出错", err && err.message ? err.message : "请稍后重试");
+                endSearch();
+              });
+
+            // ── Everything 搜索：异步补进结果，不阻塞首屏 ──
+            checkEverythingAvailable()
+              .then(function (available) {
+                if (!available || token !== state.searchToken) return [];
+                // 只在查询长度 >= 2 时才调 Everything，避免短查询返回太多结果
+                if (query.trim().length < 2) return [];
+                return invoke("ss_everything_search", { query: query });
+              })
+              .then(function (results) {
+                if (token !== state.searchToken) return;
+                if (!Array.isArray(results) || !results.length) return;
+                state.esResults = results.map(function (item) {
+                  return {
+                    kind: item.is_dir ? "folder" : "file",
+                    title: item.name,
+                    subtitle: item.path,
+                    target: item.path,
+                    category: item.is_dir ? "folder" : "file",
+                    is_dir: item.is_dir,
+                    score: 35,
+                    match_indices: [],
+                    match_mode: "everything",
+                  };
+                });
+                // 保留用户已移动的光标位置，只把新结果追加在后面
+                applyResults(true);
+                render();
+              })
+              .catch(function () {
+                // Everything 搜索失败不影响主搜索
+              });
+          } else {
+            setTimeout(function () {
+              state.localResults = [];
+              state.esResults = [];
+              applyResults(false);
+              state.searching = false;
+              statusSpinEl.classList.add("hidden");
+              statusSpinEl.classList.remove("spinning");
+              render();
+            }, 200);
+          }
+        }
+
+        // Everything 可用状态缓存
+        var _everythingAvailable = null;
+        function checkEverythingAvailable() {
+          if (_everythingAvailable !== null) {
+            return Promise.resolve(_everythingAvailable);
+          }
+          if (!invoke) return Promise.resolve(false);
+          return invoke("everything_available")
+            .then(function (v) {
+              _everythingAvailable = !!v;
+              return _everythingAvailable;
+            })
+            .catch(function () {
+              _everythingAvailable = false;
+              return false;
+            });
+        }
+
+        function triggerSearch(query) {
+          if (state.debounceTimer) {
+            clearTimeout(state.debounceTimer);
+            state.debounceTimer = null;
+          }
+          // 一敲字就把图标区收起来：搜索态下它既没用又占位，还会把注意力从结果上拽走。
+          // 关键词被清空时再摊回来（见 showIdleView）。
+          setAppsVisible(false);
+          var trimmed = query.trim();
+          if (!trimmed) {
+            state.results = [];
+            state.cursor = 0;
+            state.query = "";
+            showIdleView();
+            return;
+          }
+          state.debounceTimer = setTimeout(function () {
+            // 先清标记再发请求：state.debounceTimer 非空即代表「搜索还在路上」，
+            // 图标区的兜底判断（syncIdleView）靠它挡住「关键词已敲进来、图标又被摊开」。
+            state.debounceTimer = null;
+            doSearch(trimmed);
+          }, 150);
+        }
+
+        // ---------- 渲染 ----------
+
+        function showEmpty(icon, title, tip) {
+          resultsEl.classList.add("hidden");
+          emptyEl.classList.remove("hidden");
+          emptyIconEl.textContent = icon || "🔍";
+          emptyTitleEl.textContent = title || "";
+          emptyTipEl.textContent = tip || "";
+          // 空态时调整到最小高度
+          adjustWindowHeight();
+        }
+
+        function render() {
+          if (state.results.length === 0) {
+            if (state.searching) return;
+            if (state.query) {
+              setAppsVisible(false);
+              showEmpty("🔍", "没有找到匹配的结果", "试试其他关键词，或检查拼写是否正确");
+            } else {
+              showIdleView();
+            }
+            return;
+          }
+
+          // 有结果时图标区必然已经收起（triggerSearch 收过），这里再兜一次，
+          // 免得从内置工具返回等路径漏掉。
+          setAppsVisible(false);
+          resultsEl.classList.remove("hidden");
+          emptyEl.classList.add("hidden");
+
+          resultsEl.textContent = "";
+          state.results.forEach(function (item, index) {
+            var row = document.createElement("div");
+            row.className = "result-item" + (index === state.cursor ? " active" : "");
+            row.setAttribute("data-index", String(index));
+
+            var icon = document.createElement("div");
+            var typeInfo = getFileTypeInfo(item);
+            icon.className = "result-icon " + typeInfo.cls;
+            icon.textContent = typeInfo.icon;
+
+            var textWrap = document.createElement("div");
+            textWrap.className = "result-text";
+
+            var title = document.createElement("div");
+            title.className = "result-title";
+            title.innerHTML = highlightMatch(item.title || item.name || "(未命名)", item.match_indices);
+
+            var subtitle = document.createElement("div");
+            subtitle.className = "result-subtitle";
+            subtitle.textContent = item.subtitle || item.path || item.description || item.target || "";
+
+            textWrap.appendChild(title);
+            textWrap.appendChild(subtitle);
+
+            row.appendChild(icon);
+            row.appendChild(textWrap);
+
+            // 单击：只选中该行，不执行。
+            // 与资源管理器 / Everything 保持一致（底部提示也是“↑↓ 选择 · Enter 执行”），
+            // 否则搜索结果第一行默认高亮，用户只是想点一下就会把文件/程序直接打开。
+            row.addEventListener("click", function () {
+              if (index !== state.cursor) {
+                state.cursor = index;
+                render();
+              }
+            });
+
+            // 双击：打开该行（与 Everything 一致）
+            row.addEventListener("dblclick", function (e) {
+              e.preventDefault();
+              state.cursor = index;
+              executeCurrent();
+            });
+
+            // 右键：先选中该行，再弹出菜单
+            // - 精简模式：自绘 8 项菜单，Everything 风格
+            // - 完整模式：资源管理器原生 Shell 菜单
+            row.addEventListener("contextmenu", function (e) {
+              e.preventDefault();
+              e.stopPropagation();
+              if (index !== state.cursor) {
+                state.cursor = index;
+                render();
+              }
+              state.contextMenuIndex = index;
+              if (state.compactContextMenu) {
+                showCompactMenu(e.clientX, e.clientY);
+              } else {
+                openContextMenu(index);
+              }
+            });
+
+            resultsEl.appendChild(row);
+          });
+
+          var active = resultsEl.querySelector(".result-item.active");
+          if (active && active.scrollIntoView) {
+            active.scrollIntoView({ block: "nearest" });
+          }
+
+          // 动态调整窗口高度
+          adjustWindowHeight();
+        }
+
+        // ---------- 动态窗口高度 ----------
+        //
+        // 面板高度完全由内容决定（搜索区 + 结果/空态 + 状态栏），这里量出真实高度再同步
+        // 窗口尺寸。之前用估算常量算高度，算小了就会让面板超出窗口、上下边框被裁掉。
+
+        var PAD = 12;                 // 面板四周留白（与 CSS body padding 一致）
+        var MIN_WINDOW_H = 160;       // 窗口最小高度兜底
+        var MAX_WINDOW_H = 520;       // 窗口最大高度兜底
+
+        function adjustWindowHeight() {
+          requestAnimationFrame(function () {
+            if (!paletteEl) return;
+            var targetH = Math.ceil(paletteEl.getBoundingClientRect().height) + PAD * 2;
+            if (targetH < MIN_WINDOW_H) targetH = MIN_WINDOW_H;
+            if (targetH > MAX_WINDOW_H) targetH = MAX_WINDOW_H;
+
+            // 通过 Tauri 命令调整窗口大小（比 JS API 更可靠）
+            if (invoke) {
+              invoke("ss_resize", { height: targetH }).catch(function () {});
+            }
+          });
+        }
+
+        // ---------- 键盘导航 ----------
+
+        function moveCursor(delta) {
+          if (state.results.length === 0) return;
+          state.cursor = (state.cursor + delta + state.results.length) % state.results.length;
+          render();
+        }
+
+        // ---------- 执行选中项 ----------
+
+        function executeCurrent() {
+          // 内置工具视图里结果列表已不可见，回车语义归工具自己，
+          // 这里直接拦掉，避免「眼睛在工具里、手一按却打开了背后的搜索结果」。
+          if (state.miniapp) return;
+          if (state.results.length === 0) return;
+
+          // 去重：一次打开意图（双击 / 长按回车）只真正执行一次
+          var now = Date.now();
+          if (now - state.lastExecuteAt < EXECUTE_DEDUPE_MS) return;
+
+          var item = state.results[state.cursor];
+          if (!item) return;
+          state.lastExecuteAt = now;
+
+          var kind = item.kind;
+          var target = item.target || item.path || "";
+
+          switch (kind) {
+            case "app":
+              executeApp(item, kind, target);
+              break;
+            case "library":
+              executeLibrary(item, kind, target);
+              break;
+            case "system":
+              executeSystem(item, kind, target);
+              break;
+            case "file":
+            case "folder":
+              executeFile(item, kind, target);
+              break;
+            case "tool":
+              // 内置工具（计算器 / 待办 / 截图 / 翻译 / 小程序管理页）：不启动任何
+              // 外部进程，也不关面板，只把面板主体切成工具视图。
+              openMiniApp(target, item.title || "");
+              break;
+            case "miniapp":
+              // 小程序：用户集成进 easyop 的**外部**目标。回车这一下就是要真的启动它，
+              // 所以不走 ss_execute 而是 mini_apps_launch，启动后收起面板 —— 行为与在
+              // 资源管理器里双击那个目标一致。
+              executeMiniApp(item, target);
+              break;
+            case "plugin":
+              // 插件命令：target 是命令 id（`<namespace>.<action>`）。
+              // 执行归 plugin_host（激活层开发中）；这里走 ss_execute，是为了把失败
+              // 原因显示到状态行 —— 落到 default 会变成「点了没反应」，那是最糟的形态。
+              executePlugin(item, kind, target);
+              break;
+            default:
+              break;
+          }
+        }
+
+        // plugin：target 是命令 id（`<namespace>.<action>`）。激活层（隐藏 webview +
+        // 注入 eo.* + 执行 index.js）尚未实现，后端会返回一条明确错误；这里把它显示到
+        // 状态行，**绝不静默**。等 plugin_host 落地后，这个函数无需改动即可工作。
+        function executePlugin(item, kind, target) {
+          if (!target) return;
+          if (!invoke) {
+            showStatusError("插件执行失败：接口不可用");
+            return;
+          }
+          invoke("ss_execute", { kind: kind, target: target, title: item.title || "" })
+            .then(function () { hidePalette(); })
+            .catch(function (err) {
+              showStatusError(err && err.message ? err.message : String(err));
+            });
+        }
+
+        // miniapp：target 是 mini_apps 注册表里的 id（uuid），不是路径 ——
+        // 目标存在注册表里，由 mini_apps::launch 查出来再交给 launcher。
+        function executeMiniApp(item, target) {
+          if (!target) return;
+          if (!invoke) {
+            showStatusError("启动失败：接口不可用");
+            return;
+          }
+          invoke("mini_apps_launch", { id: target })
+            .then(function () {
+              hidePalette();
+            })
+            .catch(function (err) {
+              showStatusError("启动失败：" + (err && err.message ? err.message : err));
+            });
+        }
+
+        // ---------- 小程序图标区（搜索框正下方） ----------
+        //
+        // 面板空闲时（还没输入关键词）把已集成的小程序摊成图标网格，点一下即启动，
+        // 形态对齐微信小程序入口。一旦开始搜索就整块收起 —— 这块区域不能跟搜索结果抢
+        // 注意力，更不能参与正常搜索。
+
+        // 图标只按集成类型给一个一眼可辨的符号（注册表里没有图标字段，也不引入图片资源）
+        var MINI_APP_ICONS = { app: "📱", url: "🌐", folder: "📂" };
+
+        // 重新读一次小程序注册表。
+        // 面板窗口在应用启动时就创建并常驻，页面不会随「小程序管理页」里的增删重新加载，
+        // 所以每次唤出面板都要重新拉，否则图标区会一直停在启动时的旧列表。
+        function refreshMiniApps() {
+          if (!invoke) {
+            state.miniApps = [];
+            renderApps();
+            syncIdleView();
+            return;
+          }
+          invoke("mini_apps_list")
+            .then(function (rows) {
+              state.miniApps = Array.isArray(rows) ? rows : [];
+              renderApps();
+              syncIdleView();
+            })
+            .catch(function () {
+              // 读不到就当没有：图标区留白比在搜索框下面挂个报错干净，搜索本身不受影响
+              state.miniApps = [];
+              renderApps();
+              syncIdleView();
+            });
+        }
+
+        function renderApps() {
+          if (!appsGridEl) return;
+          appsGridEl.textContent = "";
+          state.miniApps.forEach(function (item) {
+            var cell = document.createElement("div");
+            cell.className = "app-cell";
+            cell.setAttribute("role", "button");
+            // 名称靠悬停淡入展示（.app-name），aria-label 保证读屏也拿得到名字
+            cell.setAttribute("aria-label", item.name || item.target || "");
+
+            var icon = document.createElement("div");
+            icon.className = "app-icon k-" + (item.kind || "app");
+            icon.textContent = MINI_APP_ICONS[item.kind] || "✨";
+
+            var name = document.createElement("div");
+            name.className = "app-name";
+            name.textContent = item.name || item.target || "";
+
+            cell.appendChild(icon);
+            cell.appendChild(name);
+            cell.addEventListener("click", function () {
+              launchFromGrid(item);
+            });
+            appsGridEl.appendChild(cell);
+          });
+        }
+
+        // 图标区可见性只有两个出口：空闲态摊开、一开始搜索就收起。
+        // 注册表为空时无论如何都不摊开（没有图标就没什么可摊的）。
+        function setAppsVisible(visible) {
+          if (!appsEl) return;
+          // 没有图标就没什么可摊的：visible 传 true 也白搭
+          var show = !!visible && state.miniApps.length > 0;
+          appsEl.classList.toggle("hidden", !show);
+        }
+
+        // 空闲态（关键词为空）该显示什么：有图标就摊图标 —— 图标本身就是内容，
+        // 再叠一句「输入关键词开始搜索」纯属占地方；一个图标都没有才退回原来的文字占位，
+        // 否则搜索框下面会是一片空白。
+        function showIdleView() {
+          if (state.miniApps.length > 0) {
+            setAppsVisible(true);
+            resultsEl.classList.add("hidden");
+            emptyEl.classList.add("hidden");
+            adjustWindowHeight();
+            return;
+          }
+          setAppsVisible(false);
+          showEmpty("🔍", "输入关键词开始搜索", "支持应用 / 应用库 / 系统命令");
+        }
+
+        // 图标区异步拉回来时，用户可能已经敲进关键词了：那种情况下不能再把图标区摊开，
+        // 否则会出现「结果都出来了，搜索框下面还顶着一排图标」。
+        // debounceTimer 非空 = 关键词已敲进来、150ms 防抖还没到点（那时 query 还没写进去），也算正在搜索。
+        function syncIdleView() {
+          if (state.query || state.debounceTimer || state.results.length > 0) return;
+          showIdleView();
+        }
+
+        function launchFromGrid(item) {
+          if (!item || state.launching) return;
+          if (!invoke) {
+            showStatusError("启动失败：接口不可用");
+            return;
+          }
+          // target 是注册表里的 id，交给后端 mini_apps::launch 查目标再启动
+          state.launching = true;
+          invoke("mini_apps_launch", { id: item.id })
+            .then(function () {
+              // 与在搜索结果里回车同一条行为：启动后收起面板，把前台让给那个外部应用
+              hidePalette();
+            })
+            .catch(function (err) {
+              // 面板还在，得把开关放回去，用户才能再点一次
+              state.launching = false;
+              showStatusError("启动失败：" + (err && err.message ? err.message : err));
+            });
+        }
+
+        // file / folder：Everything 命中的文件或目录，交给 Rust 用系统默认方式打开
+        function executeFile(item, kind, target) {
+          if (!target) return;
+          if (invoke) {
+            invoke("ss_execute", { kind: kind, target: target, title: item.title || "" })
+              .then(function () { hidePalette(); })
+              .catch(function (err) {
+                showStatusError("打开失败：" + (err && err.message ? err.message : err));
+              });
+          } else if (shell && shell.open) {
+            shell.open(target);
+            hidePalette();
+          }
+        }
+
+        // 右键：弹出与资源管理器一致的原生菜单（打开 / 打开方式 / 复制 / 属性 …）
+        function openContextMenu(index) {
+          var item = state.results[index];
+          if (!item) return;
+          var target = item.target || item.path || "";
+          if (!target) {
+            showStatusError("该项没有可操作的文件路径");
+            return;
+          }
+          if (!invoke) return;
+          invoke("ss_show_context_menu", {
+            kind: item.kind,
+            target: target,
+            title: item.title || "",
+          }).catch(function (err) {
+            showStatusError("右键菜单失败：" + (err && err.message ? err.message : err));
+          });
+        }
+
+        // ---------- 精简右键菜单 ----------
+
+        function showCompactMenu(x, y) {
+          if (!compactMenuEl) return;
+          var item = state.results[state.contextMenuIndex];
+          if (!item) return;
+
+          compactMenuEl.style.left = Math.max(8, x) + "px";
+          compactMenuEl.style.top = Math.max(8, y) + "px";
+          compactMenuEl.classList.remove("hidden");
+
+          placeCompactMenu();
+        }
+
+        // 菜单是 position:fixed，永远出不了窗口范围；而窗口高度是按结果条数动态收的
+        // （可能只有 160px），菜单比窗口还高时就会被裁掉，看起来就像「右键没生效」。
+        // 所以这里先按当前窗口量一次，放不下就临时把窗口撑高，再按新高度重新定位。
+        function placeCompactMenu() {
+          if (!compactMenuEl || compactMenuEl.classList.contains("hidden")) return;
+
+          var rect = compactMenuEl.getBoundingClientRect();
+          var vw = window.innerWidth;
+          var vh = window.innerHeight;
+          var left = parseFloat(compactMenuEl.style.left) || 0;
+          var top = parseFloat(compactMenuEl.style.top) || 0;
+
+          // 右边界：超出则向左收
+          if (left + rect.width > vw - 8) {
+            left = Math.max(8, vw - rect.width - 8);
+          }
+
+          // 下边界：当前窗口装不下就先把窗口撑高（上限同 MAX_WINDOW_H），
+          // 装得下则优先整体上移，尽量不改变窗口尺寸。
+          var need = Math.ceil(rect.height) + 16;
+          var targetVh = vh;
+          if (need > vh) {
+            targetVh = Math.min(need, MAX_WINDOW_H);
+            if (invoke) {
+              invoke("ss_resize", { height: targetVh }).catch(function () {});
+            }
+          }
+
+          if (top + rect.height > targetVh - 8) {
+            top = Math.max(8, targetVh - rect.height - 8);
+          }
+
+          compactMenuEl.style.left = left + "px";
+          compactMenuEl.style.top = top + "px";
+        }
+
+        function hideCompactMenu() {
+          if (compactMenuEl) {
+            compactMenuEl.classList.add("hidden");
+          }
+          // 菜单收起后把窗口高度还原成按内容算出来的高度，
+          // 否则撑高留下的空白区域会一直挡在那边。
+          adjustWindowHeight();
+        }
+
+        function handleCompactMenuAction(action) {
+          var item = state.results[state.contextMenuIndex];
+          if (!item || !invoke) { hideCompactMenu(); return; }
+          var target = item.target || item.path || "";
+          if (!target) { hideCompactMenu(); return; }
+
+          switch (action) {
+            case "open":
+              hideCompactMenu();
+              executeCurrent();
+              break;
+            case "openas":
+              hideCompactMenu();
+              invoke("ss_shell_verb", { verb: "openas", target: target })
+                .catch(function (err) {
+                  showStatusError("打开方式失败：" + (err && err.message ? err.message : err));
+                });
+              break;
+            case "locate":
+              hideCompactMenu();
+              invoke("ss_open_containing_folder", { target: target })
+                .catch(function (err) {
+                  showStatusError("打开所在位置失败：" + (err && err.message ? err.message : err));
+                });
+              break;
+            case "copypath":
+              invoke("ss_copy_path", { target: target })
+                .then(function () {
+                  showStatusOk("路径已复制到剪贴板");
+                })
+                .catch(function (err) {
+                  showStatusError("复制路径失败：" + (err && err.message ? err.message : err));
+                });
+              hideCompactMenu();
+              break;
+            case "properties":
+              hideCompactMenu();
+              invoke("ss_shell_verb", { verb: "properties", target: target })
+                .catch(function (err) {
+                  showStatusError("打开属性失败：" + (err && err.message ? err.message : err));
+                });
+              break;
+            case "fullmenu":
+              // 切换到完整原生菜单
+              hideCompactMenu();
+              openContextMenu(state.contextMenuIndex);
+              break;
+            default:
+              hideCompactMenu();
+              break;
+          }
+        }
+
+        function executeApp(item, kind, target) {
+          if (invoke) {
+            invoke("ss_execute", { kind: kind, target: target, title: item.title })
+              .then(function () { hidePalette(); })
+              .catch(function (err) {
+                showStatusError("打开失败：" + (err && err.message ? err.message : err));
+              });
+          } else if (shell && shell.open && target) {
+            shell.open(target);
+            hidePalette();
+          }
+        }
+
+        function executeLibrary(item, kind, target) {
+          if (invoke) {
+            invoke("ss_execute", { kind: kind, target: target, title: item.title })
+              .then(function () { hidePalette(); })
+              .catch(function (err) {
+                showStatusError("执行失败：" + (err && err.message ? err.message : err));
+              });
+          }
+        }
+
+        function executeSystem(item, kind, target) {
+          if (invoke) {
+            invoke("ss_execute", { kind: kind, target: target, title: item.title })
+              .then(function () { hidePalette(); })
+              .catch(function (err) {
+                showStatusError("执行失败：" + (err && err.message ? err.message : err));
+              });
+          }
+        }
+
+        function showStatusTip(msg) {
+          statusSpinEl.textContent = msg;
+          statusSpinEl.classList.remove("hidden", "spinning");
+          setTimeout(function () {
+            statusSpinEl.classList.add("hidden");
+          }, 2000);
+        }
+
+        function showStatusError(msg) {
+          statusSpinEl.textContent = msg;
+          statusSpinEl.classList.remove("hidden", "spinning");
+          statusSpinEl.style.color = "var(--err)";
+          setTimeout(function () {
+            statusSpinEl.classList.add("hidden");
+            statusSpinEl.style.color = "";
+          }, 2500);
+        }
+
+        function showStatusOk(msg) {
+          statusSpinEl.textContent = msg;
+          statusSpinEl.classList.remove("hidden", "spinning");
+          statusSpinEl.style.color = "var(--ok)";
+          setTimeout(function () {
+            statusSpinEl.classList.add("hidden");
+            statusSpinEl.style.color = "";
+          }, 1800);
+        }
+
+        // ---------- 内置工具视图（框架） ----------
+        //
+        // 先说清楚两个词，它们以前被混在一起，导致「小程序」被做成了面板自带的小工具：
+        //
+        //   · 内置工具 —— easyop 自带的一小块界面（计算器 / 待办 / 截图 / 翻译，
+        //     以及「小程序」管理页）。进入后把面板主体从搜索结果列表换成一块自绘 UI，
+        //     不启动任何外部进程。Rust 侧 kind = "tool"。
+        //   · 小程序 —— 用户集成进 easyop 的**外部** App / Web 项目 / 项目目录。
+        //     点一下是真的去启动那个外部目标，不切视图而是收起面板。Rust 侧 kind = "miniapp"。
+        //
+        // 本段框架服务的是「内置工具」。工具视图不是独立窗口：搜索框 / 结果列表 /
+        // 空态 / 状态栏整体让位给 #miniapp（见 CSS 的 .palette.miniapp-mode）。
+        //
+        // 与 Rust 端 ss_palette.rs 的 BUILTIN_TOOLS 之间的契约：
+        //   - 结果项 kind = "tool"；
+        //   - target 形如 "miniapps" / "calculator"，或 "calculator:12*34"
+        //     （`=` 语法把算式带了进来）；
+        //   - 只按【第一个】冒号切分，冒号之后的整段原样当作载荷；
+        //   - 冒号前的 id 必须能在 MINI_APP_RENDERERS 里找到渲染器 —— 这个 id 与
+        //     ss_palette.rs 里 ToolDef.id 是同一份常量，两边必须严格一致。
+        //
+        // 命名说明：下面这套 MINI_APP_* / state.miniapp 是历史命名，指的是「工具视图」；
+        // 「小程序」自身的数据不走这里，走 mini_apps_* 后端命令（见下方的 miniapps 渲染器）。
+        //
+        // 渲染器签名：render(bodyEl, payload)
+        //   bodyEl  —— 已清空的 .miniapp-body
+        //   payload —— 冒号后的原文（无载荷时是空串）
+        // 渲染器直接复用本作用域里的 setMiniHint / closeMiniApp / adjustWindowHeight。
+
+        var MINI_APP_TITLES = {
+          miniapps: "小程序",
+          calculator: "计算器",
+          todo: "待办清单",
+          screenshot: "截图",
+          translate: "翻译"
+        };
+
+        // 渲染器注册表：id → render(bodyEl, payload)，与 Rust 端 ToolDef.id 一一对应
+        var MINI_APP_RENDERERS = {};
+
+        var miniHintTimer = null;
+
+        // 顶栏右侧的一行小字反馈。内置工具模式下状态栏整体被藏起来，
+        // 所以「已复制」「保存失败」这类提示统一走这里。
+        function setMiniHint(msg, kind) {
+          if (!miniappHintEl) return;
+          clearTimeout(miniHintTimer);
+          miniappHintEl.textContent = msg || "";
+          miniappHintEl.style.color =
+            kind === "err" ? "var(--err)" : kind === "ok" ? "var(--ok)" : "";
+          if (msg) {
+            miniHintTimer = setTimeout(function () {
+              miniappHintEl.textContent = "";
+              miniappHintEl.style.color = "";
+            }, 2200);
+          }
+        }
+
+        // 只把界面切回搜索视图，不碰 results / cursor（那是 showPalette 的职责）
+        function resetMiniAppView() {
+          state.miniapp = null;
+          clearTimeout(miniHintTimer);
+          if (paletteEl) paletteEl.classList.remove("miniapp-mode");
+          if (miniappEl) miniappEl.classList.add("hidden");
+          if (miniappBodyEl) miniappBodyEl.textContent = "";
+          if (miniappHintEl) {
+            miniappHintEl.textContent = "";
+            miniappHintEl.style.color = "";
+          }
+        }
+
+        // 打开内置工具：target = "{id}" 或 "{id}:{payload}"
+        //
+        // 注意这里说的是**内置工具**（kind = "tool"），不是小程序 —— 它只切面板视图，
+        // 不启动任何外部进程。用户集成进来的小程序走 executeMiniApp，不经过这里。
+        function openMiniApp(target, title) {
+          if (!miniappEl || !miniappBodyEl) return;
+
+          var raw = String(target || "");
+          var sep = raw.indexOf(":");
+          var id = sep >= 0 ? raw.substring(0, sep) : raw;
+          var payload = sep >= 0 ? raw.substring(sep + 1) : "";
+          if (!id) return;
+
+          resetMiniAppView();
+          state.miniapp = { id: id, payload: payload };
+          paletteEl.classList.add("miniapp-mode");
+          miniappEl.classList.remove("hidden");
+          miniappTitleEl.textContent = MINI_APP_TITLES[id] || title || id;
+          miniappBodyEl.textContent = "";
+
+          var renderer = MINI_APP_RENDERERS[id];
+          if (renderer) {
+            renderer(miniappBodyEl, payload);
+          } else {
+            // 兜底：后端加了新工具但前端还没写字，宁可显式说明也不要一片空白
+            var tip = document.createElement("div");
+            tip.className = "mini-path dim";
+            tip.textContent = "「" + (MINI_APP_TITLES[id] || id) + "」还没有渲染器。";
+            miniappBodyEl.appendChild(tip);
+          }
+
+          // 记一次使用频次。后端对 kind="tool" 只写日志：不启动进程、不收面板，
+          // 目的是让常用工具在后续搜索里凭 usage_bonus 往上浮。
+          if (invoke) {
+            invoke("ss_execute", { kind: "tool", target: raw, title: title || "" }).catch(
+              function () {}
+            );
+          }
+
+          adjustWindowHeight();
+        }
+
+        // 返回搜索视图。返回 true 表示确实是从内置工具里退出来的（Esc 分支靠它判断优先级）
+        function closeMiniApp() {
+          if (!state.miniapp) return false;
+          resetMiniAppView();
+          render();
+          searchInput.focus();
+          return true;
+        }
+
+        if (miniappBackEl) {
+          miniappBackEl.addEventListener("click", function () {
+            closeMiniApp();
+          });
+        }
+
+        // ---------- 内置工具通用控件 ----------
+        //
+        // 这些 helper 只按现有 CSS 类名造元素，样式一律写在 <style> 里，不在这里塞内联样式。
+
+        function miniRow() {
+          var row = document.createElement("div");
+          row.className = "mini-row";
+          for (var i = 0; i < arguments.length; i++) {
+            if (arguments[i]) row.appendChild(arguments[i]);
+          }
+          return row;
+        }
+
+        function miniInput(placeholder) {
+          var el = document.createElement("input");
+          el.type = "text";
+          el.className = "mini-input";
+          el.placeholder = placeholder || "";
+          el.setAttribute("autocomplete", "off");
+          el.setAttribute("spellcheck", "false");
+          return el;
+        }
+
+        function miniButton(label, ghost) {
+          var el = document.createElement("button");
+          el.type = "button";
+          el.className = "mini-btn" + (ghost ? " ghost" : "");
+          el.textContent = label;
+          return el;
+        }
+
+        function miniNote(text) {
+          var el = document.createElement("div");
+          el.className = "mini-note";
+          el.textContent = text || "";
+          return el;
+        }
+
+        function miniPlaceholder(text) {
+          var el = document.createElement("div");
+          el.className = "mini-path dim";
+          el.textContent = text || "";
+          return el;
+        }
+
+        function trim(s) {
+          return String(s == null ? "" : s).replace(/^\s+|\s+$/g, "");
+        }
+
+        // 让输入框自己吃掉回车。不 stopPropagation 的话，回车会冒泡到 document，
+        // 被搜索视图那条 keydown 分支当成「执行选中项」，出现「在工具里按回车却打开了背后的文件」。
+        function miniOnEnter(inputEl, handler) {
+          inputEl.addEventListener("keydown", function (e) {
+            if (e.key !== "Enter") return;
+            if (e.isComposing || e.keyCode === 229) return; // IME 候选上屏，放行给输入法
+            e.preventDefault();
+            e.stopPropagation();
+            handler();
+          });
+        }
+
+        // 复制纯文本：走后端 clip.exe（与精简菜单的「复制路径」同一条通路）。
+        // 没用 navigator.clipboard 是因为它要求安全上下文 + 用户手势，在 WebView2 里不稳定。
+        function miniCopy(text, okMsg) {
+          var v = String(text || "");
+          if (!v) return;
+          if (!invoke) {
+            setMiniHint("复制失败：接口不可用", "err");
+            return;
+          }
+          invoke("ss_copy_path", { target: v })
+            .then(function () {
+              setMiniHint(okMsg || "已复制", "ok");
+            })
+            .catch(function (err) {
+              setMiniHint("复制失败：" + (err && err.message ? err.message : err), "err");
+            });
+        }
+
+        // ---------- 小程序：集成管理 ----------
+        //
+        // 这里的「小程序」就是文件开头定义的那个意思：**外部**应用被集成进 easyop。
+        // 面板不渲染它们的内容，只做三件事 —— 列出 / 启动 / 增删。
+        //
+        // 与内置工具最直观的差别在行为上：启动一个小程序会**收起面板**并真的把外部目标
+        // 打开（Rust 侧 mini_apps::launch → launcher），而不是像计算器那样换一块自绘 UI。
+        //
+        // 数据全部来自后端命令，前端不缓存也不落盘：
+        //   mini_apps_list    列出已集成项
+        //   mini_apps_launch  启动（按 id 查注册表，再交给 launcher）
+        //   mini_apps_add     集成（url 自动补 https://，名字留空自动推导）
+        //   mini_apps_remove  移除
+        //   mini_apps_suggest 填目标时给本机应用建议（复用启动时预热的应用索引）
+
+        var MINI_APP_KINDS = [
+          { id: "app", label: "外部应用", hint: "exe 路径，例如 C:\\Tools\\notepad++.exe" },
+          { id: "url", label: "Web 项目", hint: "网址，例如 my-app.vercel.app" },
+          { id: "folder", label: "项目目录", hint: "本地目录，例如 D:\\code\\my-app" }
+        ];
+
+        function miniAppKindLabel(kind) {
+          for (var i = 0; i < MINI_APP_KINDS.length; i++) {
+            if (MINI_APP_KINDS[i].id === kind) return MINI_APP_KINDS[i].label;
+          }
+          return kind || "未知";
+        }
+
+        MINI_APP_RENDERERS.miniapps = function (bodyEl) {
+          var kindIndex = 0;
+          var items = [];
+          var suggestTimer = null;
+
+          function currentKind() {
+            return MINI_APP_KINDS[kindIndex];
+          }
+
+          // ── 添加表单 ──
+          var nameInput = miniInput("名字（留空自动取）");
+          nameInput.classList.add("narrow");
+          var targetInput = miniInput(MINI_APP_KINDS[0].hint);
+          var argsInput = miniInput("启动参数（可选，仅外部应用）");
+          var addBtn = miniButton("集成");
+
+          var chips = document.createElement("div");
+          chips.className = "mini-dirs";
+
+          var suggestBox = document.createElement("div");
+          suggestBox.className = "mini-suggest";
+
+          var form = document.createElement("div");
+          form.className = "mini-form";
+          form.appendChild(
+            miniNote("把外部 App / Web 项目 / 项目目录收进 easyop，之后在面板里搜名字就能启动。")
+          );
+          form.appendChild(chips);
+          form.appendChild(miniRow(nameInput, targetInput));
+          form.appendChild(miniRow(argsInput, addBtn));
+          form.appendChild(suggestBox);
+          bodyEl.appendChild(form);
+
+          // ── 已集成列表 ──
+          var listLabel = document.createElement("div");
+          listLabel.className = "mini-sect";
+          listLabel.textContent = "已集成";
+          bodyEl.appendChild(listLabel);
+
+          var list = document.createElement("div");
+          list.className = "mini-list";
+          bodyEl.appendChild(list);
+
+          function renderChips() {
+            chips.textContent = "";
+            MINI_APP_KINDS.forEach(function (k, i) {
+              var chip = document.createElement("button");
+              chip.type = "button";
+              chip.className = "mini-chip" + (i === kindIndex ? " on" : "");
+              chip.textContent = k.label;
+              chip.addEventListener("click", function () {
+                kindIndex = i;
+                renderChips();
+                targetInput.placeholder = currentKind().hint;
+                suggestBox.textContent = "";
+                targetInput.focus();
+              });
+              chips.appendChild(chip);
+            });
+          }
+
+          // 填目标时给本机应用建议。只在「外部应用」下给 —— 网址和目录没有可枚举的
+          // 本机索引。索引本身已在启动时预热过，这里只是内存里扫一遍，不额外读盘。
+          function loadSuggest() {
+            suggestBox.textContent = "";
+            if (!invoke || currentKind().id !== "app") return;
+            invoke("mini_apps_suggest", { query: trim(targetInput.value), limit: 8 })
+              .then(function (rows) {
+                var arr = Array.isArray(rows) ? rows : [];
+                if (arr.length === 0) return;
+                arr.forEach(function (app) {
+                  var el = document.createElement("div");
+                  el.className = "mini-suggest-item";
+                  el.textContent = app.name;
+                  el.title = app.path || "";
+                  el.addEventListener("click", function () {
+                    targetInput.value = app.path || "";
+                    // 名字空着就顺手用应用名填上，省得用户再打一遍
+                    if (!trim(nameInput.value)) nameInput.value = app.name || "";
+                    suggestBox.textContent = "";
+                    setMiniHint("已选「" + (app.name || "") + "」", "ok");
+                  });
+                  suggestBox.appendChild(el);
+                });
+                adjustWindowHeight();
+              })
+              .catch(function () {});
+          }
+
+          // 每敲一个字都发一次 IPC 太吵，攒 120ms 再发
+          targetInput.addEventListener("input", function () {
+            clearTimeout(suggestTimer);
+            suggestTimer = setTimeout(loadSuggest, 120);
+          });
+
+          function reload() {
+            if (!invoke) {
+              list.textContent = "";
+              list.appendChild(miniPlaceholder("接口不可用，读不到小程序列表。"));
+              return;
+            }
+            invoke("mini_apps_list")
+              .then(function (rows) {
+                items = Array.isArray(rows) ? rows : [];
+                renderList();
+              })
+              .catch(function (err) {
+                list.textContent = "";
+                list.appendChild(
+                  miniPlaceholder("读取失败：" + (err && err.message ? err.message : err))
+                );
+              });
+          }
+
+          function launchItem(item) {
+            if (!invoke) {
+              setMiniHint("启动失败：接口不可用", "err");
+              return;
+            }
+            setMiniHint("正在启动「" + item.name + "」…", "");
+            invoke("mini_apps_launch", { id: item.id })
+              .then(function () {
+                // 与在搜索结果里回车同一条行为：启动后收起面板，把前台让给那个外部应用
+                hidePalette();
+              })
+              .catch(function (err) {
+                setMiniHint("启动失败：" + (err && err.message ? err.message : err), "err");
+              });
+          }
+
+          function removeItem(item) {
+            if (!invoke) return;
+            invoke("mini_apps_remove", { id: item.id })
+              .then(function (ok) {
+                if (ok) setMiniHint("已移除「" + item.name + "」", "ok");
+                reload();
+              })
+              .catch(function (err) {
+                setMiniHint("移除失败：" + (err && err.message ? err.message : err), "err");
+              });
+          }
+
+          function renderList() {
+            list.textContent = "";
+            if (items.length === 0) {
+              list.appendChild(
+                miniPlaceholder("还没有集成任何应用。用上面的表单把外部 App / Web 项目收进来。")
+              );
+              adjustWindowHeight();
+              return;
+            }
+            items.forEach(function (item) {
+              var row = document.createElement("div");
+              row.className = "mini-app";
+              row.title = "点击启动";
+
+              var main = document.createElement("div");
+              main.className = "mini-app-main";
+
+              var nameEl = document.createElement("div");
+              nameEl.className = "mini-app-name";
+              nameEl.textContent = item.name || item.target;
+
+              var subEl = document.createElement("div");
+              subEl.className = "mini-app-sub";
+              // 第二行必须交代「指向哪里」：有备注就带上，再跟真实目标，
+              // 免得出现「名字一样但指错地方」的误启动。
+              subEl.textContent = item.note ? item.note + " · " + item.target : item.target;
+
+              main.appendChild(nameEl);
+              main.appendChild(subEl);
+
+              var kindEl = document.createElement("div");
+              kindEl.className = "mini-app-kind";
+              kindEl.textContent = miniAppKindLabel(item.kind);
+
+              var del = document.createElement("button");
+              del.type = "button";
+              del.className = "mini-app-del";
+              del.textContent = "✕";
+              del.title = "从小程序里移除";
+              del.addEventListener("click", function (e) {
+                e.stopPropagation(); // 别让点击冒泡成「启动这一行」
+                removeItem(item);
+              });
+
+              row.appendChild(main);
+              row.appendChild(kindEl);
+              row.appendChild(del);
+              row.addEventListener("click", function () {
+                launchItem(item);
+              });
+              list.appendChild(row);
+            });
+            adjustWindowHeight();
+          }
+
+          function submit() {
+            if (!invoke) {
+              setMiniHint("集成失败：接口不可用", "err");
+              return;
+            }
+            var target = trim(targetInput.value);
+            if (!target) {
+              setMiniHint("先填启动目标", "err");
+              targetInput.focus();
+              return;
+            }
+            addBtn.disabled = true;
+            invoke("mini_apps_add", {
+              name: trim(nameInput.value),
+              kind: currentKind().id,
+              target: target,
+              args: trim(argsInput.value),
+              note: ""
+            })
+              .then(function (created) {
+                var label = (created && created.name) || target;
+                nameInput.value = "";
+                argsInput.value = "";
+                targetInput.value = "";
+                suggestBox.textContent = "";
+                setMiniHint("已集成「" + label + "」", "ok");
+                reload();
+              })
+              .catch(function (err) {
+                setMiniHint("集成失败：" + (err && err.message ? err.message : err), "err");
+              })
+              .then(function () {
+                addBtn.disabled = false;
+              });
+          }
+
+          renderChips();
+          miniOnEnter(nameInput, submit);
+          miniOnEnter(targetInput, submit);
+          miniOnEnter(argsInput, submit);
+          addBtn.addEventListener("click", submit);
+          reload();
+          targetInput.focus();
+        };
+
+        // ---------- 内置工具：计算器 ----------
+
+        // 自写表达式求值，刻意不用 eval / new Function ——「面板内执行任意代码」正是这个
+        // 功能要回避的风险（见 docs/ss-palette-deep-dive.md 的风险表）。
+        // 只认四则运算、括号、取模、幂和一元负号，出现其它字符直接判为非法。
+        function calcEval(src) {
+          var s = String(src || "")
+            .replace(/[×✕]/g, "*") // 中文输入法下常见的乘号
+            .replace(/÷/g, "/")
+            .replace(/（/g, "(")
+            .replace(/）/g, ")")
+            .replace(/[，,]/g, "") // 千分位
+            .replace(/\s+/g, "");
+          if (!s) return null;
+          // 白名单：函数名、变量名、属性访问、赋值都会被这一条挡在门外
+          if (!/^[0-9+\-*\/%^().]+$/.test(s)) return null;
+
+          var pos = 0;
+
+          function eat(ch) {
+            if (s.charAt(pos) === ch) {
+              pos++;
+              return true;
+            }
+            return false;
+          }
+
+          function parseAtom() {
+            if (eat("(")) {
+              var inner = parseExpr();
+              if (!eat(")")) throw new Error("括号没有闭合");
+              return inner;
+            }
+            var start = pos;
+            while (pos < s.length && /[0-9.]/.test(s.charAt(pos))) pos++;
+            // 常见触发：运算符后面没跟数字（"12*"、"20%"）或空括号
+            if (pos === start) throw new Error("运算符后面缺少数字");
+            var num = parseFloat(s.substring(start, pos));
+            if (!isFinite(num)) throw new Error("数字不合法");
+            return num;
+          }
+
+          function parsePower() {
+            var base = parseAtom();
+            if (eat("^")) return Math.pow(base, parseUnary());
+            return base;
+          }
+
+          function parseUnary() {
+            if (eat("-")) return -parseUnary();
+            if (eat("+")) return parseUnary();
+            return parsePower();
+          }
+
+          function parseTerm() {
+            var v = parseUnary();
+            for (;;) {
+              if (eat("*")) v *= parseUnary();
+              else if (eat("/")) v /= parseUnary();
+              else if (eat("%")) v %= parseUnary();
+              else return v;
+            }
+          }
+
+          function parseExpr() {
+            var v = parseTerm();
+            for (;;) {
+              if (eat("+")) v += parseTerm();
+              else if (eat("-")) v -= parseTerm();
+              else return v;
+            }
+          }
+
+          var out = parseExpr();
+          if (pos !== s.length) throw new Error("算式结尾有多余字符，检查括号");
+          if (!isFinite(out)) throw new Error("结果不是有限数");
+          return out;
+        }
+
+        // 数字 → 展示文本。顺手抹掉浮点误差：0.1 + 0.2 要显示 0.3，而不是 0.30000000000000004。
+        function formatNumber(v) {
+          if (typeof v !== "number" || !isFinite(v)) return "";
+          if (v === Math.floor(v) && Math.abs(v) < 1e15) return String(v);
+          var abs = Math.abs(v);
+          if (abs >= 1e15 || (abs < 1e-6 && abs > 0)) return String(v);
+          return String(Math.round(v * 1e12) / 1e12);
+        }
+
+        MINI_APP_RENDERERS.calculator = function (bodyEl, payload) {
+          var input = miniInput("输入算式，例如 12*34 或 (1+2)^3");
+          var copyBtn = miniButton("复制结果", true);
+          copyBtn.disabled = true;
+          bodyEl.appendChild(miniRow(input, copyBtn));
+
+          var out = document.createElement("div");
+          out.className = "mini-calc-out";
+          var value = document.createElement("div");
+          value.className = "mini-calc-value";
+          out.appendChild(value);
+          bodyEl.appendChild(out);
+
+          var current = ""; // 当前可复制的答案
+
+          function update() {
+            var raw = trim(input.value);
+            if (!raw) {
+              value.className = "mini-calc-value";
+              value.textContent = "0";
+              current = "0";
+              copyBtn.disabled = false;
+              return;
+            }
+            var v;
+            try {
+              v = calcEval(raw);
+            } catch (err) {
+              v = null;
+              value.className = "mini-calc-value err";
+              value.textContent = (err && err.message) || "算式无法计算";
+              current = "";
+              copyBtn.disabled = true;
+              return;
+            }
+            if (v === null) {
+              // calcEval 返回 null 表示「有非法字符」，与抛异常是两种不同的错
+              value.className = "mini-calc-value err";
+              value.textContent = "只支持 + - * / % ^ 和括号";
+              current = "";
+              copyBtn.disabled = true;
+              return;
+            }
+            value.className = "mini-calc-value";
+            value.textContent = formatNumber(v);
+            current = value.textContent;
+            copyBtn.disabled = false;
+          }
+
+          function copyResult() {
+            if (!current) {
+              setMiniHint("算式还不对，先改一下吧", "err");
+              return;
+            }
+            miniCopy(current, "结果已复制");
+          }
+
+          miniOnEnter(input, copyResult);
+          copyBtn.addEventListener("click", copyResult);
+          input.addEventListener("input", update);
+
+          input.value = trim(payload);
+          update();
+          input.focus();
+        };
+
+        // ---------- 内置工具：待办清单 ----------
+
+        var TODO_STORAGE_KEY = "easyop.miniapp.todos";
+
+        function loadTodos() {
+          try {
+            var raw = localStorage.getItem(TODO_STORAGE_KEY);
+            var list = raw ? JSON.parse(raw) : [];
+            return Object.prototype.toString.call(list) === "[object Array]" ? list : [];
+          } catch (err) {
+            return [];
+          }
+        }
+
+        function saveTodos(list) {
+          try {
+            localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(list));
+          } catch (err) {
+            setMiniHint("保存失败：本地存储不可用", "err");
+          }
+        }
+
+        MINI_APP_RENDERERS.todo = function (bodyEl) {
+          var todos = loadTodos();
+
+          var input = miniInput("记一笔，回车添加");
+          var addBtn = miniButton("添加");
+          bodyEl.appendChild(miniRow(input, addBtn));
+
+          var list = document.createElement("div");
+          list.className = "mini-list";
+          bodyEl.appendChild(list);
+
+          function renderList() {
+            list.textContent = "";
+            if (todos.length === 0) {
+              list.appendChild(miniPlaceholder("还没有待办。上面输入内容按回车就能加一条。"));
+              return;
+            }
+            todos.forEach(function (item, index) {
+              var row = document.createElement("div");
+              row.className = "mini-todo" + (item.done ? " done" : "");
+
+              var check = document.createElement("div");
+              check.className = "mini-todo-check";
+              check.textContent = "✓";
+              check.title = item.done ? "标记为未完成" : "标记为已完成";
+              check.addEventListener("click", function () {
+                item.done = !item.done;
+                saveTodos(todos);
+                renderList();
+              });
+
+              var text = document.createElement("div");
+              text.className = "mini-todo-text";
+              text.textContent = item.text;
+              text.title = item.text;
+
+              var del = document.createElement("div");
+              del.className = "mini-todo-del";
+              del.textContent = "✕";
+              del.title = "删除";
+              del.addEventListener("click", function () {
+                todos.splice(index, 1);
+                saveTodos(todos);
+                renderList();
+                adjustWindowHeight();
+              });
+
+              row.appendChild(check);
+              row.appendChild(text);
+              row.appendChild(del);
+              list.appendChild(row);
+            });
+          }
+
+          function add() {
+            var v = trim(input.value);
+            if (!v) return;
+            todos.push({ text: v, done: false });
+            input.value = "";
+            saveTodos(todos);
+            renderList();
+            setMiniHint("已添加", "ok");
+            adjustWindowHeight();
+          }
+
+          miniOnEnter(input, add);
+          addBtn.addEventListener("click", add);
+          renderList();
+          input.focus();
+        };
+
+        // ---------- 内置工具：截图 ----------
+
+        MINI_APP_RENDERERS.screenshot = function (bodyEl) {
+          var shootBtn = miniButton("立即截图");
+          var copyBtn = miniButton("复制路径", true);
+          copyBtn.disabled = true;
+          bodyEl.appendChild(
+            miniRow(shootBtn, copyBtn, miniNote("抓取整个屏幕，PNG 存到图片文件夹的 easyop 目录。"))
+          );
+
+          var pathBox = miniPlaceholder("还没有截图。");
+          bodyEl.appendChild(pathBox);
+
+          var savedPath = "";
+
+          function capture() {
+            if (!invoke) {
+              setMiniHint("截图失败：接口不可用", "err");
+              return;
+            }
+            shootBtn.disabled = true;
+            shootBtn.textContent = "抓取中…";
+            setMiniHint("面板会闪一下，马上回来", "");
+
+            invoke("ss_capture_screen")
+              .then(function (path) {
+                savedPath = String(path || "");
+                if (savedPath) {
+                  pathBox.className = "mini-path";
+                  pathBox.textContent = savedPath;
+                  copyBtn.disabled = false;
+                  setMiniHint("已保存", "ok");
+                } else {
+                  setMiniHint("截图失败：没有拿到文件路径", "err");
+                }
+                adjustWindowHeight();
+              })
+              .catch(function (err) {
+                setMiniHint("截图失败：" + (err && err.message ? err.message : err), "err");
+              })
+              .then(function () {
+                // 无论成败都要把按钮恢复，否则失败一次就再也点不动了
+                shootBtn.disabled = false;
+                shootBtn.textContent = savedPath ? "再截一张" : "立即截图";
+              });
+          }
+
+          shootBtn.addEventListener("click", capture);
+          copyBtn.addEventListener("click", function () {
+            miniCopy(savedPath, "路径已复制");
+          });
+        };
+
+        // ---------- 内置工具：翻译 ----------
+
+        // 语言方向。走「打开在线翻译页面」而不是调 API：不需要 key、不引入新依赖，
+        // 翻译质量也是现成的（与 deep-dive 里「面板内输入 翻 你好 → 显示英文」的意图一致）。
+        var TRANSLATE_DIRS = [
+          { label: "中 → 英", from: "zh-Hans", to: "en" },
+          { label: "英 → 中", from: "en", to: "zh-Hans" },
+          { label: "中 → 日", from: "zh-Hans", to: "ja" },
+          { label: "中 → 韩", from: "zh-Hans", to: "ko" },
+          { label: "自动 → 英", from: "auto-detect", to: "en" }
+        ];
+
+        MINI_APP_RENDERERS.translate = function (bodyEl, payload) {
+          var input = miniInput("输入要翻译的内容，回车打开在线翻译");
+          var goBtn = miniButton("翻译");
+          bodyEl.appendChild(miniRow(input, goBtn));
+
+          var dirs = document.createElement("div");
+          dirs.className = "mini-dirs";
+          bodyEl.appendChild(dirs);
+
+          var dirIndex = 0;
+
+          function renderDirs() {
+            dirs.textContent = "";
+            TRANSLATE_DIRS.forEach(function (dir, i) {
+              var chip = document.createElement("button");
+              chip.type = "button";
+              chip.className = "mini-chip" + (i === dirIndex ? " on" : "");
+              chip.textContent = dir.label;
+              chip.addEventListener("click", function () {
+                dirIndex = i;
+                renderDirs();
+              });
+              dirs.appendChild(chip);
+            });
+          }
+
+          function go() {
+            var text = trim(input.value);
+            if (!text) {
+              setMiniHint("先输入要翻译的内容", "err");
+              input.focus();
+              return;
+            }
+            if (!invoke) {
+              setMiniHint("打开失败：接口不可用", "err");
+              return;
+            }
+            var dir = TRANSLATE_DIRS[dirIndex];
+            var url =
+              "https://www.bing.com/translator?ref=TThis" +
+              "&from=" + encodeURIComponent(dir.from) +
+              "&to=" + encodeURIComponent(dir.to) +
+              "&text=" + encodeURIComponent(text);
+            // kind 用 "url"：后端确认后交给系统默认浏览器打开，面板随即收起
+            invoke("ss_execute", { kind: "url", target: url, title: text })
+              .then(function () {
+                hidePalette();
+              })
+              .catch(function (err) {
+                setMiniHint("打开失败：" + (err && err.message ? err.message : err), "err");
+              });
+          }
+
+          miniOnEnter(input, go);
+          goBtn.addEventListener("click", go);
+          renderDirs();
+          input.value = trim(payload);
+          input.focus();
+        };
+
+        // ---------- 面板显隐 ----------
+
+        function hidePalette() {
+          if (invoke) {
+            invoke("hide_ss_palette").catch(function () {});
+          }
+        }
+
+        // 从后端重新读取「精简右键菜单」开关。
+        // 面板窗口在应用启动时就创建并常驻，页面不会随设置改动重新加载，
+        // 所以每次唤出面板都要重新拉一次，否则会一直用启动时的旧值。
+        function refreshCompactMenuSetting() {
+          if (!invoke) return;
+          invoke("get_compact_context_menu")
+            .then(function (v) {
+              state.compactContextMenu = !!v;
+            })
+            .catch(function () { /* 忽略，默认 false */ });
+        }
+
+        function showPalette() {
+          // 上次可能是停在内置工具里被收起的，先退回搜索视图再重置其余状态
+          resetMiniAppView();
+          searchInput.value = "";
+          state.results = [];
+          state.cursor = 0;
+          state.query = "";
+          state.lastExecuteAt = 0;
+          state.enterHeld = false;
+          state.contextMenuIndex = -1;
+          // 上一次点图标的启动意图到此为止：新一次唤出要能立刻再点
+          state.launching = false;
+          hideCompactMenu();
+          refreshCompactMenuSetting();
+          // 图标区每次唤出都重新读一次：小程序管理页里刚加进来的项要能立刻出现在搜索框下面
+          refreshMiniApps();
+          clearTimeout(state.enterResetTimer);
+          render();
+          searchInput.focus();
+        }
+
+        // ---------- 事件监听 ----------
+
+        searchInput.addEventListener("input", function (e) {
+          triggerSearch(e.target.value);
+        });
+
+        document.addEventListener("keydown", function (e) {
+          switch (e.key) {
+            case "ArrowUp":
+              // 内置工具视图里不接管方向键，交给工具自己的输入框 / 列表滚动
+              if (state.miniapp) break;
+              e.preventDefault();
+              moveCursor(-1);
+              break;
+            case "ArrowDown":
+              if (state.miniapp) break;
+              e.preventDefault();
+              moveCursor(1);
+              break;
+            case "Enter":
+              // 内置工具内按回车由渲染器自己在输入框上处理（stopPropagation 拦在前面），
+              // 真走到这里说明焦点在工具容器上，忽略即可 —— 绝不能去执行背后的搜索结果。
+              if (state.miniapp) break;
+              // 输入法正在拼字时，回车的语义是“候选上屏”而不是“打开文件”，必须放行给输入法。
+              // isComposing 是标准字段；keyCode 229 是 WebView2 在 IME 接管按键时的兜底特征。
+              if (e.isComposing || e.keyCode === 229) break;
+              e.preventDefault();
+              // 长按回车会连续派发 keydown，用“按住标记”保证一次按下只执行一次。
+              // 这里不能用 e.repeat 判断：部分输入来源（自动化/快捷键注入）会把它恒置为 true，会导致回车完全失灵。
+              if (state.enterHeld) break;
+              state.enterHeld = true;
+              clearTimeout(state.enterResetTimer);
+              state.enterResetTimer = setTimeout(function () {
+                state.enterHeld = false;
+              }, 800);
+              executeCurrent();
+              break;
+            case "Escape":
+              e.preventDefault();
+              // 优先级：内置工具 → 精简菜单 → 收面板
+              if (closeMiniApp()) {
+                // 已在工具里，退回搜索视图
+              } else if (compactMenuEl && !compactMenuEl.classList.contains("hidden")) {
+                hideCompactMenu();
+              } else {
+                hidePalette();
+              }
+              break;
+            default:
+              break;
+          }
+        });
+
+        // 松开回车立即解除“按住”标记，保证连续两次正常按键都能生效
+        document.addEventListener("keyup", function (e) {
+          if (e.key === "Enter") {
+            clearTimeout(state.enterResetTimer);
+            state.enterHeld = false;
+          }
+        });
+
+        function listen(name, handler) {
+          if (tauri.event && tauri.event.listen) {
+            // 监听注册是核心插件命令，受权限约束。失败必须显式暴露，
+            // 否则会静默失效（表现为「后端发了事件，前端却毫无反应」）。
+            Promise.resolve(tauri.event.listen(name, handler)).catch(function (err) {
+              console.error("[ss_palette] 事件监听注册失败: " + name, err);
+            });
+          } else {
+            console.warn("[ss_palette] 事件 API 不可用，事件监听被跳过: " + name);
+          }
+        }
+
+        listen("ss-palette-show", function () {
+          showPalette();
+        });
+
+        window.addEventListener("focus", function () {
+          setTimeout(function () {
+            // 内置工具模式下搜索框是隐藏的（focus() 对隐藏元素无效），
+            // 此时焦点要交给工具自己的输入控件，否则用户打字会「打不进去」。
+            if (state.miniapp) {
+              var miniInput = miniappBodyEl && miniappBodyEl.querySelector(".mini-input");
+              if (miniInput) miniInput.focus();
+              return;
+            }
+            searchInput.focus();
+          }, 50);
+          // 兜底：面板每次唤出都会重新获得焦点，这里再同步一次后端设置，
+          // 保证即使没收到 ss-palette-show 事件，开关状态也不会过期。
+          refreshCompactMenuSetting();
+          // 同理：图标区也不能因为少收一个事件就永远空着
+          refreshMiniApps();
+        });
+
+        // ---------- 精简右键菜单事件绑定 ----------
+        if (compactMenuEl) {
+          // 菜单项点击
+          var items = compactMenuEl.querySelectorAll(".compact-menu-item");
+          for (var i = 0; i < items.length; i++) {
+            (function (el) {
+              el.addEventListener("click", function () {
+                var action = el.getAttribute("data-action");
+                handleCompactMenuAction(action);
+              });
+            })(items[i]);
+          }
+          // 点击菜单项外 → 收起
+          document.addEventListener("mousedown", function (e) {
+            if (!compactMenuEl.classList.contains("hidden") &&
+                !compactMenuEl.contains(e.target)) {
+              hideCompactMenu();
+            }
+          });
+        }
+
+        // ---------- 初始化 ----------
+        // 加载「精简右键菜单」设置（之后每次唤出面板会再刷新一次）
+        refreshCompactMenuSetting();
+        render();
+        searchInput.focus();
+      })();
+    </script>
+  </body>
+</html>

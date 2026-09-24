@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ss_palette",
+  "description": "Capability for the ⌘SS command palette window (event listen + invoke)",
+  "windows": ["ss_palette"],
+  "permissions": ["core:default"]
+}

@@ -4,7 +4,7 @@
 //! 注意：校验通过并不保证固件一定接受（固件是最终真源），这里只是前置兜底。
 
 use crate::constants::*;
-use crate::model::{ActionSpec, AppTarget, Profile};
+use crate::model::{ActionSpec, AppTarget, Profile, Prompt};
 
 /// 校验一个可打开目标是否填写完整（用于应用库录入/编辑）。
 pub fn is_valid_app_target(target: &AppTarget) -> bool {
@@ -31,6 +31,20 @@ pub fn validate_action(action: &ActionSpec, input: &str) -> Result<(), String> {
         ActionSpec::Hotkey(hotkey) => validate_hotkey(hotkey, input),
         ActionSpec::Text(text) => validate_text(text, input),
         ActionSpec::HostAction(value) => validate_host_action(value, input),
+        ActionSpec::TaskDesk(_) => {
+            // 槽位号只可能是 UI 里那四个；出现别的值说明配置被改坏，
+            // 宁可拒绝下发也不猜一个槽位（猜错 = 语音进错槽，用户无从察觉）。
+            if action.desk_slot().is_none() {
+                return Err(format!(
+                    "「{input}」的任务台槽位非法（应为 1–4，实际 {:?}）",
+                    match action {
+                        ActionSpec::TaskDesk(v) => v.as_str(),
+                        _ => "",
+                    }
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -91,7 +105,30 @@ pub fn validate_host_action(value: &str, input: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验整个方案：所有 11 个输入均在位且动作合法。
+/// 校验方案的提示词库：条数上限 + 每条非空且不超长。
+///
+/// 提示词不属于 `ALL_INPUTS` 里的任何一个输入，因此 `validate_action` 那套
+/// 固件词表校验天然扫不到它 —— 它本来也不下发固件，只需要一组成员自己用得上
+/// 的上限（见 `PROMPT_MAX_UTF8_BYTES` / `PROMPT_MAX_COUNT` 的说明）。
+pub fn validate_prompts(prompts: &[Prompt]) -> Result<(), String> {
+    if prompts.len() > PROMPT_MAX_COUNT {
+        return Err(format!("提示词太多（{} 条，上限 {PROMPT_MAX_COUNT} 条）", prompts.len()));
+    }
+    for prompt in prompts {
+        if prompt.text.trim().is_empty() {
+            return Err("提示词内容不能为空".into());
+        }
+        if prompt.text.len() > PROMPT_MAX_UTF8_BYTES {
+            return Err(format!(
+                "提示词过长（{} 字节，上限 {PROMPT_MAX_UTF8_BYTES} 字节）",
+                prompt.text.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验整个方案：所有 11 个输入均在位且动作合法，提示词库合规。
 pub fn validate_profile(profile: &Profile) -> Result<(), String> {
     if profile.name.trim().is_empty() {
         return Err("方案名不能为空".into());
@@ -108,6 +145,7 @@ pub fn validate_profile(profile: &Profile) -> Result<(), String> {
             }
         }
     }
+    validate_prompts(&profile.prompts)?;
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-//! 领域数据模型：按键动作、按键方案、本机应用库、配置回执。
+//! 领域数据模型：按键动作、按键方案（含提示词库）、本机应用库、配置回执。
 //!
 //! 这些类型同时被前端（经 Tauri 命令 JSON 序列化）与后端各模块共享。
 //! 动作的「本地存储表示」是 `ActionSpec` 判别枚举；向固件下发时由
@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 /// {"kind": "hotkey", "value": "Ctrl+Alt+A"}
 /// {"kind": "text", "value": "你好"}          // 固定文本，≤ 960 字节
 /// {"kind": "host_action", "value": "host_action:<uuid>"}
+/// {"kind": "task_desk", "value": "1"}        // Agent 任务台槽位 1
 /// ```
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -26,6 +27,33 @@ pub enum ActionSpec {
     Hotkey(String),
     Text(String),
     HostAction(String),
+    /// **Agent 任务台槽位按键**。`value` 是槽位号字符串 `"1"`–`"4"`。
+    ///
+    /// # 为什么单列一个 kind，而不复用 `HostAction`
+    ///
+    /// 对固件而言两者**完全等价**，`payload::to_firmware_value` 都会把它编码成
+    /// `host_action:<保留 UUID>`（固件白名单只认这一种携带自定义语义的形式，
+    /// 详见 `constants::UUID_DESK_SLOT1` 的说明）。
+    ///
+    /// 分开的理由在**主机侧**：`HostAction` 的语义是"按 UUID 去应用库里开一个程序"，
+    /// 而任务台按键的语义是"把这一键归入某个槽位"。两者共用一个 kind 会让
+    /// `handle_host_action` 的分流退化成"先查应用库、查不到再当任务台"——
+    /// 一旦用户的某个应用 UUID 恰好撞上保留段就会静默开错东西。
+    /// 类型分开，分流就是**互斥**的，不依赖查表顺序。
+    TaskDesk(String),
+}
+
+impl ActionSpec {
+    /// 槽位号（`TaskDesk` 专用）。非法/非本类型返回 `None`。
+    ///
+    /// **不在这里兜底成 1**：写进配置的槽位号只可能来自 UI 的四个选项，
+    /// 出现别的值说明配置被人手改坏了，应当显式失败而不是猜一个。
+    pub fn desk_slot(&self) -> Option<u8> {
+        match self {
+            ActionSpec::TaskDesk(v) => v.trim().parse::<u8>().ok().filter(|s| (1..=4).contains(s)),
+            _ => None,
+        }
+    }
 }
 
 /// 固定可配置的按键输入 ID 及其固件 JSON 键名。
@@ -67,6 +95,22 @@ pub struct AppEntry {
     pub target: AppTarget,
 }
 
+/// 提示词库条目：一条可以用浮窗一键上屏的常用提示词。
+///
+/// 与「固定文本动作」（`ActionSpec::Text`）是**两回事**：
+/// - 固定文本动作挂在某个按键上，会被 `payload::build_firmware_payload` 下发到固件；
+/// - 提示词只是主机端的一份常用语清单，**完全不下发固件**，只服务于 KEY4 浮窗。
+///
+/// `id` 由主机端生成（v4 UUID），仅用于界面上定位「改哪一条 / 删哪一条」，
+/// 不参与任何协议，也没必要在下发前做规范化校验。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    /// 条目唯一 ID。
+    pub id: String,
+    /// 提示词正文（面板预览与上屏都用它）。
+    pub text: String,
+}
+
 /// 一个按键方案（profile）。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -78,6 +122,12 @@ pub struct Profile {
     pub keys: BTreeMap<String, ActionSpec>,
     /// left/right/press → 动作。
     pub encoder: BTreeMap<String, ActionSpec>,
+    /// 该方案专属的提示词库（KEY4 浮窗的内容，随方案切换）。
+    ///
+    /// `#[serde(default)]` 是**必需**的：加字段之前的 `profiles.json` 里没有这个键，
+    /// 缺了它会让整份配置反序列化失败，用户的全部方案会被静默重置成出厂默认。
+    #[serde(default)]
+    pub prompts: Vec<Prompt>,
 }
 
 impl Profile {
@@ -96,7 +146,7 @@ impl Profile {
         encoder.insert("left".into(), ActionSpec::Disabled);
         encoder.insert("right".into(), ActionSpec::Disabled);
         encoder.insert("press".into(), ActionSpec::Named("scroll_axis_toggle".into()));
-        Profile { id: id.into(), name: name.into(), keys, encoder }
+        Profile { id: id.into(), name: name.into(), keys, encoder, prompts: Vec::new() }
     }
 
     /// 取出某个输入的动作；缺失时回退到「禁用」。

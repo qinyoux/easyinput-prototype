@@ -1,0 +1,109 @@
+{
+  "id": "studio",
+  "name": "内容台",
+  "version": "0.3.0",
+  "description": "easyop 的内容生产工作台：选题台账 → AI 生成（标题/正文/去AI味）→ 导出成品包。随 easyop 发布的内置插件。",
+  "main": "index.js",
+  "activationEvents": [
+    "onCommand:studio.toggle",
+    "onPage:studio.board",
+    "onKeyword:内容台",
+    "onKeyword:选题"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "studio.toggle",
+        "title": "打开内容台",
+        "keywords": ["内容台", "studio", "neirongtai", "写稿", "看板", "nrt"]
+      },
+      {
+        "id": "studio.state",
+        "title": "内容台状态",
+        "keywords": ["状态", "state", "zt"]
+      },
+      {
+        "id": "studio.topics.list",
+        "title": "列出选题",
+        "keywords": ["选题", "列表", "xuanti", "xt"]
+      },
+      {
+        "id": "studio.topics.save",
+        "title": "保存选题",
+        "keywords": ["选题", "保存", "baocun", "bc"]
+      },
+      {
+        "id": "studio.topics.remove",
+        "title": "删除选题",
+        "keywords": ["选题", "删除", "shanchu", "sc"]
+      },
+      {
+        "id": "studio.stage.advance",
+        "title": "推进阶段",
+        "keywords": ["推进", "阶段", "tuiin", "tj"]
+      },
+      {
+        "id": "studio.gen.title",
+        "title": "生成标题候选",
+        "keywords": ["标题", "生成", "biaoti", "bt", "title"]
+      },
+      {
+        "id": "studio.gen.body",
+        "title": "生成正文",
+        "keywords": ["正文", "生成", "zhengwen", "zw", "body"]
+      },
+      {
+        "id": "studio.gen.humanize",
+        "title": "去 AI 味",
+        "keywords": ["去ai味", "humanize", "润色", "runse", "rs"]
+      },
+      {
+        "id": "studio.export",
+        "title": "导出成品包",
+        "keywords": ["导出", "export", "daochu", "dc", "排版", "公众号", "wechat"]
+      },
+      {
+        "id": "studio.doctor",
+        "title": "内容台自检",
+        "keywords": ["自检", "环境", "doctor", "zijan", "zj"]
+      }
+    ],
+    "tools": [
+      {
+        "command": "studio.toggle",
+        "subtitle": "选题 → 生成 → 导出的工作台",
+        "keywords": ["内容台", "studio", "neirongtai", "写稿", "nrt"]
+      },
+      {
+        "command": "studio.gen.title",
+        "subtitle": "为当前选题生成 3 个标题候选",
+        "keywords": ["标题", "biaoti", "bt"]
+      },
+      {
+        "command": "studio.gen.body",
+        "subtitle": "为当前选题生成正文",
+        "keywords": ["正文", "zhengwen", "zw"]
+      },
+      {
+        "command": "studio.export",
+        "subtitle": "导出稿件并按需生成投放包",
+        "keywords": ["导出", "daochu", "dc", "排版"]
+      },
+      {
+        "command": "studio.doctor",
+        "subtitle": "检查 Python / pub.py / 目录是否就位",
+        "keywords": ["自检", "doctor", "zijan"]
+      }
+    ],
+    "pages": [
+      {
+        "id": "studio.board",
+        "title": "内容台",
+        "icon": "board",
+        "order": 50,
+        "keywords": ["内容台", "studio", "写稿", "看板", "nrt"]
+      }
+    ]
+  },
+  "capabilities": ["storage", "llm", "runner", "selected-text", "log"]
+}

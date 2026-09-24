@@ -142,39 +142,73 @@ fn is_batch_path(path: &str) -> bool {
 
 /// 用系统默认方式打开（文件/URL/文件夹/快捷方式）。
 ///
-/// 实现：调用 Win32 `ShellExecuteW`（`open` 动词）。这是系统「打开方式」的标准
+/// 实现：调用 Win32 `ShellExecuteExW`（`open` 动词）。这是系统「打开方式」的标准
 /// 入口，Unicode 友好，能正确处理含中文/空格的路径，且能复用 `.lnk` / `.url`
 /// 快捷方式内嵌的目标与参数。比 `cmd /C start` 更可靠——后者经 cmd.exe 的
 /// OEM 代码页转码，含非 ASCII 字符的路径会被破坏成乱码而静默失败。
-fn shell_open(target: &str) -> Result<String, String> {
+///
+/// 注意：必须显式把工作目录设为文件所在的父目录，否则某些应用（如
+/// LibreOffice）会在 easyop 自己的工作目录里尝试创建锁文件，导致"无法
+/// 创建加锁文件 / 缺少权限"之类的报错。
+pub(crate) fn shell_open(target: &str) -> Result<String, String> {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     if target.trim().is_empty() {
         return Err("打开目标不能为空".into());
     }
-    let mut wide: Vec<u16> = target.encode_utf16().collect();
-    wide.push(0);
-    let hinst = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR::null(),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
+    let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // 计算工作目录：文件/文件夹所在的父目录。
+    // URL（含 :// 或 http 开头）不设工作目录。
+    let is_url = target.contains("://")
+        || target.starts_with("http:")
+        || target.starts_with("https:");
+    let work_dir_wide: Vec<u16> = if is_url {
+        Vec::new()
+    } else {
+        std::path::Path::new(target)
+            .parent()
+            .map(|p| {
+                let s = p.to_string_lossy().to_string();
+                if s.is_empty() {
+                    // 根目录（如 C:\）的 parent 是空串，直接用目标本身
+                    target.encode_utf16().chain(std::iter::once(0)).collect()
+                } else {
+                    s.encode_utf16().chain(std::iter::once(0)).collect()
+                }
+            })
+            .unwrap_or_default()
     };
-    // ShellExecuteW 约定：返回值 > 32 表示成功；<= 32 为 SE_ERR_* 错误码。
-    let code = hinst.0 as usize;
-    if code <= 32 {
+
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC,
+        hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        lpVerb: PCWSTR::null(),   // 默认动词（通常是 "open"）
+        lpFile: PCWSTR(target_wide.as_ptr()),
+        lpParameters: PCWSTR::null(),
+        lpDirectory: if work_dir_wide.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(work_dir_wide.as_ptr())
+        },
+        nShow: SW_SHOWNORMAL.0 as i32,
+        ..Default::default()
+    };
+
+    let result = unsafe { ShellExecuteExW(&mut sei) };
+    if result.is_err() {
+        // 失败时尝试拿更详细的错误码
+        let err = unsafe { windows::Win32::Foundation::GetLastError() };
+        let code = err.0 as i32;
         log_buffer::err(format!(
-            "launcher: ShellExecuteW 失败 target={target:?} code={code}"
+            "launcher: ShellExecuteExW 失败 target={target:?} err={code}"
         ));
-        return Err(format!("无法打开「{target}」（ShellExecute 错误码 {code}）"));
+        return Err(format!("无法打开「{target}」（错误码 {code}）"));
     }
-    log_buffer::info(format!("launcher: ShellExecuteW 成功 target={target:?} code={code}"));
+    log_buffer::info(format!("launcher: ShellExecuteExW 成功 target={target:?}"));
     Ok(format!("已打开：{target}"))
 }
 

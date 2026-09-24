@@ -1,7 +1,9 @@
 //! 构造固件配置 JSON（`ai_keyboard.v1`）与解析 0x11 回执。
 //!
-//! `to_firmware_json` 把本地 `Profile` 转换成固件 `config_payload.cpp` 严格声称的
+//! `build_firmware_payload` 把本地 `Profile` 转换成固件 `config_payload.cpp` 严格声称的
 //! 结构：`keys` 条目包 `{press: ...}`，`encoder` 条目用裸值，两者都必须含全部字段。
+//! 它与固件 JSON 一并产出两张反向索引表（UUID → 正文 / UUID → 输入项），
+//! 因为含非ASCII的固定文本每次下发都会拿到新的随机 UUID，索引必须与本次下发同源。
 
 use crate::constants::*;
 use crate::model::{ActionSpec, ConfigAck, Profile, ENCODER_INPUTS, KEY_INPUTS};
@@ -9,26 +11,60 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// 具名动作 → 主机端保留 UUID。
+///
+/// 这些动作的语义完全在主机侧实现（方案切换、浮窗工作台），固件只需要把触发
+/// 原样回传。命中者在下发时被改写成 `host_action:<uuid>` 裸字符串。
+pub fn reserved_uuid_for_named(name: &str) -> Option<&'static str> {
+    match name {
+        "toggle_profile" => Some(UUID_TOGGLE_PROFILE),
+        "previous_profile" => Some(UUID_PREVIOUS_PROFILE),
+        "next_profile" => Some(UUID_NEXT_PROFILE),
+        "workbench" => Some(UUID_WORKBENCH),
+        "workbench_prev" => Some(UUID_WORKBENCH_PREV),
+        "workbench_next" => Some(UUID_WORKBENCH_NEXT),
+        "workbench_confirm" => Some(UUID_WORKBENCH_CONFIRM),
+        "ss_palette" => Some(UUID_SS_PALETTE),
+        "cli_terminal" => Some(UUID_CLI_TERMINAL),
+        _ => None,
+    }
+}
+
+/// 保留 UUID → 具名动作（`reserved_uuid_for_named` 的逆映射）。
+///
+/// 用于把固件回发的 UUID 反查回「是哪个语义」，以及输入来源反查时比对固件值。
+pub fn named_for_reserved_uuid(uuid: &str) -> Option<&'static str> {
+    match uuid {
+        UUID_TOGGLE_PROFILE => Some("toggle_profile"),
+        UUID_PREVIOUS_PROFILE => Some("previous_profile"),
+        UUID_NEXT_PROFILE => Some("next_profile"),
+        UUID_WORKBENCH => Some("workbench"),
+        UUID_WORKBENCH_PREV => Some("workbench_prev"),
+        UUID_WORKBENCH_NEXT => Some("workbench_next"),
+        UUID_WORKBENCH_CONFIRM => Some("workbench_confirm"),
+        UUID_SS_PALETTE => Some("ss_palette"),
+        UUID_CLI_TERMINAL => Some("cli_terminal"),
+        _ => None,
+    }
+}
+
 /// 把单个动作转成固件可接受的 JSON 值。
 ///
 /// - `Disabled` / `Named` → 裸字符串
 /// - `Hotkey` → `{"hotkey": "..."}`
 /// - `Text` → `{"text": "..."}`
-/// - `HostAction` → 裸字符串 `"host_action:<uuid>"`
+/// - `HostAction` / `TaskDesk` → 裸字符串 `"host_action:<uuid>"`
 ///
-/// 方案切换命名动作（`toggle_profile` / `previous_profile` / `next_profile`）
-/// 被转为保留 UUID 的 `host_action` 裸字符串，使固件回发 0x11 kind 0x05 报文，
-/// 主机端拦截后执行方案切换并重新下发当前方案。
+/// 主机端保留具名动作（方案切换三件套、浮窗工作台四件套）被转为保留 UUID 的
+/// `host_action` 裸字符串，使固件回发 0x11 kind 0x05 报文，主机端拦截后执行。
+/// 任务台槽位按键走同一条通道（固件对按键动作是白名单制，这是唯一能携带
+/// 自定义语义的形式）。
 pub fn to_firmware_value(action: &ActionSpec) -> Value {
     match action {
         ActionSpec::Disabled => Value::String("disabled".into()),
         ActionSpec::Named(name) => {
-            if name == "toggle_profile" {
-                Value::String(format!("host_action:{UUID_TOGGLE_PROFILE}"))
-            } else if name == "previous_profile" {
-                Value::String(format!("host_action:{UUID_PREVIOUS_PROFILE}"))
-            } else if name == "next_profile" {
-                Value::String(format!("host_action:{UUID_NEXT_PROFILE}"))
+            if let Some(uuid) = reserved_uuid_for_named(name) {
+                Value::String(format!("{HOST_ACTION_PREFIX}{uuid}"))
             } else {
                 Value::String(name.clone())
             }
@@ -36,33 +72,66 @@ pub fn to_firmware_value(action: &ActionSpec) -> Value {
         ActionSpec::Hotkey(hk) => json!({ "hotkey": hk }),
         ActionSpec::Text(text) => json!({ "text": text }),
         ActionSpec::HostAction(value) => Value::String(value.clone()),
+        ActionSpec::TaskDesk(_) => match action.desk_slot().and_then(crate::constants::desk_slot_uuid)
+        {
+            Some(uuid) => Value::String(format!("{HOST_ACTION_PREFIX}{uuid}")),
+            None => {
+                // 失败要看得见：这里没法返回 Err（下发路径的签名是 Value），
+                // 所以显式记一条错误日志，再降级成 disabled——**绝不**静默发一个
+                // 固件会拒收的字符串（那会让整份配置下发失败，用户只看到"按键失灵"）。
+                crate::log_buffer::err(format!(
+                    "任务台按键槽位号非法（{action:?}），本次下发已降级为 disabled"
+                ));
+                Value::String("disabled".into())
+            }
+        },
     }
 }
 
-/// 把一个方案序列化为固件配置 JSON 字符串。
+/// 一次方案下发的产物：固件 JSON + 主机端需要的文本动作反查表。
 ///
-/// `text_map` 接收含非ASCII字符的固定文本动作映射（UUID → 文本内容），
-/// 供主机端在固件回发 UUID 时用剪贴板+Ctrl+V 注入。
-pub fn to_firmware_json(profile: &Profile, text_map: &mut HashMap<String, String>) -> String {
+/// `text_map` 必须与本次下发的 JSON 来自同一次遍历：含非ASCII的固定文本在每次
+/// 下发时都会拿到一个新的 v4 UUID，脱离本次遍历独立推导出来的 UUID 与开发板上
+/// 正在生效的那一份对不上。
+///
+/// 改造前这里还有第二张表 `text_sources`（UUID → 硬件输入），它只服务于浮窗的
+/// 「按键动作列表」做反查高亮。浮窗改成提示词库后不再列按键动作，该表已无消费方，
+/// 故一并移除 —— 少一张没有读者的表，也少一处将来会被人误以为「在用」的假接口。
+pub struct FirmwarePayload {
+    /// 固件配置 JSON。
+    pub json: String,
+    /// UUID → 文本正文（固件回传该 UUID 时用于剪贴板上屏）。
+    pub text_map: HashMap<String, String>,
+}
+
+/// 构造一次完整下发产物（固件 JSON + 文本动作反查表）。
+pub fn build_firmware_payload(profile: &Profile) -> FirmwarePayload {
+    let mut text_map = HashMap::new();
+
     let mut keys = Map::new();
     for input in KEY_INPUTS {
         let action = profile.action_for(input);
-        keys.insert(input.to_string(), json!({ "press": action_to_firmware(&action, text_map) }));
+        let value = action_to_firmware(&action, &mut text_map);
+        keys.insert(input.to_string(), json!({ "press": value }));
     }
     let mut encoder = Map::new();
     for input in ENCODER_INPUTS {
         let action = profile.action_for(input);
-        encoder.insert(input.to_string(), action_to_firmware(&action, text_map));
+        let value = action_to_firmware(&action, &mut text_map);
+        encoder.insert(input.to_string(), value);
     }
+
     let payload = json!({
         "schema": SCHEMA_VERSION,
         "target_platform": "windows",
         "profiles": [ { "keys": keys, "encoder": encoder } ],
     });
-    serde_json::to_string(&payload).unwrap_or_else(|_| {
+    let json = serde_json::to_string(&payload).unwrap_or_else(|_| {
         // 理论上不会失败；兜底返回最简 schema。
         format!(r#"{{"schema":"{SCHEMA_VERSION}","target_platform":"windows","profiles":[{{}}]}}"#)
-    })
+    });
+
+    FirmwarePayload { json, text_map }
 }
 
 /// 把单个动作转成固件可接受的 JSON 值，含非ASCII的 Text 转为 host_action。
@@ -98,9 +167,8 @@ mod tests {
     #[test]
     fn firmware_json_shape() {
         let p = Profile::factory_default("默认", "p1");
-        let mut text_map = HashMap::new();
-        let json = to_firmware_json(&p, &mut text_map);
-        let v: Value = serde_json::from_str(&json).unwrap();
+        let built = build_firmware_payload(&p);
+        let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["schema"], SCHEMA_VERSION);
         let prof = &v["profiles"][0];
         assert!(prof["keys"]["KEY1"]["press"].is_string());
@@ -117,7 +185,7 @@ mod tests {
             }
         }
         // 默认方案无含非ASCII的文本动作
-        assert!(text_map.is_empty());
+        assert!(built.text_map.is_empty());
     }
 
     #[test]
@@ -126,25 +194,98 @@ mod tests {
         p.keys.insert("KEY2".into(), ActionSpec::Hotkey("Ctrl+Alt+A".into()));
         p.keys.insert("KEY3".into(), ActionSpec::Text("你好".into()));
         p.keys.insert("KEY4".into(), ActionSpec::HostAction("host_action:12345678-1234-4abc-8def-1234567890ab".into()));
-        let mut text_map = HashMap::new();
-        let v: Value = serde_json::from_str(&to_firmware_json(&p, &mut text_map)).unwrap();
+        let built = build_firmware_payload(&p);
+        let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["profiles"][0]["keys"]["KEY2"]["press"]["hotkey"], "Ctrl+Alt+A");
         // 含非ASCII的 Text 被转为 host_action 裸字符串
         let key3_val = v["profiles"][0]["keys"]["KEY3"]["press"].as_str().unwrap();
         assert!(key3_val.starts_with("host_action:"));
         assert_eq!(v["profiles"][0]["keys"]["KEY4"]["press"], "host_action:12345678-1234-4abc-8def-1234567890ab");
         // text_map 中应有一条映射
-        assert_eq!(text_map.len(), 1);
-        assert!(text_map.values().any(|v| v == "你好"));
+        assert_eq!(built.text_map.len(), 1);
+        assert!(built.text_map.values().any(|v| v == "你好"));
     }
 
     #[test]
     fn ascii_text_stays_text() {
         let mut p = Profile::factory_default("默认", "p1");
         p.keys.insert("KEY1".into(), ActionSpec::Text("hello 123".into()));
-        let mut text_map = HashMap::new();
-        let v: Value = serde_json::from_str(&to_firmware_json(&p, &mut text_map)).unwrap();
+        let built = build_firmware_payload(&p);
+        let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["profiles"][0]["keys"]["KEY1"]["press"]["text"], "hello 123");
-        assert!(text_map.is_empty());
+        assert!(built.text_map.is_empty());
+    }
+
+    #[test]
+    fn workbench_named_maps_to_reserved_uuid() {
+        let mut p = Profile::factory_default("默认", "p1");
+        p.keys.insert("KEY4".into(), ActionSpec::Named("workbench".into()));
+        p.encoder.insert("left".into(), ActionSpec::Named("workbench_prev".into()));
+        p.encoder.insert("right".into(), ActionSpec::Named("workbench_next".into()));
+        p.encoder.insert("press".into(), ActionSpec::Named("workbench_confirm".into()));
+        let built = build_firmware_payload(&p);
+        let v: Value = serde_json::from_str(&built.json).unwrap();
+        let prof = &v["profiles"][0];
+        assert_eq!(
+            prof["keys"]["KEY4"]["press"],
+            format!("host_action:{UUID_WORKBENCH}")
+        );
+        assert_eq!(
+            prof["encoder"]["left"],
+            format!("host_action:{UUID_WORKBENCH_PREV}")
+        );
+        assert_eq!(
+            prof["encoder"]["right"],
+            format!("host_action:{UUID_WORKBENCH_NEXT}")
+        );
+        assert_eq!(
+            prof["encoder"]["press"],
+            format!("host_action:{UUID_WORKBENCH_CONFIRM}")
+        );
+        // 浮窗动作不消耗 text_map
+        assert!(built.text_map.is_empty());
+    }
+
+    #[test]
+    fn firmware_payload_text_map() {
+        let mut p = Profile::factory_default("默认", "p1");
+        // KEY3 与 encoder.left 各放一条含非ASCII文本
+        p.keys.insert("KEY3".into(), ActionSpec::Text("帮我润色这段文字".into()));
+        p.encoder.insert("left".into(), ActionSpec::Text("总结要点".into()));
+        // KEY5 是纯 ASCII 文本：留在固件侧自行键入，不进 text_map
+        p.keys.insert("KEY5".into(), ActionSpec::Text("hello".into()));
+
+        let built = build_firmware_payload(&p);
+        assert_eq!(built.text_map.len(), 2);
+        assert!(built.text_map.values().any(|v| v == "帮我润色这段文字"));
+        assert!(built.text_map.values().any(|v| v == "总结要点"));
+
+        // 固件 JSON 里的 host_action 值应与 text_map 的键一一对应
+        let v: Value = serde_json::from_str(&built.json).unwrap();
+        let key3 = v["profiles"][0]["keys"]["KEY3"]["press"].as_str().unwrap();
+        let left = v["profiles"][0]["encoder"]["left"].as_str().unwrap();
+        assert!(built.text_map.contains_key(key3.trim_start_matches("host_action:")));
+        assert!(built.text_map.contains_key(left.trim_start_matches("host_action:")));
+        // ASCII 文本不产生 UUID
+        assert_eq!(v["profiles"][0]["keys"]["KEY5"]["press"]["text"], "hello");
+    }
+
+    #[test]
+    fn reserved_uuid_roundtrip() {
+        for name in [
+            "toggle_profile",
+            "previous_profile",
+            "next_profile",
+            "workbench",
+            "workbench_prev",
+            "workbench_next",
+            "workbench_confirm",
+        ] {
+            let uuid = reserved_uuid_for_named(name).expect("保留动作应有 UUID");
+            assert!(crate::validate::is_canonical_uuid(uuid), "{uuid} 非法");
+            assert_eq!(named_for_reserved_uuid(uuid), Some(name));
+        }
+        // 普通具名动作不产生 UUID
+        assert!(reserved_uuid_for_named("copy").is_none());
     }
 }

@@ -41,3 +41,28 @@ src-tauri/WixTools/
 .codegraph/
 .codeartsdoer/
 .merkle-snapshot.json
+
+# 探测脚本的落盘产物（scripts/probe_models.py 生成的试听 WAV）
+scripts/_probe_out/
+
+# Trae 分享包缓存（HTML 分享产物，不入库）
+.trae-html-share-packages/
+
+# 本地改动备份（多 agent 并行时临时留档用的，**不入库**）
+# 起因：`git add -A` 会把 `src/.../mod.rs.bak-xxx` 这类文件一起提交，
+# 于是别人的 `git log --stat` 里会突然多出几百 KB 与功能无关的副本。
+*.bak
+*.bak-*
+*.orig
+
+# 本地取证调试产物（截图 / 时间线），**不入库**
+# 起因：它们是某次排查的一次性证据（如 v0.35.3 字幕浮层显隐取证的 6 张截图），
+# 不是项目资产；可复用的**工具**（如 cdp_eval.mjs）与**记忆**（memory/）照常入库。
+.workbuddy/shots/
+.workbuddy/watch/
+
+# 内容生产流水线的中间产物（飞书文档 API 往返 JSON / 组稿草稿 xml），**不入库**
+# 起因：它们与 easyop 代码无关，且是别的工作流（内容台/飞书）的一次性中间态，
+# `git add -A` 会把它们一起卷进来，污染 `git log --stat`。
+.tmp-lark/
+draft_*_folder/

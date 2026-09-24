@@ -1,0 +1,28 @@
+{
+  "id": "demo-quick-note",
+  "name": "灵感速记（示范）",
+  "version": "0.2.0",
+  "description": "easyop 插件机制的最小参考实现：一句话记下灵感，落进插件本地存储。命名空间用 demo.*，不占 studio.*（那是内容台的）。",
+  "main": "index.js",
+  "activationEvents": [
+    "onCommand:demo.quick_note",
+    "onKeyword:灵感"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "demo.quick_note",
+        "title": "记一条灵感",
+        "keywords": ["灵感", "速记", "note", "inbox", "linggan", "sj"]
+      }
+    ],
+    "tools": [
+      {
+        "command": "demo.quick_note",
+        "subtitle": "记下一句话，稍后整理",
+        "keywords": ["灵感", "速记", "note", "inbox", "linggan"]
+      }
+    ]
+  },
+  "capabilities": ["storage", "selected-text", "log"]
+}

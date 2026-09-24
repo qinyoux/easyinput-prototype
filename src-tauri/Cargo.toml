@@ -1,21 +1,59 @@
 [package]
 name = "easyop"
-version = "0.2.0"
+version = "0.35.4"
 description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
 authors = ["easyop"]
 edition = "2021"
 
 [lib]
 name = "easyop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 只留 rlib —— **不要加回 staticlib / cdylib**（2026-09-22 实测决定）。
+#
+# 那两项是 `create-tauri-app` 模板的默认值，服务的是**移动端**：Android/iOS 把
+# Rust 编成 .so / .a 再被原生工程链进去。本项目只出 Windows 桌面版：
+# `src/main.rs` 一句 `easyop_lib::run()`，链的是 **rlib**；staticlib / cdylib
+# 编出来没人用。
+#
+# 代价不是"多两个文件"，而是**每轮编译都要多写约 1.1 GB 的 `easyop_lib.lib`**
+# （静态库把整棵依赖树的 .o 合并进去，debug 信息还全带着）。开发期每次存盘
+# 触发重编都写一遍，磁盘与 I/O 全是白耗。
+#
+# 何时需要加回来：`tauri android init` / `tauri ios init` 之后。桌面版不需要。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# ⚠️ 这不是功能依赖，是**编译期修复**，不要删。
+#
+# 问题链（实测 2026-09-22，rustc 1.98）：本 crate 的 build-dep `tauri-build`
+# → `tauri-utils` → `schemars 0.8.22` → `indexmap 1.9.3`。
+# indexmap 1.9 的 `IndexMap<K, V, S = RandomState>` **只在 `has_std` 生效时**才给 S
+# 默认值；而 `has_std` 由它自己的 build.rs 用 autocfg 探测 sysroot 得出
+# （`emit_sysroot_crate("std")`）。在 rustc 1.98 上这个探测**探不到** ——
+# 证据是 `target/debug/build/indexmap-*/output` 里只有 `rustc-check-cfg`、没有
+# `rustc-cfg=has_std`。于是 schemars 的 `pub type Map<K, V> = indexmap::IndexMap<K, V>`
+# 报 `struct takes 3 generic arguments but 2 were supplied`，整个项目 `cargo check`
+# 都过不去。
+#
+# indexmap 1.9 的 build.rs 第一句就是「If "std" is explicitly requested, don't bother
+# probing」⇒ **显式开 std 即可跳过那次探测**。这条依赖的唯一作用就是提交那个特性。
+#
+# ⚠️ 必须挂在 `[build-dependencies]`、不能挂 `[dependencies]`：schemars 处在
+# **构建依赖图（host）**里，而 Cargo resolver v2（edition 2021 默认）**不跨
+# 宿主图与目标图合并特性** —— 挂到 `[dependencies]` 实测无效，报同一个错。
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 豆包 TTS 的音频片段是 base64（NDJSON 每行的 data 字段）。
+#
+# 为什么直接依赖而不是像 WAV 那样手写：**0.22.1 早已在依赖树里被编译过**
+# （reqwest/tokio-tungstenite 都在用，target/debug/deps 下已有 rlib），
+# 所以这一行不新增任何下载与编译。手写 base64 反而要多维护"填充缺失/空白字符"
+# 这些边界，得不偿失。
+base64 = "0.22"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -29,10 +67,16 @@ windows = { version = "0.58", features = [
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_UI_Shell",
+    "Win32_System_WindowsProgramming",
+    # ⌘SS 面板的「资源管理器右键菜单」用到 SHCreateItemFromParsingName /
+    # IShellItem::BindToHandler / IContextMenu，这些 API 由本特性开关控制。
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    # 截图小程序用 GDI 抓屏（BitBlt / CreateDIBSection），见 screenshot.rs。
+    "Win32_Graphics_Gdi",
 ] }
-
 # 云端流式识别相关
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 http = "1"
@@ -40,3 +84,6 @@ cpal = "0.15"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

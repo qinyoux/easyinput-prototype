@@ -5,6 +5,8 @@
 //! 线程持续打开 HID 设备并读取 0x11 报告，识别 kind 0x05 后按 UUID 分流：
 //! - 文本注入 UUID → 主机端用剪贴板+Ctrl+V 注入含非ASCII的固定文本；
 //! - 保留 UUID（方案切换）→ 主机端切换激活方案并重新下发固件；
+//! - 保留 UUID（浮窗工作台）→ 主机端开合浮窗 / 移动高亮 / 确认上屏；
+//! - 保留 UUID（启动终端）→ 打开（或复用）一个终端并预置命令前缀，不回车；
 //! - 普通 UUID → 在应用库中解析并打开本机目标。
 
 use std::collections::HashMap;
@@ -187,8 +189,23 @@ fn handle_host_action(
     {
         let guard = text_actions.read().unwrap();
         if let Some(text) = guard.get(&uuid) {
+            let text = text.clone();
+            drop(guard);
+
+            // 浮窗工作台打开时不能直接注入：此刻前台是浮窗自己，Ctrl+V 会把正文
+            // 粘进浮窗，而不是用户原来的编辑位置。改为让浮窗高亮对应行，由用户在
+            // 浮窗里按编码器确认（`workbench_commit` 会先收起浮窗再注入）。
+            //
+            // 传给浮窗的是**正文**而不是 UUID：提示词库与按键绑定是两套独立数据，
+            // 两者之间唯一的对应关系就是「文本相同」，页面按正文匹配即可高亮。
+            if crate::workbench::is_open(app) {
+                log_buffer::info("浮窗工作台已打开：文本动作转为高亮对应提示词");
+                crate::workbench::emit_command(app, "activate", Some(text.clone()));
+                return;
+            }
+
             log_buffer::info(format!("文本注入: {} 字节", text.len()));
-            match crate::text_delivery::deliver(text) {
+            match crate::text_delivery::deliver(&text) {
                 Ok(()) => log_buffer::info("文本注入成功"),
                 Err(e) => log_buffer::err(format!("文本注入失败: {e}")),
             }
@@ -209,7 +226,56 @@ fn handle_host_action(
         return;
     }
 
-    // 3. 普通 UUID：在应用库中解析并打开。
+    // 3. 保留 UUID：KEY4 浮窗工作台（开合 / 高亮上下 / 确认上屏）。
+    if crate::workbench::handle_action(app, &uuid) {
+        return;
+    }
+
+    // 3.5. 保留 UUID：⌘SS 命令面板（开合）。
+    if crate::ss_palette::handle_action(app, &uuid) {
+        return;
+    }
+
+    // 3.6. 保留 UUID：Agent 任务台的槽位按键（S1–S4）。
+    //
+    // 必须排在"查应用库"之前。按键的 `task_desk` 动作在固件里就是一个普通的
+    // `host_action:<uuid>`（固件对按键动作是白名单制，见 constants 里的说明），
+    // 但它的语义是"归入槽位"而不是"开一个程序"——放到应用库分支就会报
+    // "打开失败"，把功能未实现误诊成配置错误。
+    if crate::agent_desk::handle_reserved_uuid(app, &uuid) {
+        return;
+    }
+
+    // 3.7. 保留 UUID：启动一个终端并把命令前缀打进去（不回车）。
+    //
+    // ⚠️ **必须 spawn 到独立线程**。`launch()` 里要等新窗口起来并拿到前台
+    //    （上限 6 秒），再把命令打进那个窗口。直接在这里调，就是把这**一个**
+    //    HID 监听线程钉住 6 秒 —— 这 6 秒里板子上任何按键都读不到，
+    //    用户看到的是"按了没反应"，日志上却像设备掉线。
+    //    监听线程的职责只有"读到报文 → 分流 → 立刻回去读下一条"，一点都不能多。
+    //
+    //    代价是"这次启动的结果"不能再靠日志顺序看出因果，所以结果单独发一条
+    //    `cli-terminal` 事件给界面（成功/失败都发，失败不静默）。
+    if uuid == crate::constants::UUID_CLI_TERMINAL {
+        let app2 = app.clone();
+        let uuid2 = uuid.clone();
+        std::thread::spawn(move || {
+            let (ok, message) = match crate::cli_terminal::launch() {
+                Ok(m) => (true, m),
+                Err(e) => {
+                    log_buffer::err(format!("终端启动：{e}"));
+                    (false, e)
+                }
+            };
+            let _ = app2.emit(
+                "cli-terminal",
+                serde_json::json!({ "uuid": uuid2, "message": message, "ok": ok }),
+            );
+        });
+        return;
+    }
+
+    // 4. 普通 UUID：在应用库中解析并打开。
     let result = {
         let guard = apps.read().unwrap();
         launcher::open_by_uuid(&guard, &uuid)
@@ -273,12 +339,15 @@ fn handle_profile_switch(
 
     *active_profile_id.write().unwrap() = Some(new_id.clone());
 
-    // 下发新方案到固件，同时更新文本动作映射。
-    let mut text_map = HashMap::new();
-    let json = crate::payload::to_firmware_json(new_profile, &mut text_map);
-    *text_actions.write().unwrap() = text_map;
-    log_buffer::info(format!("方案切换：下发固件 ({} 字节)", json.len()));
-    match crate::transport::send_config(&json) {
+    // 下发新方案到固件，同时更新文本动作映射与浮窗提示词列表。
+    //
+    // 「内容随方案切换」正是靠这一行：提示词挂在方案上，任何一次激活方案变更都
+    // 会重新发布一次快照，浮窗若正开着就当场换内容。
+    let built = crate::payload::build_firmware_payload(new_profile);
+    *text_actions.write().unwrap() = built.text_map.clone();
+    crate::workbench::publish_board_input(app, new_profile);
+    log_buffer::info(format!("方案切换：下发固件 ({} 字节)", built.json.len()));
+    match crate::transport::send_config(&built.json) {
         Ok(ack) => log_buffer::info(format!("方案切换：下发回执 {:?}", ack)),
         Err(e) => log_buffer::err(format!("方案切换：下发失败 {e}")),
     }
