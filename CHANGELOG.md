@@ -7,6 +7,143 @@
 
 ---
 
+## [v0.35.4] — 2026-09-23
+
+> ⚠️ **本节为回顾补记**：原条目在 2026-09-24 13:24 与 v0.35.3 一起被**一次外部操作**
+> 从工作树清掉（文件顶部回退到 v0.35.2），按本次改动的实际内容、commit 记录与
+> `.workbuddy/memory/2026-09-23.md` 重建，**不是逐字还原**。
+
+### 新增
+
+- **豆包 TTS 支持「WebSocket 双向流式 V3」端点。**
+  新增 `tts.rs::synthesize_volc_bidirection_ws`，按官方双向流式的上行帧形状
+  `[头 4B][event 4B][sid_len 4B][sid][size 4B][payload]`（头 flags `0b0100`）
+  与握手序列 `1→50→100→150→200→35x→102→152→2→52` 实现合成。
+  `TtsConfig::is_bidirection()` 的判据 = 去掉 `?`/`#`、去尾 `/` 后**最后一个路径段
+  严格等于 `"bidirection"`**（`bidirection-proxy`、`bidirection/stream2` **不算**）。
+  **刻意不提供"双向端点"常量** —— 一个带错误前缀的默认值比没有更糟。
+- `scripts/` 新增三个零依赖协议探针：`probe_tts_bidirection.py`（权威探针，
+  `--repro-old` 可复现"0 帧"）、`_probe_bidir_variants.py`（四种帧形状对照）、
+  `_capture_bidir_frames.py`（抓真实 hex 供单测）。
+
+### 变更
+
+- `ServerFrame` 新增 `session_id: Option<String>`（连接类事件存 `connection_id`、
+  会话类存 `session_id`，两者布局相同）；`parse_server_frame` 由"只跳过 id 段"改为**捕获**。
+  **单向路径行为不变**（实测字节级回归一致）。
+- 新增 `(Volc, Http) if is_bidirection()` 分支 → 返回 `InvalidInput`，明确提示该端点需 `wss://`。
+- 抽公共 `volc_ws_connect` / `bidir_send` / `bidir_recv` / `bidir_expect`，
+  单向 `synthesize_volc_ws` 改为复用（其内联连接块删除）。
+
+### 修复
+
+- **修「双向流式端点跑不起来」——现场表现为 `等待音频超时(10 秒无新帧，已收 0 帧)`。**
+  真根因是**同一个服务、上行帧形状有两套**：单向
+  `[头][sequence 4B][size 4B][payload]`（flags `0b0001`）vs 双向
+  `[头][event 4B][sid_len 4B][sid][size 4B][payload]`（flags `0b0100`）。
+  **把单向帧发给双向端点，服务器不报错、只是静默等待** ⇒ 客户端收 0 帧。
+  ⚠️ **这个错误形状没有任何错误码**，靠读文档看不出来，只能实测。
+  **判据记牢：「0 帧」先怀疑帧形状，别先怀疑 key / 网络 / 端点。**
+- **会话类事件必须带非空 `session_id`**：`sid_len == 0` → 服务器回
+  `session ID length is zero`；填了 sid 但帧里没写出 sid 段 →
+  `parse payload size failed: body too short`。⇒ 已把这条规则**编码进类型**：
+  `FrameScope::Session(&str)` 传空串直接返回 `Err`，想绕开得先改类型（这是故意的）。
+
+### 实测钉死的事实（别再重测）
+
+- 连接类帧 `StartConnection` 真身 14 字节：`11 14 10 00 00 00 00 01 00 00 00 02 7b 7d`（有单测锁死）。
+- **只有 `152`（SessionFinished）是终止符**：`351`（TTSSentenceEnd）在 TTS1.0 是**逐句**触发，
+  拿它当终止会早停。
+- **文本只放 `TaskRequest`**：放 `StartSession` 也能通（实测 3.58 s vs 3.81 s，无双份合成），
+  但按文档语义更干净。
+- `FinishConnection` 失败**忽略**（音频已到手，不因此判失败）。
+- 单次成功合成样本：16 帧 / `48000 Hz` / 171778 samples / 3578 ms 音频 / 墙钟 1513 ms。
+- `/plan/` 网关前缀在本账号的 key 上是**硬要求**，官方裸路径返回 **401 `Invalid X-Api-Key`**。
+
+### 验证
+
+- `cargo test --lib -- --test-threads=1` → **418 passed / 0 failed / 4 ignored**。
+  `tts::tests` 覆盖：端点判定、连接帧字节表、会话帧带 sid、真实 hex 回包解析、
+  协议错误不误判为鉴权失败、`https` 端点被拒且有方向提示。
+- 两个 `#[ignore]` 实时用例手动跑通：双向合成（`logid=20260923180004E5669E24BDE7F50799B9`）、
+  单向回归（字节级不变）。
+- `cargo check` → exit 0（52 个既有 warning）；`npm run build` → exit 0；`npm run version:check` → exit 0。
+
+### ⚠️ 未完成
+
+- **`cargo build` 链接期 `LNK1104`**：`easyop.exe` 被运行中的 App 实例占用，需关掉 App
+  才能完整链接；`cargo check` 与全部测试不受影响。
+- **ASR 只做结构审查、未改一行代码**。唯一发现的潜在隐患：`asr.rs` 700/729/778/809 行
+  `final_text = text.clone();` **无条件覆盖**，而空文本恰是正常 `last=true` 帧带回的
+  （`emit_partial` 已对空文本有守卫，两处不对称）。实测 1094 次返回**0 次**触发 ⇒
+  属潜在地雷而非现症。修法：`if !text.trim().is_empty() { final_text = text; }`。
+  另两个候选（`result_type=chunk` 降延迟、跨次复用 WS 连接省约 231 ms）**均未验证、均未动**。
+- 双向流式已端到端跑通，但**未做长时间稳定性压测**。
+
+---
+
+## [v0.35.3] — 2026-09-23
+
+> ⚠️ **本节为回顾补记**：原条目在 2026-09-24 13:24 被同一次外部操作清掉，
+> 按 `.workbuddy/memory/2026-09-23.md` 的工作记录重建，**不是逐字还原**。
+
+### 变更
+
+- **字幕浮层的显隐决策权整体收归后端（前端 0 处控制）。**
+  `VoicePanel.tsx` 里那段"跟随录音状态"的浮层显隐效果，连同 `overlayEnabled` 状态
+  与 `get_overlay_enabled` 回填一并删除；`lib.rs::set_overlay_enabled` 接管
+  "开关被关掉"这个只在后端可见的时机（关 → `hide()`；开 → 若 `is_listening()` 补一次 `show()`，
+  后端只在"录音开始"那一刻读过开关，不补这手用户要等下一轮才看得见）；
+  `session.rs::show_overlay` 提升为 `pub(crate)`，让上一步复用**同一个**定位逻辑。
+
+### 修复
+
+- **修「任务台执行/说话时小浮窗出来了、但没有文字」**（钦友报，现象精确到"有窗无字"）。
+  结论：**后端一直是对的，字也一直上去了 —— 是被前端收掉的。**
+  `asr-partial` / `asr-final` 正常送达、DOM 文本正确，**但同一时刻浮层窗口
+  `isVisible()` 是 `false`** —— 前端用**一个** `status`（由 `asr-state` 与 `edit-state`
+  **两个通道轮流写入**）的**子串**推导"是不是还在录"，而 v0.35.2 新增的状态行
+  「识别完成，正在派给 S{slot}」含 `识别完成` ⇒ 命中编辑态判定 ⇒ 前端立刻
+  `hide_overlay()`，**正文只亮约 200 ms**。
+  ⇒ 即 v0.35.2 那版"字幕已修好"并未真正生效。
+- **判别实验（很省事，记下来）**：正文不变、只改收尾状态行措辞 ——
+  「识别完成，正在派给 S1」→ 被收掉；「正在听，请说话…」→ 保持可见。
+  可见性随**文案**变化 ⇒ 凶手就是"由文案驱动的显隐逻辑"。
+- 这个坑早有化石：`session.rs` 通话链路里那条「通话中：已派给 S{slot}」是**故意多补的**，
+  为的是把状态拉回通话态、"骗过"前端那套推断。
+  ⇒ **看到"为骗过某判断而补文案"，该拆的是那个判断。**
+
+### ⚠️ 踩坑记录（第一版修法是错的，只删了一半）
+
+第一版只删 `hide_overlay`、保留 `show_overlay`，**看起来通过了第一轮验证**
+（任务台序列里正文可见 3.2 s）。但真机跑一轮**空录音**暴露了它：后端 `hide` 之后
+浮层**仍可见 4.7 s**。原因是同文件里 `status → phase` 那条 `useEffect` 声明在显隐效果
+**之后**，status 变化那一帧显隐效果带**上一轮的 `phase`（listening）** 先跑一次，
+于是在后端 hide 之后又把浮层叫回来。
+**⇒ 互补动作（show/hide）只删一条之前，必须先查时序/声明顺序；改完两个方向都要验。**
+
+### 验证（全部实测，非推断）
+
+| 用例 | 结果 |
+|---|---|
+| A 任务台派发序列（`show→asr-final→识别完成，正在派给 S1→desk-slot-key`） | 正文可见 **3.2 s**，唯一一次 hide 是脚本显式调的 ✓ |
+| B 真机跑一轮空录音（`start_recording` ×2，静音） | 后端 show → 后端 hide，**没有再自己回来** ✓（修复前此例挂 4.7 s） |
+| C 开关五连：显示→关→录音中(关)→录音中途开→本轮结束 | `true,false,false,true,false` **全对** ✓；收尾已把开关恢复为**开** |
+
+`npm run version:check` → exit 0；`tsc --noEmit` → 0 错误；`cargo build` → 成功（仅既有 warning）。
+
+### 新增（开发侧观测工具）
+
+- `.workbuddy/` 下新增零依赖 CDP 观测链：`cdp_eval.mjs`（`list` / `eval` / `evalfile`，
+  `--url` 支持**精确 basename** 与 `~正则`）、`cdp_inject.js`（注入事件 + 可见性记录器），
+  以及 `emit_desk_seq.js` / `v1v3_test.js` / `ab_test.js` / `real_round.js` / `switch_test.js`。
+- ⚠️ **工具自身三个静默坑**（已记入 `silent-failure-forensics` 与 `windows-dpi-window-capture`
+  两个 skill）：目标选择用 `includes` 会误命中 `edit_overlay.html`；
+  `__TAURI_INTERNALS__.invoke` 是 non-writable，挂钩**静默失败**；
+  页面 HMR/重载会**清掉注入的记录器**。
+
+---
+
 ## [v0.35.2] — 2026-09-23
 
 ### 变更
