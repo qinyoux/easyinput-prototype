@@ -486,10 +486,19 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         <div className="desk-meta">
           <span>
             TTS：
-            {snap.tts_configured ? (
+            {/*
+              两层判断缺一不可：`tts_configured` 只看 API Key，
+              而"模型标识为空"同样发不出请求（豆包缺 resource_id 会在发请求前就报错）。
+              只填了 Key 就把空字符串渲染成绿色，等于在任务台里给出一个假的好消息。
+            */}
+            {!snap.tts_configured ? (
+              <span className="desk-bad">未填 API Key（见「模型配置 → ③ 语音合成」）</span>
+            ) : snap.tts_model ? (
               <span className="desk-ok">{snap.tts_model}</span>
             ) : (
-              <span className="desk-bad">未填 API Key（见「模型配置 → ③ 语音合成」）</span>
+              <span className="desk-bad">
+                已填 API Key，但模型标识为空（见「模型配置 → ③ 语音合成」）
+              </span>
             )}
           </span>
           <span className="mono" title={snap.output_dir}>

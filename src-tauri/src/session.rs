@@ -857,7 +857,7 @@ impl SessionManager {
         *self.inner.keyboard_audio.lock().unwrap() = Some(ka);
     }
 
-    /// 开发板 Wi-Fi 音频是否在线（最近 5 秒内收到过心跳）。
+    /// 开发板 Wi-Fi 音频是否在线（最近 [`keyboard_audio::HEARTBEAT_TIMEOUT`] 内收到过心跳）。
     pub fn keyboard_audio_online(&self) -> bool {
         self.inner
             .keyboard_audio

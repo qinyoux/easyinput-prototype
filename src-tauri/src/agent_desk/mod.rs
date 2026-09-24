@@ -1714,7 +1714,11 @@ fn build_snapshot(mgr: &DeskManager) -> DeskSnapshot {
         ready: blockers.is_empty(),
         blockers,
         tts_configured: cfg.tts.is_configured(),
-        tts_model: cfg.tts.model.clone(),
+        // ⛔ 不要改回 `cfg.tts.model`：`model` 是**百炼专用**字段，豆包 provider 下
+        // 被忽略、界面上也不显示，直接读它会让豆包用户看到陈旧的值
+        // （实测：界面填 `seed-tts-2.0`，卡片显示 `seed-tts-1.0`）。
+        // 按 provider 分流这件事收在 `TtsConfig::active_model()` 一处。
+        tts_model: cfg.tts.active_model().to_string(),
         output_dir: mgr.output_dir().to_string_lossy().to_string(),
         config_path: mgr
             .store

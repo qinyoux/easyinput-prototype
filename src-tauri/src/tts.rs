@@ -906,6 +906,28 @@ impl TtsConfig {
         !self.api_key.trim().is_empty()
     }
 
+    /// **当前 provider 下真正生效的模型标识**，给界面展示用。
+    ///
+    /// # 为什么必须有这个方法（2026-09-24 的真实 bug）
+    ///
+    /// `resource_id` 与 `model` 是**两个 provider 各自的字段**（见上方字段归属表），
+    /// 任一方在另一方的 provider 下都被忽略、界面上也**根本不显示**。
+    /// 任务台那张「可接任务」卡片原先直接读 `model`，于是豆包用户看到的永远是
+    /// `model` 里那个陈旧的值（实测：界面上明明填着 `seed-tts-2.0`，
+    /// 卡片却显示 `seed-tts-1.0`）——
+    /// 而 `model` 在豆包路径下**不参与任何一次请求**，是个纯展示用的错值。
+    ///
+    /// 判据只能按 provider 分流，**不能**用"哪个非空取哪个"来兜底：
+    /// 切换过 provider 的配置里两个字段都非空（各自留着上一个 provider 的味道），
+    /// 猜错就会把不生效的那个显示出来 —— 那正是这次要修的毛病。
+    pub fn active_model(&self) -> &str {
+        match self.provider {
+            // 豆包：`X-Api-Resource-Id` 决定可用音色与计费条目，是事实上的"模型"。
+            TtsProvider::Volc => self.resource_id.trim(),
+            TtsProvider::Bailian => self.model.trim(),
+        }
+    }
+
     /// 实际使用的端点：字段留空时回落到该 provider 的官方端点。
     ///
     /// **只对"空"兜底，不对"填错"兜底。** 填了内容的端点一律照用——用户可能把它
@@ -1119,7 +1141,10 @@ impl TtsClient {
         log_buffer::info(format!(
             "TTS 配置更新: provider={} model={} voice={} rate={} key_len={}",
             config.provider.label(),
-            config.model,
+            // ⛔ 不要写 `config.model`：豆包 provider 下那是被忽略的百炼字段，
+            // 日志会永远显示一个不参与任何请求的值（实测：界面填 seed-tts-2.0，
+            // 日志却一直打 seed-tts-1.0 —— 排查时会被这个假线索带偏）。
+            config.active_model(),
             config.voice,
             config.target_sample_rate,
             config.api_key.len()
@@ -2101,6 +2126,41 @@ mod tests {
         let cfg = TtsConfig::default();
         assert_eq!(cfg.target_sample_rate, FIRMWARE_SAMPLE_RATE);
         assert!(!cfg.is_configured(), "默认 key 必须为空——由用户填");
+    }
+
+    /// 展示用的"当前模型"必须**按 provider 选字段**，不能读死 `model`。
+    ///
+    /// 回归背景：任务台「可接任务」卡片原先读 `cfg.tts.model`，而豆包 provider 下
+    /// `model` 是被忽略、界面上也不显示的百炼字段 ⇒ 用户改了资源 ID（`seed-tts-2.0`）
+    /// 卡片却仍显示旧的 `seed-tts-1.0`。
+    #[test]
+    fn active_model_follows_provider() {
+        let mut cfg = TtsConfig::default();
+
+        // 豆包：生效的是 resource_id。`model` 里留着上一个 provider 的残值，
+        // 它**不该**被显示出来。
+        cfg.provider = TtsProvider::Volc;
+        cfg.resource_id = "seed-tts-2.0".into();
+        cfg.model = "seed-tts-1.0".into();
+        assert_eq!(cfg.active_model(), "seed-tts-2.0");
+
+        // 百炼：生效的是 model。
+        cfg.provider = TtsProvider::Bailian;
+        cfg.model = "qwen3-tts-flash".into();
+        assert_eq!(cfg.active_model(), "qwen3-tts-flash");
+
+        // ⛔ 两个字段都非空（切换过 provider 的配置就是这种形态）时，
+        // **只能**按 provider 选 —— 靠"哪个非空取哪个"会拿错。
+        cfg.provider = TtsProvider::Volc;
+        assert_eq!(
+            cfg.active_model(),
+            "seed-tts-2.0",
+            "两个字段都非空时必须按 provider 选，不能按非空猜"
+        );
+
+        // 前后空白不容忍（配置可能是手改的）。
+        cfg.resource_id = "  seed-tts-2.0  ".into();
+        assert_eq!(cfg.active_model(), "seed-tts-2.0");
     }
 
     #[test]

@@ -10,8 +10,8 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::ei_protocol::{
     dispatch, build_eicc, EiPacket, EICC_ACTION_START, EICC_ACTION_STOP,
@@ -27,7 +27,38 @@ pub const DEFAULT_PORT: u16 = 17333;
 pub const CONFIG_JSON_MAX_BYTES: usize = 2048;
 
 /// 心跳超时：超过此时间未收到 EIHB 则判定开发板离线。
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// # 为什么是 15 秒，而不是曾经的 5 秒（2026-09-24 实测修正）
+///
+/// 板子心跳周期是 **2 秒**，所以 5 秒只够容忍**连丢 1 个包**：只要连丢 2 个
+/// （间隔变成 6 秒）就踩线。实测日志里出现过 **7748 ms** 的空档（连丢 3 个），
+/// 且"开始推流 + 同时跑任务"时抖动明显变密（同一小时从 4 次涨到 9 次）——
+/// 表现为"离线→在线"每秒级反复翻转：
+///
+/// ```text
+/// 15:56:55 板子心跳中断（超过 5 秒未收到）
+/// 15:56:56 收到板子心跳，链路在线          ← 只隔 1 秒
+/// ```
+///
+/// 代价不只是日志难看：`resolve_mic` 是按这个判据选录音源的，翻转的那一瞬间
+/// 会把录音源退回**电脑麦克风** ⇒ 用户对着板子说话却录到静音，
+/// 而提示只写"空结果"。**用户感知到的是"Wi-Fi 不稳定、偶尔断开"。**
+///
+/// 15 秒 = 7.5 个心跳周期，容忍连丢 6 个包。
+///
+/// # 上界同样不能放大
+///
+/// 这条判据同时决定"对着板子说话但采不到音"要多久才提示用户。再放大，
+/// 真掉线时用户会先经历一段**没有任何反馈的沉默**，那比误判一次离线更糟。
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `HEARTBEAT_TIMEOUT` 的秒数，供日志与界面文案引用。
+///
+/// **不要在别处再写死这个数字**：本仓库已经吃过一次"改了阈值忘了改文案"的亏
+/// （提示里写"超过 5 秒"，而代码已经不是 5 秒了，排查的人会照着错的前提去查）。
+pub fn heartbeat_timeout_secs() -> u64 {
+    HEARTBEAT_TIMEOUT.as_secs()
+}
 
 /// EICC keepalive 间隔。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -51,11 +82,34 @@ struct Inner {
     stop_flag: AtomicBool,
 }
 
+/// 单调时基的零点（首次取时间时确定，此后不变）。
+static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// 单调毫秒时间戳：**只用于算时间间隔，不是"现在是几点"**。
+///
+/// # 为什么不用 `SystemTime`
+///
+/// 心跳判据问的是"上一次心跳到现在过了多久"，**与墙上时钟无关**。
+/// 用 `SystemTime` 会引入一类无法靠日志排查的偶发误判 —— NTP 校时、时区/时间被改、
+/// 甚至跨夏令时调整，都会让这个差值跳变：
+///
+/// - 往**未来**跳 ⇒ 间隔被算得很大 ⇒ 凭空出现一次"板子离线"；
+/// - 往**过去**跳 ⇒ `saturating_sub` 归零 ⇒ 间隔恒为 0 ⇒
+///   **板子真的掉线了也不报**（这一侧更危险：静默失效）。
+///
+/// `Instant` 只保证单调，不保证与任何真实时刻对应 —— 这正是本判据需要的东西。
+/// 需要**真实时刻**的地方（如任务历史里的 `timestamp`）一律用墙钟，两者别混。
+///
+/// 返回值**恒 ≥ 1**：`last_heartbeat_ms == 0` 被当作"从未收到过心跳"的哨兵值
+/// （见 `is_online` / `status_note`），所以业务值不能是 0。
+/// 否则万一首次心跳恰好在进程启动后的同一毫秒内到达，就会被记成 0 ⇒
+/// "明明连上了却一直报从未收到"。
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    (MONO_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64)
+        .saturating_add(1)
 }
 
 impl KeyboardAudioManager {
@@ -124,7 +178,7 @@ impl KeyboardAudioManager {
         Ok(())
     }
 
-    /// 开发板是否在线（最近 5 秒内收到过 EIHB 心跳）。
+    /// 开发板是否在线（最近 [`HEARTBEAT_TIMEOUT`] 内收到过 EIHB 心跳）。
     pub fn is_online(&self) -> bool {
         let last = self.inner.last_heartbeat_ms.load(Ordering::Relaxed);
         if last == 0 {
@@ -198,7 +252,10 @@ impl KeyboardAudioManager {
             return "从未收到开发板心跳（板子没连同一 Wi-Fi，或固件没在推流）".to_string();
         }
         let ago = now_ms().saturating_sub(last);
-        format!("最近一次心跳在 {ago} ms 前（超过 5 秒即判离线）")
+        format!(
+            "最近一次心跳在 {ago} ms 前（超过 {} 秒即判离线）",
+            heartbeat_timeout_secs()
+        )
     }
 
     /// 监听线程是否还在跑。**仅测试用** —— 存在的唯一理由就是给下面那条回归钉子提供判据。
@@ -321,5 +378,48 @@ mod tests {
             !m.is_online(),
             "没有任何心跳时绝不许判在线 —— 判在线会让宿主把静音当成\"用户没说话\""
         );
+    }
+
+    /// 心跳超时必须显著大于心跳周期。
+    ///
+    /// 板子心跳周期 2 秒（固件定死）。曾经的 5 秒只容忍**连丢 1 个包**，
+    /// 实测日志里出现过 **7748 ms** 的空档（连丢 3 个）⇒ "离线→在线"每秒级翻转；
+    /// 而 `resolve_mic` 就是按这个判据选录音源的，翻转的瞬间会把录音源退回
+    /// **电脑麦克风** ⇒ 用户对着板子说话却录到静音。用户感知到的正是
+    /// "Wi-Fi 不稳定、偶尔断开"。
+    #[test]
+    fn heartbeat_timeout_tolerates_several_lost_beats() {
+        /// 固件的心跳广播周期（秒）。
+        const BEAT_SECS: u64 = 2;
+
+        let secs = heartbeat_timeout_secs();
+        assert!(
+            secs >= BEAT_SECS * 5,
+            "超时必须容忍连丢 5 个心跳以上，否则 2.4G 拥挤环境下必然误判：{secs}s"
+        );
+        // 上界同样重要：这条判据也决定"对着板子说话却没反应"多久才提示用户，
+        // 放得过大 = 真掉线时长时间毫无反馈。
+        assert!(secs <= 30, "超时过大 ⇒ 真掉线时长时间无反馈：{secs}s");
+    }
+
+    /// 文案与代码不能脱节：提示里的秒数必须来自常量本身。
+    #[test]
+    fn status_note_quotes_the_real_timeout() {
+        let Ok(m) = KeyboardAudioManager::new(0) else {
+            return;
+        };
+        // 造一次"收到过心跳但已过期"的状态不好做（要等真实时间），
+        // 所以这里只钉住常量本身 —— 关键是文案**引用**它，而不是手写数字。
+        let secs = heartbeat_timeout_secs();
+        assert_eq!(secs as u128, HEARTBEAT_TIMEOUT.as_millis() / 1000);
+        assert!(secs > 0);
+        let _ = m;
+    }
+
+    /// 单调时基同样要求恒 > 0（`last_heartbeat_ms == 0` 是"从未收到"的哨兵值）。
+    #[test]
+    fn mono_clock_is_nonzero() {
+        assert!(now_ms() > 0, "0 是哨兵值，业务时间戳不能为 0");
+        assert!(now_ms() <= now_ms(), "单调时钟不能倒退");
     }
 }

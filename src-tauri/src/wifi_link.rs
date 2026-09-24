@@ -48,8 +48,8 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -72,6 +72,19 @@ const ENV_TTL_ONLINE_MS: u64 = 30_000;
 const ENV_TTL_BUSY_MS: u64 = 5_000;
 /// 心跳丢失多久后才由上位机重下发（先给板子自己重试的机会）。
 const OFFLINE_RESEND_MS: u64 = 20_000;
+/// 离线短于此时长又恢复 ⇒ 判为**同一次会话的抖动**，不算一次新的"连接成功"。
+///
+/// # 为什么需要它（2026-09-24 实测）
+///
+/// 板子心跳是 UDP 单播，丢包时 `is_online()` 会短暂转假。若不设门槛，每一轮
+/// "掉一下又回来"都会被记成一次成功 ⇒ `success_count` 虚高、`last_success_unix`
+/// 被无意义刷新，而历史表的**排序依据正是这两项**（选网时"证据最强的优先"），
+/// 于是抖动最频繁的那张网会被越推越高 —— 这是纯粹的噪声污染。
+///
+/// 30 秒 = 3 倍板子侧重连周期（约 10 秒），足以把"偶发抖动"与"真掉线后重连"分开；
+/// 同时它比 `OFFLINE_RESEND_MS`(20 s) 大，保证"上位机主动重下发后恢复"那一类
+/// 一定会被正常计数。
+const RESUMED_FLAP_MS: u64 = 30_000;
 /// 下发后等心跳确认的最长时间。
 const CONFIRM_TIMEOUT_MS: u64 = 25_000;
 /// 本机 IPv4 候选缓存时长。
@@ -89,11 +102,65 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// 单调时基的零点。
+static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// 单调毫秒时间戳：**只用于算时间间隔**（`offline_since_ms` / 探测周期 / 退避）。
+///
+/// 与 `keyboard_audio::now_ms` 同款理由：这些量都是"过了多久"，用墙钟会让
+/// NTP 校时、改系统时间变成假离线（往前跳）或**漏报离线**（往后跳，`saturating_sub`
+/// 归零）。
+///
+/// 需要**真实时刻**的地方（历史落盘的 `last_success_unix`）用 [`now_unix`]（墙钟），
+/// 两者别混 —— 单调时钟的零点没有现实含义，写进文件就再也解释不通了。
+///
+/// 返回值**恒 ≥ 1**：本文件里 `0` 被当成"未开始 / 从未发生"的哨兵值
+/// （`last_probe_ms` / `offline_since_ms` / `next_attempt_ms` 都这么用），
+/// 业务值不能是 0，否则启动后第一毫秒的采样会被误读成"还没开始"。
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    (MONO_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64)
+        .saturating_add(1)
+}
+
+/// 这次"离线→在线"够不够格算一次连接成功（而不是仅仅抖了一下）。
+///
+/// - `offline_ms_before`：本轮恢复在线**之前**已离线的时长。
+/// - `ever_online_before`：本轮之前**是否曾经在线过**。`false` = 本进程启动以来
+///   的首次连接 ⇒ **必须**计成功，否则"第一次连上"永远不进历史，
+///   `success_count` 停在 0，而历史表正是选网的依据。
+///
+/// # 语义边界：`success_count` 会随"应用重启"增长，这是有意为之
+///
+/// 每次进程启动后的第一次连上都计一笔，所以频繁重启会让计数上涨。
+/// 这**不是**噪声（与抖动污染不同）—— "启动后确实连上了"是一次真实连接事件，
+/// 它也确实反映了"这张网可用"。不要把它重新解释成"历史累计的网络事件数"，
+/// 也不要用它去推断"网络质量"：它既含使用频次也含启动次数。
+/// 排序的第一依据是 `last_success_unix`（最近成功），那才是"最近可用"的信号。
+///
+/// # 为什么"首次连接"必须单独传一个标志，不能靠 `offline_ms_before == 0`
+///
+/// 真机抓到过：应用启动时板子还没开始发包 ⇒ **第一个 tick 就把 `offline_since_ms`
+/// 设上了**（那段起表刻意如此，否则会漏掉"开机时板子本来就没连上"）。
+/// 等首包到达时它已经是"启动到首包的时长"，不是 0 ⇒ 首次连接被误判成抖动：
+///
+/// ```text
+/// 16:27:25 keyboard_audio: 收到首次心跳 addr=10.x.y.z:61598
+/// 16:27:26 Wi-Fi 链路：心跳恢复（离线 1.0 秒，判为短暂抖动，不计入成功次数）
+/// ```
+///
+/// 判据"表示从未在线过"与"表示刚离线了 0 毫秒"是两件事，不能用同一个数值兼任。
+///
+/// # 为什么单独抽成纯函数
+///
+/// 判据本来长在 tick 循环体里，那就**没法测**；而它的失效方式是静默的 ——
+/// 统计被污染后界面上看不出任何异常，只是选网排序慢慢变歪。
+/// 抽出来之后：① 单测能直接钉住边界；② **日志与历史共用同一个调用**，
+/// 不可能出现"日志说抖动、历史却记了一笔成功"这种两份证据互相打架的现场。
+fn counts_as_success(offline_ms_before: u64, ever_online_before: bool) -> bool {
+    !ever_online_before || offline_ms_before >= RESUMED_FLAP_MS
 }
 
 /// 日志里给 SSID 打码。
@@ -890,6 +957,16 @@ fn watchdog_loop(app: tauri::AppHandle, inner: Arc<Inner>) {
     // "开机时板子本来就没连上"这种最常见的情况 —— 表永远是 0，
     // T4（心跳丢失重下发）永远不触发，自动重连只发生一次、之后再也不发生。
     let mut offline_since_ms = 0u64;
+    // 自本次进程启动以来**是否曾经在线过**。
+    //
+    // ⛔ 不能用"`offline_since_ms == 0`"来代表"首次连接"：上面那张起表刻意在
+    // **第一次评估到非在线状态时**就设上了，而应用启动时板子通常还没开始发包
+    // ⇒ 首包到达时 `offline_since_ms` 早就不为 0 了。
+    // 实测（2026-09-24 真机）：应用启动后**第一次连上**被判成
+    // `心跳恢复（离线 1.0 秒，判为短暂抖动，不计入成功次数）`——
+    // 于是"启动以来第一次连上"这件事从来没被记进历史。
+    // （注：函数体内的注释用 `//`，`///` 只对 item 有效，用在这里会警告。）
+    let mut ever_online = false;
 
     while !inner.stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(TICK_MS));
@@ -921,16 +998,38 @@ fn watchdog_loop(app: tauri::AppHandle, inner: Arc<Inner>) {
         }
 
         // ── 在线状态迁移。**心跳是唯一可信的"连上了"判据。**
+        //
+        // 先取"这一轮恢复之前已经离线了多久"——**必须在下面被清零之前取**：
+        // `offline_since_ms` 一旦在线就被重置，之后再也算不出这次离线有多长，
+        // 而"这次是真重连还是仅仅抖了一下"正是靠它来分的。
+        // `0` 表示本轮之前从未离线（首次连接），按真重连处理。
+        let offline_ms_before = offline_since_ms;
+
         if board_online {
-            if !was_online {
-                log_buffer::info("Wi-Fi 链路：收到板子心跳，链路在线");
-            }
             offline_since_ms = 0;
             link.inner.attempt.store(0, Ordering::Relaxed);
             link.inner.next_attempt_ms.store(0, Ordering::Relaxed);
+
+            if !was_online {
+                // 抖动与真重连要**在日志里就能分开**：否则一年后再看这段日志，
+                // 只看到一串"在线/离线"来回，根本判断不出网络到底稳不稳。
+                // 与历史计数**共用同一个判据函数**，不许各写一份 ——
+                // "日志说抖动、历史却记了一笔成功"这种互相打架的现场最难排查。
+                if counts_as_success(offline_ms_before, ever_online) {
+                    log_buffer::info("Wi-Fi 链路：收到板子心跳，链路在线");
+                } else {
+                    log_buffer::info(format!(
+                        "Wi-Fi 链路：心跳恢复（离线 {:.1} 秒，判为短暂抖动，不计入成功次数）",
+                        offline_ms_before as f64 / 1000.0
+                    ));
+                }
+            }
         } else {
             if was_online {
-                log_buffer::warn("Wi-Fi 链路：板子心跳中断（超过 5 秒未收到）");
+                log_buffer::warn(format!(
+                    "Wi-Fi 链路：板子心跳中断（超过 {} 秒未收到）",
+                    crate::keyboard_audio::heartbeat_timeout_secs()
+                ));
             }
             if offline_since_ms == 0 {
                 offline_since_ms = now;
@@ -939,43 +1038,8 @@ fn watchdog_loop(app: tauri::AppHandle, inner: Arc<Inner>) {
         let online_transition = board_online && !was_online;
         was_online = board_online;
 
-        // ── 在线确认：把这一轮的目标写进历史（**只有这里算"成功过"**）
-        if online_transition {
-            let target = link
-                .inner
-                .status
-                .lock()
-                .ok()
-                .and_then(|g| g.target_ssid.clone())
-                .or_else(|| {
-                    link.inner
-                        .manual_target
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone())
-                });
-            if let Some(ssid) = target {
-                if let Some(dir) = link.config_dir() {
-                    let mut file = load_known(&dir);
-                    upsert_known(&mut file, &ssid, None);
-                    mark_success(&mut file, &ssid, now_unix());
-                    let _ = save_known(&dir, &file);
-                }
-                link.update_status(|st| {
-                    st.state = "online".into();
-                    st.state_text = "已连上（收到板子心跳）".into();
-                    st.last_error = None;
-                    st.saved_to_board = true;
-                });
-                log_buffer::info(format!(
-                    "Wi-Fi 链路：已确认连接（SSID={}，心跳到达）",
-                    mask_ssid(&ssid)
-                ));
-            }
-            if let Ok(mut guard) = link.inner.manual_target.lock() {
-                *guard = None;
-            }
-        }
+        // ⚠️ "在线确认 + 写历史"**不在这里**，它被挪到了下面**选网之后** ——
+        // 因为它需要一个网络名做兜底，那段注释里有真机证据。
 
         // ── T2：HID 出现（插上 USB / 蓝牙连上）
         let hid_appeared = hid_present && !was_hid_present;
@@ -1006,6 +1070,79 @@ fn watchdog_loop(app: tauri::AppHandle, inner: Arc<Inner>) {
 
         let known = link.known();
         let candidate = pick_candidate(&env, &known);
+
+        // ── 在线确认：把这一轮的目标写进历史（**只有这里算"成功过"**）
+        //
+        // # 为什么位置必须在**选网之后**（2026-09-24 真机抓出来的）
+        //
+        // 原先这段写在状态迁移那里（选网之前），而目标名要靠 `target_ssid` 兜底 ——
+        // 那个字段由**下发分支**写入。于是"板子比上位机更快"时目标恒为 None：
+        // 板上电常开、心跳在启动延迟（3 s）走完之前就到了，日志只有一行
+        // "收到板子心跳，链路在线"，**没有"已确认连接"**，`success_count` 一动不动：
+        //
+        // ```text
+        // 16:33:35 keyboard_audio: 收到首次心跳
+        // 16:33:36 Wi-Fi 链路：收到板子心跳，链路在线
+        // （没有"已确认连接" ⇒ 历史没记）
+        // ```
+        //
+        // 结果就是**成功记录永远积累不起来**，而历史表正是自动选网的依据。
+        // 挪到选网之后，就能拿本轮选网结果兜底。
+        //
+        // # 抖动仍然不算成功
+        //
+        // 短于 `RESUMED_FLAP_MS` 的"离线→在线"是**抖动**：心跳走 UDP，丢几个包
+        // `is_online()` 就会短暂转假（2026-09-24 实测 9 次/小时）。若也记成成功，
+        // `success_count` 与 `last_success_unix` 会被噪声刷高，而这两项正是
+        // 历史表的排序依据（选网优先"证据最强"的一条）
+        // ⇒ 抖动最频繁的那张网反被越推越高。
+        // 状态**仍会**在下面被更新成 online（那是事实），只是不写历史、不刷统计。
+        if online_transition && counts_as_success(offline_ms_before, ever_online) {
+            let target = link
+                .inner
+                .status
+                .lock()
+                .ok()
+                .and_then(|g| g.target_ssid.clone())
+                .or_else(|| {
+                    link.inner
+                        .manual_target
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                })
+                // 兜底：本轮选网结果。启动即在线时上面两个来源都还是空的，
+                // 而"本轮选中的那张网"就是正确答案（板子与上位机同网，是整套设计的前提）。
+                .or_else(|| candidate.as_ref().map(|c| c.ssid.clone()));
+            if let Some(ssid) = target {
+                if let Some(dir) = link.config_dir() {
+                    let mut file = load_known(&dir);
+                    upsert_known(&mut file, &ssid, None);
+                    mark_success(&mut file, &ssid, now_unix());
+                    let _ = save_known(&dir, &file);
+                }
+                link.update_status(|st| {
+                    st.state = "online".into();
+                    st.state_text = "已连上（收到板子心跳）".into();
+                    st.last_error = None;
+                    st.saved_to_board = true;
+                });
+                log_buffer::info(format!(
+                    "Wi-Fi 链路：已确认连接（SSID={}，心跳到达）",
+                    mask_ssid(&ssid)
+                ));
+            }
+            if let Ok(mut guard) = link.inner.manual_target.lock() {
+                *guard = None;
+            }
+        }
+
+        // 在线过就**永久**记住（本进程内不改回 false）——
+        // `counts_as_success` 用它区分"启动以来第一次连上"与"重连"。
+        // ⚠️ 必须放在上面判定**之后**：提前置位会让首次连接被判成重连。
+        if board_online {
+            ever_online = true;
+        }
 
         let startup_done =
             now.saturating_sub(link.inner.start_ms.load(Ordering::Relaxed)) >= STARTUP_DELAY_MS;
@@ -1524,6 +1661,58 @@ mod tests {
         assert_eq!(backoff_secs(4), 60);
         assert_eq!(backoff_secs(99), 60);
         assert!(backoff_secs(1) < backoff_secs(2));
+    }
+
+    /// 抖动不该被算成一次"连接成功"。
+    ///
+    /// 失效方式是静默的：`success_count` / `last_success_unix` 被噪声刷高后，
+    /// 界面上看不出任何异常，只是历史排序（选网依据）慢慢变歪 ——
+    /// 抖得最凶的那张网反而排到最前。
+    #[test]
+    fn flapping_does_not_count_as_a_success() {
+        // 本进程启动以来的**第一次**连上：与"离线了多久"无关，一律计成功。
+        //
+        // ⛔ 这一条是真机抓出来的：原先用 `offline_ms_before == 0` 代表首次连接，
+        // 但应用启动时板子通常还没开始发包 ⇒ **第一个 tick 就把
+        // `offline_since_ms` 设上了**（那段起表刻意如此，否则会漏掉"开机时板子
+        // 本来就没连上"）⇒ 首包到达时它是"启动到首包的时长"，不是 0。
+        // 实测打成了 `心跳恢复（离线 1.0 秒，判为短暂抖动，不计入成功次数）`，
+        // 而那一刻其实是启动后的第一次连上（于是这条网永远不被记进历史）。
+        assert!(counts_as_success(0, false), "首次连接必须计入成功");
+        assert!(
+            counts_as_success(1_000, false),
+            "首次连接与离线时长无关 —— 启动后 1 秒才收到首包也很正常"
+        );
+        assert!(counts_as_success(9_999_999, false), "同上，离线表早已开始走");
+
+        // 已经在线过 ⇒ 短离线是抖动，不算成功。边界取门槛两侧各一毫秒。
+        assert!(!counts_as_success(1, true));
+        assert!(!counts_as_success(RESUMED_FLAP_MS - 1, true));
+
+        // 真离线一段时间后重连：算。门槛本身按"够长"处理。
+        assert!(counts_as_success(RESUMED_FLAP_MS, true));
+        assert!(counts_as_success(RESUMED_FLAP_MS + 1, true));
+
+        // ⚠️ 门槛必须**大于**"上位机主动重下发"的等待时长：
+        // 否则 T4 重下发后恢复的那一类会被误判成抖动，永远进不了历史
+        //（离线越久越该被记住，结果反而被吞掉，方向正好反了）。
+        assert!(
+            RESUMED_FLAP_MS > OFFLINE_RESEND_MS,
+            "抖动门槛必须大于 T4 等待时长（{RESUMED_FLAP_MS} vs {OFFLINE_RESEND_MS}）"
+        );
+    }
+
+    /// 单调时基：恒 > 0 且严格递增。
+    ///
+    /// `0` 在本文件里是"未开始 / 从未发生"的哨兵值（`offline_since_ms` /
+    /// `last_probe_ms` / `next_attempt_ms`），业务值取到 0 会被读成"还没开始"。
+    #[test]
+    fn monotonic_clock_is_nonzero_and_never_goes_back() {
+        let a = now_ms();
+        assert!(a > 0, "0 是哨兵值，业务时间戳不能为 0");
+        std::thread::sleep(Duration::from_millis(5));
+        let b = now_ms();
+        assert!(b > a, "单调时钟必须严格递增：{b} 不大于 {a}");
     }
 
     #[test]
