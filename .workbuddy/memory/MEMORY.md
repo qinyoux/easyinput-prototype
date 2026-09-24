@@ -6,7 +6,7 @@
 - 调试需同时后台运行 Vite（1420）和 `src-tauri/target/debug/easyop.exe`；debug 前端依赖 `devUrl`，无 Vite 会白屏。
 - Vite 清缓存可能触发批量删除保护；目标仅限 `node_modules/.vite/deps`。
 - CDP 选择主窗口使用 URL 正则 `~^http://localhost:1420/$`。
-- TTS 配置在 `%APPDATA%\com.easyop.app\agent_desk.json` 的 `tts` 段；`config.json` 不含 TTS。Volc 的资源头取 `resource_id`，忽略百炼专用 `model`。
+- TTS 配置在 `%APPDATA%\com.easyop.app\agent_desk.json` 的 `tts` 段；`config.json` 不含 TTS。Volc 的资源头取 `resource_id`，忽略百炼专用 `model`（展示/日志一律走 `active_model()`，见下文「配置字段的按分支才生效陷阱」）。
 - HID 枚举返回全部设备，VID/PID 校验在打开阶段；蓝牙在线不等于 USB Feature Report 配置通道可用。
 - `desk_tts_test` 只合成并保存 WAV，不播放。2026-09-24 真机验证双向流式 TTS 可用：48 kHz、229404 采样、4779 ms 音频、16 帧/13 句、墙钟 1389 ms。
 - 有运行实例时 `cargo build` 可能 LNK1104；不要强杀用户实例。
@@ -44,7 +44,9 @@
 
 ## Wi-Fi 链路自动化（v0.37.0 起，动 `wifi_link.rs` 前必读）
 
-- **⛔ 「连上了」的唯一可信判据 = 收到板子的 EIHB 心跳**（`is_online()`，5 s 超时，UDP 17333）。
+- **⛔ 「连上了」的唯一可信判据 = 收到板子的 EIHB 心跳**（`is_online()`，**15 s** 超时，UDP 17333）。
+  ⚠️ 这个超时值被改过（v0.37.1：5 s → 15 s），**别照旧资料写 5 s**；要引用就调
+  `keyboard_audio::heartbeat_timeout_secs()`，文案里也别手写数字。
   **下发成功 ≠ 已连接** —— 只说明端点进了 NVS。前端「Wi-Fi 已连接」徽标只读后端的 `board_online`，
   不许再本地硬写。历史上正是"点一下连接就本地置真"导致"点了成功但麦克风不出声"可以一直挂着。
 - **⛔ 每一次配置下发都必须带 Wi-Fi 端点**（`payload::build_firmware_payload_with_wifi`）。
@@ -59,6 +61,43 @@
 - 麦克风来源 ≠ Wi-Fi 时整条链路**主动停摆**（`state=disabled`），这是故意的。
 - 板子端**没有**扫描环境的能力（未改固件、未加 Report ID）；判断全在上位机。
 - 历史文件里**密码明文**（与 `config.json` 同级，未新增暴露面）；迁移是"只增不清"。
+
+### 心跳判据与"假离线"（v0.37.1，用户报"Wi-Fi 偶尔断开"的真根因）
+
+- **心跳周期 2 s vs 超时 5 s ⇒ 只容忍连丢 1 个包。** 实测空档 **7748 ms**（连丢 3 个），
+  一小时冒 9 次「中断 → 恢复」且成对间隔只有 1～16 秒 ⇒ 那是判据太紧，**不是 Wi-Fi 不稳**。
+- **真正的伤害是丢音，不是图标闪。** `resolve_mic` 按 `is_online()` 选录音源 ⇒
+  翻转瞬间退回**电脑麦克风** ⇒ 用户对着板子说话却录到静音，提示只写"空结果"。
+  用户说的"不稳定"绝大多数是**录到静音**。排查这类报障先查录音源切换，别只看徽标。
+- **两处 `now_ms()` 必须用单调时钟**（`OnceLock<Instant>`）：判据问的是"过了多久"，
+  与"现在几点"无关。用墙钟时 NTP 校时会让差值跳变 —— 往前跳 = 凭空一次离线；
+  **往后跳 = `saturating_sub` 归零 ⇒ 真掉线也不报**（静默失效，比误报危险）。
+  真实时刻（`last_success_unix`）才用墙钟，两者不混用。
+- **`+1` 不是笔误**：`0` 在本仓库是"未开始 / 从未发生"的哨兵值，业务时间戳取到 0 会被读成"还没开始"。
+- **抖动不计入成功**（`RESUMED_FLAP_MS = 30_000`）。原先每次"离线→在线"都 `mark_success`，
+  而 `success_count`/`last_success_unix` 正是历史表的**排序依据** ⇒ 抖得最凶的网反而被推得最高。
+  实测某网 `success_count` 已到 17，而它真实只连过 2 次。
+- **判据抽成纯函数 `counts_as_success(offline_ms_before, ever_online_before)`，日志与历史共用同一调用** ——
+  不允许出现两份证据互相打架。⚠️ 别用 `offline_ms_before == 0` 表示"首次连接"：
+  `offline_since_ms` **刻意**在"第一次评估到非在线"就起表（否则 T4 永不触发）⇒ 启动时会假命中最先那个 tick。
+  **"从未在线过"与"刚离线 0 毫秒"是两件事，不能用一个数值兼任。**
+- **"确认 + 写历史"必须在选网之后。** 它要 `target_ssid` 兜底，而那个字段由**下发分支**写入 ⇒
+  心跳先于启动延迟（3 s）到达时目标恒为 `None` ⇒ 板子常开则历史**永远积累不起来**（而历史表正是选网依据）。
+- ⚠️ 未跑完的闭环：「抖动不计成功」需板子真离线 ≥ 45 秒再回来。判据已由单测钉住，
+  且该日志路径已真机触发过一次。**下次板子在场且方便断电时补验。**
+- ⚠️ 待查风险：`netsh wlan show networks` 同步阻塞 tick，可能让 `offline_since_ms` 时间测量偏斜。
+- ⚠️ **注入式验证前必须先确认真信号源不在场**：`.workbuddy/inject_heartbeat.py`（往 17333 注入 EIHB 帧）
+  首次跑无效 —— 我把"USB 不在位"当成了"无心跳源"，实际板子 Wi-Fi 那头一直在发 ⇒
+  注入被真流量淹没，两条路刷同一时间戳，连"离线"都造不出来。前提已写进脚本文件头。
+
+### 配置字段的"按分支才生效"陷阱（v0.37.1）
+
+- `TtsConfig` 里 `resource_id`（豆包 / `X-Api-Resource-Id`）与 `model`（百炼）**按 provider 才生效**。
+  ⇒ 任务台卡片原先读 `cfg.tts.model` 就一直显示陈旧的 `seed-tts-1.0`，而界面填的是 `seed-tts-2.0`。
+- **展示与日志一律走 `TtsConfig::active_model()`**（按 provider 分流），三处展示点已统一。
+  ⛔ **不能**用"哪个字段非空取哪个"兜底：切换过 provider 的配置两个字段都非空，猜错就把不生效的显示出来。
+- **通用自查口径**：结构体里有"按分支才生效的字段"（provider / 模式 / 协议）时，
+  任何 `cfg.xxx.field` 的**展示与日志**都可能是错的 —— 值得全局 grep 一遍 `\.field`，确认每个都经过分流函数。
 
 ## 已知未实现/受限能力
 - 槽位“按能力/自动判定”未实现。
