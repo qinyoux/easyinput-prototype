@@ -1,6 +1,6 @@
 //! 构造固件配置 JSON（`ai_keyboard.v1`）与解析 0x11 回执。
 //!
-//! `build_firmware_payload` 把本地 `Profile` 转换成固件 `config_payload.cpp` 严格声称的
+//! `build_firmware_payload_with_wifi` 把本地 `Profile` 转换成固件 `config_payload.cpp` 严格声称的
 //! 结构：`keys` 条目包 `{press: ...}`，`encoder` 条目用裸值，两者都必须含全部字段。
 //! 它与固件 JSON 一并产出两张反向索引表（UUID → 正文 / UUID → 输入项），
 //! 因为含非ASCII的固定文本每次下发都会拿到新的随机 UUID，索引必须与本次下发同源。
@@ -104,8 +104,40 @@ pub struct FirmwarePayload {
     pub text_map: HashMap<String, String>,
 }
 
-/// 构造一次完整下发产物（固件 JSON + 文本动作反查表）。
-pub fn build_firmware_payload(profile: &Profile) -> FirmwarePayload {
+/// 开发板 Wi-Fi 音频端点（随配置一起下发的四个顶层字段）。
+///
+/// ⛔ **为什么它必须跟着每一次下发走 —— 这是 2026-09-24 查出来的真 bug。**
+///
+/// 固件 `ConfigState::apply_json` 是**整体替换**：`current_ = parsed.config`，
+/// 而 `ParsedKeyboardConfig` 里没被 JSON 提到的字段一律回到**默认值**
+/// （`wifi_ssid` / `audio_host` 默认都是空串）。于是"下发方案"这件事的副作用是
+/// **把开发板上已经配好的 Wi-Fi 端点清空** —— 板子随即按 `audio_enabled == false`
+/// 关掉 Wi-Fi，而界面上一切正常、没有任何报错。
+///
+/// 本仓库过去只发 `schema` / `target_platform` / `profiles`（见 git 历史），
+/// 所以「按一次方案切换，板子麦克风就掉线」是必然发生的，不是偶发。
+///
+/// 修法就是把端点字段补全，让**每一次**下发都携带当前端点 ——
+/// 而不是"在下发之后补一条 Wi-Fi 命令"（那样中间有一段窗口是坏的，
+/// 而且补发的那条又得是完整载荷，等于把同一件事做两遍）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WifiEndpoint<'a> {
+    pub ssid: &'a str,
+    pub password: &'a str,
+    /// 上位机的 IPv4（固件 `config_ready` 要求非空，否则连 Wi-Fi 都不会尝试）。
+    pub host: &'a str,
+    pub port: u16,
+}
+
+/// 构造一次完整下发产物，可选携带 Wi-Fi 音频端点。
+///
+/// `wifi` 为 `Some` 时，四个顶层字段（`wifi_ssid` / `wifi_password` /
+/// `audio_host` / `audio_port`）会被写进 JSON —— 固件据此连接并持久化到 NVS。
+/// 传入空 SSID 是**合法且有语义**的：它表示"关掉板子的 Wi-Fi 音频"。
+pub fn build_firmware_payload_with_wifi(
+    profile: &Profile,
+    wifi: Option<WifiEndpoint<'_>>,
+) -> FirmwarePayload {
     let mut text_map = HashMap::new();
 
     let mut keys = Map::new();
@@ -121,11 +153,21 @@ pub fn build_firmware_payload(profile: &Profile) -> FirmwarePayload {
         encoder.insert(input.to_string(), value);
     }
 
-    let payload = json!({
+    let mut payload = json!({
         "schema": SCHEMA_VERSION,
         "target_platform": "windows",
         "profiles": [ { "keys": keys, "encoder": encoder } ],
     });
+    // 端点字段按需追加。`wifi_password` 为空串也照发（开放网络 / guest 网络都合法），
+    // 判据是"这次下发要不要谈 Wi-Fi"，而不是"密码非空才发"。
+    if let Some(endpoint) = wifi {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("wifi_ssid".to_string(), json!(endpoint.ssid));
+            obj.insert("wifi_password".to_string(), json!(endpoint.password));
+            obj.insert("audio_host".to_string(), json!(endpoint.host));
+            obj.insert("audio_port".to_string(), json!(endpoint.port));
+        }
+    }
     let json = serde_json::to_string(&payload).unwrap_or_else(|_| {
         // 理论上不会失败；兜底返回最简 schema。
         format!(r#"{{"schema":"{SCHEMA_VERSION}","target_platform":"windows","profiles":[{{}}]}}"#)
@@ -167,7 +209,7 @@ mod tests {
     #[test]
     fn firmware_json_shape() {
         let p = Profile::factory_default("默认", "p1");
-        let built = build_firmware_payload(&p);
+        let built = build_firmware_payload_with_wifi(&p, None);
         let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["schema"], SCHEMA_VERSION);
         let prof = &v["profiles"][0];
@@ -194,7 +236,7 @@ mod tests {
         p.keys.insert("KEY2".into(), ActionSpec::Hotkey("Ctrl+Alt+A".into()));
         p.keys.insert("KEY3".into(), ActionSpec::Text("你好".into()));
         p.keys.insert("KEY4".into(), ActionSpec::HostAction("host_action:12345678-1234-4abc-8def-1234567890ab".into()));
-        let built = build_firmware_payload(&p);
+        let built = build_firmware_payload_with_wifi(&p, None);
         let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["profiles"][0]["keys"]["KEY2"]["press"]["hotkey"], "Ctrl+Alt+A");
         // 含非ASCII的 Text 被转为 host_action 裸字符串
@@ -210,7 +252,7 @@ mod tests {
     fn ascii_text_stays_text() {
         let mut p = Profile::factory_default("默认", "p1");
         p.keys.insert("KEY1".into(), ActionSpec::Text("hello 123".into()));
-        let built = build_firmware_payload(&p);
+        let built = build_firmware_payload_with_wifi(&p, None);
         let v: Value = serde_json::from_str(&built.json).unwrap();
         assert_eq!(v["profiles"][0]["keys"]["KEY1"]["press"]["text"], "hello 123");
         assert!(built.text_map.is_empty());
@@ -223,7 +265,7 @@ mod tests {
         p.encoder.insert("left".into(), ActionSpec::Named("workbench_prev".into()));
         p.encoder.insert("right".into(), ActionSpec::Named("workbench_next".into()));
         p.encoder.insert("press".into(), ActionSpec::Named("workbench_confirm".into()));
-        let built = build_firmware_payload(&p);
+        let built = build_firmware_payload_with_wifi(&p, None);
         let v: Value = serde_json::from_str(&built.json).unwrap();
         let prof = &v["profiles"][0];
         assert_eq!(
@@ -255,7 +297,7 @@ mod tests {
         // KEY5 是纯 ASCII 文本：留在固件侧自行键入，不进 text_map
         p.keys.insert("KEY5".into(), ActionSpec::Text("hello".into()));
 
-        let built = build_firmware_payload(&p);
+        let built = build_firmware_payload_with_wifi(&p, None);
         assert_eq!(built.text_map.len(), 2);
         assert!(built.text_map.values().any(|v| v == "帮我润色这段文字"));
         assert!(built.text_map.values().any(|v| v == "总结要点"));
@@ -268,6 +310,51 @@ mod tests {
         assert!(built.text_map.contains_key(left.trim_start_matches("host_action:")));
         // ASCII 文本不产生 UUID
         assert_eq!(v["profiles"][0]["keys"]["KEY5"]["press"]["text"], "hello");
+    }
+
+    /// ⛔ 这条钉住的是 2026-09-24 查出来的真 bug：固件 `apply_json` **整体替换**
+    /// 配置，载荷里没提到的字段回默认值（`wifi_ssid` / `audio_host` 默认空串）。
+    /// 所以"下发方案"必须**带上** Wi-Fi 端点，否则每下发一次就把板子的 Wi-Fi 清空。
+    #[test]
+    fn wifi_endpoint_fields_are_emitted() {
+        let p = Profile::factory_default("默认", "p1");
+        // ⛔ 测试一律用**假**凭据。这里曾经填的是真实 SSID/密码，
+        //    差点随代码入库 —— 单测里的字符串和注释一样会被永久保存。
+        let built = build_firmware_payload_with_wifi(
+            &p,
+            Some(WifiEndpoint {
+                ssid: "example-ssid",
+                password: "example-pass",
+                host: "192.168.31.24",
+                port: 17333,
+            }),
+        );
+        let v: Value = serde_json::from_str(&built.json).unwrap();
+        // 四个顶层字段都在（固件就是按这四个名字读的）
+        assert_eq!(v["wifi_ssid"], "example-ssid");
+        assert_eq!(v["wifi_password"], "example-pass");
+        assert_eq!(v["audio_host"], "192.168.31.24");
+        assert_eq!(v["audio_port"], 17333);
+        // 键位方案仍在（缺了会被固件判 MissingProfile 拒整包）
+        assert!(v["profiles"][0]["keys"]["KEY1"]["press"].is_string());
+        // 必须在固件 2048 字节上限内 —— 超了会被整包丢弃
+        assert!(
+            built.json.len() <= crate::constants::CONFIG_MAX_JSON_LEN,
+            "载荷 {} 字节，超过固件上限",
+            built.json.len()
+        );
+    }
+
+    /// 不带端点时**不出现**这组字段（而不是出现空值）—— 两者在固件侧同义
+    /// （都是回默认值的空串），但显式区分能让"这次下发有没有谈 Wi-Fi"可读。
+    #[test]
+    fn wifi_endpoint_omitted_when_not_requested() {
+        let p = Profile::factory_default("默认", "p1");
+        let built = build_firmware_payload_with_wifi(&p, None);
+        let v: Value = serde_json::from_str(&built.json).unwrap();
+        assert!(v.get("wifi_ssid").is_none());
+        assert!(v.get("audio_host").is_none());
+        assert!(v.get("audio_port").is_none());
     }
 
     #[test]

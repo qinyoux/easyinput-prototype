@@ -885,6 +885,16 @@ impl SessionManager {
         self.inner.keyboard_audio.lock().unwrap().clone()
     }
 
+    /// 取键盘音频管理器的克隆（`pub` 版本）。
+    ///
+    /// Wi-Fi 链路看护线程用它走"配置 JSON 直投"这条快通道（不用插 USB）。
+    /// ⚠️ 拿到的是**克隆**：它内部是 `Arc<Inner>`，克隆不会多出一个监听线程，
+    /// 也不能在离开作用域时把线程带走（详见
+    /// `KeyboardAudioManager::shutdown` 那段注释里记着的真实故障）。
+    pub fn keyboard_audio(&self) -> Option<keyboard_audio::KeyboardAudioManager> {
+        self.keyboard_audio_clone()
+    }
+
     /// 决定这一轮录音用哪个麦克风，并**说清理由**。
     ///
     /// 返回 `(是否用板子音频, 理由)`。理由要进日志与"空结果"提示 ——

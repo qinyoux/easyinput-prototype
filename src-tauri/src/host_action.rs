@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::constants::{
     HOST_ACTION_V1_HEADER_LEN, KIND_HOST_ACTION, REPORT_ID_APP_COMMAND, UUID_NEXT_PROFILE,
@@ -343,7 +343,18 @@ fn handle_profile_switch(
     //
     // 「内容随方案切换」正是靠这一行：提示词挂在方案上，任何一次激活方案变更都
     // 会重新发布一次快照，浮窗若正开着就当场换内容。
-    let built = crate::payload::build_firmware_payload(new_profile);
+    //
+    // ⛔ 载荷必须**带上 Wi-Fi 端点**：固件 `apply_json` 是整体替换，载荷里没提到的
+    // 字段回默认值（`wifi_ssid` / `audio_host` 默认空串）⇒ 不带端点就是
+    // **一按「切换方案」就把板子的 Wi-Fi 配置清空**。别改回 `build_firmware_payload`。
+    let (ssid, password) = app.state::<crate::session::SessionManager>().get_wifi_config();
+    let built = match crate::wifi_link::build_payload_with_endpoint(app, &ssid, &password) {
+        Ok(built) => built,
+        Err(e) => {
+            log_buffer::err(format!("方案切换：构造下发载荷失败 {e}"));
+            return;
+        }
+    };
     *text_actions.write().unwrap() = built.text_map.clone();
     crate::workbench::publish_board_input(app, new_profile);
     log_buffer::info(format!("方案切换：下发固件 ({} 字节)", built.json.len()));

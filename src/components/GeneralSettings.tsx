@@ -29,7 +29,8 @@ export default function GeneralSettings() {
   const [micSource, setMicSource] = useState<"auto" | "pc" | "wifi" | "bluetooth">("auto");
   const [wifiSsid, setWifiSsid] = useState("");
   const [wifiPassword, setWifiPassword] = useState("");
-  const [wifiConnected, setWifiConnected] = useState(false);
+  /** 链路实时状态（来自后端看护线程）。`null` = 还没拿到。 */
+  const [wifiLink, setWifiLink] = useState<api.WifiLinkStatus | null>(null);
   // 蓝牙的"状态"文案由后端给（见 commands.rs 的 `ble_status`）——它现在是一句
   // **如实的话**："读不到（开发板只在蓝牙 GATT 通道上发布蓝牙状态…）"。
   // 过去这个字段装的是 Wi-Fi 音频心跳的替身结论（在线/离线），与蓝牙无关。
@@ -181,6 +182,30 @@ export default function GeneralSettings() {
     };
   }, []);
 
+  // Wi-Fi 链路状态轮询。
+  //
+  // ⛔ 以前这张卡片的「Wi-Fi 已连接」是**本地硬写**的：点一下「连接」就
+  // `setWifiConnected(true)`，跟板子到底连没连上毫无关系。于是"点了成功、麦克风
+  // 却不出声"这种状态可以一直挂着。现在的唯一判据是后端的 `board_online`
+  // （= 上位机收到了板子的 EIHB 心跳），前端只负责显示它。
+  useEffect(() => {
+    let mounted = true;
+    const poll = async () => {
+      try {
+        const st = await api.wifiLinkStatus();
+        if (mounted) setWifiLink(st);
+      } catch {
+        if (mounted) setWifiLink(null);
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
+
   return (
     <div className="settings-page">
       <div className="settings-section">
@@ -243,17 +268,24 @@ export default function GeneralSettings() {
             </button>
           </div>
           <div className="row">
-            <span className={`kb-audio-badge ${wifiConnected ? "online" : "offline"}`}>
-              {wifiConnected ? "Wi-Fi 已连接" : "Wi-Fi 未连接"}
+            <span
+              className={`kb-audio-badge ${wifiLink?.board_online ? "online" : "offline"}`}
+            >
+              {wifiLink?.board_online ? "Wi-Fi 已连接" : "Wi-Fi 未连接"}
             </span>
             <button
               onClick={async () => {
+                setHint("");
                 try {
                   await api.setWifiConfig(wifiSsid, wifiPassword);
-                  await api.wifiConnect(wifiSsid, wifiPassword);
-                  setWifiConnected(true);
+                  const r = await api.wifiConnect(wifiSsid, wifiPassword);
+                  // ⚠️ 这里**不写"已连接"**：下发成功 ≠ 连上了。
+                  // 徽标由 `wifi_link_status` 的 `board_online` 决定。
+                  setHint(
+                    `端点已下发（通道 ${r.channel}${r.saved_to_board ? "，板子已存 NVS：下次上电它会自己连" : ""}）。` +
+                      (r.hint ? ` ${r.hint}` : " 正在等板子心跳确认…"),
+                  );
                 } catch (e) {
-                  setWifiConnected(false);
                   setHint(`Wi-Fi 连接失败: ${e}`);
                 }
               }}
@@ -262,9 +294,10 @@ export default function GeneralSettings() {
             </button>
             <button
               onClick={async () => {
+                setHint("");
                 try {
-                  await api.wifiDisconnect();
-                  setWifiConnected(false);
+                  const msg = await api.wifiDisconnect();
+                  setHint(msg);
                 } catch (e) {
                   setHint(`Wi-Fi 断开失败: ${e}`);
                 }
@@ -272,9 +305,73 @@ export default function GeneralSettings() {
             >
               断开
             </button>
+            <button
+              onClick={async () => {
+                try {
+                  setWifiLink(await api.wifiLinkStatus());
+                } catch (e) {
+                  setHint(`读取链路状态失败: ${e}`);
+                }
+              }}
+            >
+              刷新状态
+            </button>
           </div>
+
+          {/* 链路实时状态：把"自动检测 / 自动连接 / 重试倒计时"如实摊开。
+              这四行是**唯一**能让"板子麦克风不出声"这类问题当场定位的地方 ——
+              没有它，用户只能看到一个"未连接"和一堆猜测。 */}
+          {wifiLink && (
+            <div className="hint" style={{ lineHeight: 1.7 }}>
+              <div>
+                <strong>链路状态：</strong>
+                {wifiLink.state_text}
+                {wifiLink.attempts > 0 && wifiLink.next_retry_secs > 0 && (
+                  <> · 第 {wifiLink.attempts + 1} 次重试还有 {wifiLink.next_retry_secs} 秒</>
+                )}
+              </div>
+              <div>
+                <strong>上位机所处网络：</strong>
+                {wifiLink.current_ssid ?? "未连 Wi-Fi"} · 本机地址{" "}
+                {wifiLink.lan_ipv4 ?? "未知"}
+              </div>
+              {wifiLink.target_ssid && (
+                <div>
+                  <strong>本轮目标：</strong>
+                  {wifiLink.target_ssid}
+                  {wifiLink.target_reason ? `（${wifiLink.target_reason}）` : ""}
+                  {wifiLink.last_channel ? ` · 通道 ${wifiLink.last_channel}` : ""}
+                  {wifiLink.saved_to_board ? " · 板子已存 NVS" : ""}
+                </div>
+              )}
+              {wifiLink.last_error && (
+                <div style={{ color: "var(--danger, #d33)" }}>
+                  <strong>最近一次失败：</strong>
+                  {wifiLink.last_error}
+                </div>
+              )}
+              {wifiLink.known.length > 0 && (
+                <div>
+                  <strong>历史网络（按成功证据排序）：</strong>
+                  {wifiLink.known
+                    .map((k) =>
+                      k.last_success_unix > 0
+                        ? `${k.ssid}（成功 ${k.success_count} 次）`
+                        : `${k.ssid}（尚未成功过${k.has_password ? "" : "，无密码"}）`,
+                    )
+                    .join(" · ")}
+                </div>
+              )}
+            </div>
+          )}
+
           <p className="hint">
             配置下发到开发板后，开发板将连接此 Wi-Fi 并通过 UDP 发送音频。SSID 和密码会自动保存到配置文件，下次启动自动回填。
+            <br />
+            <strong>接好一次之后就不必再手动连了</strong>：端点由上位机写进板子的 NVS，
+            板子<strong>上电即自行连接</strong>（每约 10 秒重试一轮）；上位机只在你
+            <strong>换了网络、或本机 IP 变了</strong>时自动重下发。历史网络会一直留着，
+            下次回到那张网会直接命中。
           </p>
         </div>
 

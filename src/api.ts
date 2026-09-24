@@ -117,14 +117,68 @@ export function keyboardAudioOnline(): Promise<boolean> {
   return invoke<boolean>("keyboard_audio_online");
 }
 
-/** 下发 Wi-Fi 连接命令到开发板。 */
-export function wifiConnect(ssid: string, password: string): Promise<void> {
-  return invoke<void>("wifi_connect", { ssid, password });
+/**
+ * 一次 Wi-Fi 下发的如实结果。
+ *
+ * ⚠️ 字段名是 **snake_case**：本仓库 Rust 侧只有少数结构体用 `rename_all`，
+ * 这里与 `wifi_link.rs` 的字段名保持一致（照搬会得到一堆 `undefined`）。
+ */
+export interface WifiConnectOutcome {
+  ssid: string;
+  /** `usb-hid` / `wifi-udp` / `usb-hid + wifi-udp` */
+  channel: string;
+  /** 板子是否已把端点写进 NVS ⇒ 下次上电它能自己连，不需要上位机在场。 */
+  saved_to_board: boolean;
+  lan_ipv4: string | null;
+  /** 还没连上时给用户的一句话（连上了是 null）。 */
+  hint: string | null;
 }
 
-/** 下发 Wi-Fi 断开命令到开发板。 */
-export function wifiDisconnect(): Promise<void> {
-  return invoke<void>("wifi_disconnect");
+export interface KnownWifiView {
+  ssid: string;
+  last_success_unix: number;
+  success_count: number;
+  has_password: boolean;
+  last_error: string;
+}
+
+/** Wi-Fi 链路看护线程的实时状态。 */
+export interface WifiLinkStatus {
+  /** disabled | no-history | idle | provisioning | waiting-heartbeat | online | blocked */
+  state: string;
+  state_text: string;
+  board_online: boolean;
+  board_hid_present: boolean;
+  current_ssid: string | null;
+  lan_ipv4: string | null;
+  target_ssid: string | null;
+  target_reason: string | null;
+  saved_to_board: boolean;
+  attempts: number;
+  next_retry_secs: number;
+  last_error: string | null;
+  last_channel: string | null;
+  known: KnownWifiView[];
+}
+
+/**
+ * 下发 Wi-Fi 端点并持久化。
+ *
+ * ⛔ 别把这个 `await` 当成「连上了」：它只说明**端点已经发出去了**（并且带回了板子的
+ * 存盘回执）。真正连上的判据是 `wifiLinkStatus().board_online`（收到的板子心跳）。
+ */
+export function wifiConnect(ssid: string, password: string): Promise<WifiConnectOutcome> {
+  return invoke<WifiConnectOutcome>("wifi_connect", { ssid, password });
+}
+
+/** 断开开发板 Wi-Fi 音频（下发空端点，板子会释放 Wi-Fi 省电）。 */
+export function wifiDisconnect(): Promise<string> {
+  return invoke<string>("wifi_disconnect");
+}
+
+/** 读 Wi-Fi 链路实时状态（含历史网络、环境、重试倒计时）。 */
+export function wifiLinkStatus(): Promise<WifiLinkStatus> {
+  return invoke<WifiLinkStatus>("wifi_link_status");
 }
 
 /** 下发蓝牙启用命令到开发板。 */

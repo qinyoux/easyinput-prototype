@@ -131,12 +131,64 @@ function fmt(result) {
   return JSON.stringify(v);
 }
 
+// Page.captureScreenshot → 落盘 PNG。
+//
+// ⛔ 这是"DOM 有文本 ≠ 用户看得见"的补刀工具：本项目出过真实故障 ——
+// 字幕浮层的 `#text` 明明有值，窗口却是隐藏的（v0.35.3）。读 DOM 只能证明
+// "数据到位"，证明不了"人眼能看到"。
+// 顺序建议：先 eval 查 `isVisible()` + `getBoundingClientRect()`，
+// 再用本模式截图确认版式（有元素也可能被压成 0 高 / 挪出视口）。
+async function capture(target, outPath) {
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((res, rej) => {
+    ws.addEventListener("open", res, { once: true });
+    ws.addEventListener("error", (e) => rej(new Error("WS 连接失败: " + e.message)), {
+      once: true,
+    });
+  });
+
+  const id = 1;
+  const done = new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("CDP 截图超时")), 30000);
+    ws.addEventListener("message", (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (msg.id !== id) return;
+      clearTimeout(timer);
+      if (msg.error) return rej(new Error("CDP 错误: " + JSON.stringify(msg.error)));
+      res(msg.result);
+    });
+  });
+
+  ws.send(
+    JSON.stringify({ id, method: "Page.captureScreenshot", params: { format: "png" } })
+  );
+
+  const result = await done;
+  ws.close();
+  const buf = Buffer.from(result.data, "base64");
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(outPath, buf);
+  return `已保存截图 ${outPath}（${buf.length} 字节）`;
+}
+
 try {
   if (mode === "list") {
     const list = await targets();
     for (const t of list) {
       console.log(`${t.type}\t${t.title}\t${t.url}`);
     }
+    process.exit(0);
+  }
+
+  if (mode === "shot") {
+    const list = await targets();
+    const target = pick(list, urlFilter);
+    console.log(await capture(target, payload));
     process.exit(0);
   }
 
@@ -147,7 +199,9 @@ try {
     const { readFile } = await import("node:fs/promises");
     expr = await readFile(payload, "utf8");
   } else {
-    console.error("用法: node cdp_eval.mjs list | eval <expr> | evalfile <file> [--url <子串>]");
+    console.error(
+      "用法: node cdp_eval.mjs list | eval <expr> | evalfile <file> | shot <输出.png> [--url <子串>]"
+    );
     process.exit(2);
   }
 

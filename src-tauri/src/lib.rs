@@ -54,6 +54,7 @@ mod asr_vocab;
 mod cli_terminal;
 /// TTS 通用能力（Capability Core）—— 文本 → 48 kHz PCM。见 `tts.rs` 头部说明。
 mod tts;
+mod wifi_link;
 /// Agent 任务台（第 7 课作业落地）。**纯增量**：删除本目录 + 摘命令即回滚。
 mod agent_desk;
 
@@ -137,8 +138,23 @@ fn get_resource_id(state: tauri::State<'_, SessionManager>) -> String {
 
 /// 设置 Wi-Fi 配置（SSID + 密码）并持久化到配置文件。
 #[tauri::command]
-fn set_wifi_config(state: tauri::State<'_, SessionManager>, ssid: String, password: String) -> Result<(), String> {
+fn set_wifi_config(
+    state: tauri::State<'_, SessionManager>,
+    link: tauri::State<'_, wifi_link::WifiLink>,
+    ssid: String,
+    password: String,
+) -> Result<(), String> {
     state.set_wifi_config(&ssid, &password);
+    // 顺手写进"历史网络"：用户在界面上填过一次，就等于声明"我可能会用它"。
+    // 真正的"成功"仍以收到心跳为准（由看护线程写 last_success）。
+    if !ssid.trim().is_empty() {
+        if let Some(dir) = link.config_dir_for_write() {
+            let mut file = wifi_link::load_known(&dir);
+            if wifi_link::upsert_known(&mut file, &ssid, Some(&password)) {
+                let _ = wifi_link::save_known(&dir, &file);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1078,14 +1094,26 @@ pub fn run() {
             }
 
             // 自动连接 Wi-Fi（如果配置文件中有保存的 SSID）。
+            //
+            // ⛔ 这里过去直接调 `commands::wifi_connect(ssid, password)` —— 那个命令
+            // 发的是 `{"cmd":"wifi_connect"}`，而固件配置协议**没有 `cmd` 字段**
+            // 且 `schema` 必填 ⇒ 整包被拒；又因为不等回执，日志里只留下一行
+            // "Wi-Fi 连接命令已下发"。也就是说：**这段"自动连接"从来没有生效过**。
+            //
+            // 现在交给 Wi-Fi 链路看护线程（`wifi_link`）：它在自己的节奏里做
+            // "探测环境 → 选网 → 下发完整载荷 → 等心跳确认 → 写历史 → 失败退避重试"，
+            // 并且和「设置」里的手动「连接」按钮走**同一条**下发路径。
             {
-                let (ssid, password) = app.state::<SessionManager>().get_wifi_config();
-                if !ssid.is_empty() {
-                    crate::log_buffer::info(format!("自动连接 Wi-Fi: SSID={ssid}"));
-                    if let Err(e) = commands::wifi_connect(ssid, password) {
-                        crate::log_buffer::warn(format!("自动连接 Wi-Fi 失败: {e}"));
-                    }
+                app.manage(wifi_link::WifiLink::new());
+                let link = app.state::<wifi_link::WifiLink>();
+                if let Ok(dir) = app.path().app_config_dir() {
+                    link.bind_config_dir(dir.clone());
+                    // 迁移：把 config.json 里已存的 SSID 补进历史，否则第一次启动
+                    // 会显示"没有历史网络"，老用户的既有配置等于白存。
+                    let (ssid, password) = app.state::<SessionManager>().get_wifi_config();
+                    wifi_link::migrate_legacy_credentials(&dir, &ssid, &password);
                 }
+                wifi_link::start(app.handle().clone(), (*link).clone());
             }
 
             // 事件调度线程：钩子事件 → 会话状态机。
@@ -1286,6 +1314,7 @@ pub fn run() {
             commands::set_active_profile,
             commands::wifi_connect,
             commands::wifi_disconnect,
+            commands::wifi_link_status,
             commands::ble_enable,
             commands::ble_disable,
             commands::ble_pair,
@@ -1387,6 +1416,9 @@ pub fn run() {
                     // 不挂在 `Drop` 上（挂了的话，录音函数里任意一个局部克隆释放
                     // 都会把它带走，见 keyboard_audio 里的说明）。
                     _app.state::<SessionManager>().shutdown_keyboard_audio();
+                    // 停掉 Wi-Fi 链路看护线程。理由同上：它同样不挂 `Drop`
+                    // （里面每秒一次的环境探测不该被某个局部克隆的释放带走）。
+                    _app.state::<wifi_link::WifiLink>().stop();
                 } else {
                     log_buffer::info("拦截退出请求：非显式退出（可能只是收起了浮层/面板）");
                     api.prevent_exit();

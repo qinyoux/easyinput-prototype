@@ -7,6 +7,98 @@
 
 ---
 
+## [v0.37.0] — 2026-09-24
+
+### 新增
+
+- **Wi-Fi 链路四环节自动化（自动检测 / 自动连接 / 历史记录 / 快速重连）。**
+  新增独立模块 `src-tauri/src/wifi_link.rs`（约 1500 行 + 23 个单测）与设计文档
+  `docs/wi-fi链路自动连接设计.md`。四件事的判据与触发条件：
+
+  | 环节 | 做什么 | 触发条件 |
+  |---|---|---|
+  | 自动检测 | 读「当前所连 SSID + 本机首选 IPv4 + 可见 AP 列表」，组成环境指纹 `epoch = 当前SSID\|首选IPv4` | 每秒 tick；在线时 30 s 重探一次，离线时 5 s；USB 插入立即重探 |
+  | 自动连接 | 把**带 Wi-Fi 端点的完整配置载荷**写进板子 NVS（先 USB HID，后 UDP 直投） | T1 开机首次（3 s 启动宽限后且板子未在线）；T2 检测到 USB 配置通道出现；T4 离线超过 20 s 仍未收到心跳 |
+  | 历史记录 | `output_dir()/wifi_known.json`，最多 16 条，按成功证据排序；启动时从 `config.json` 的 `wifi_ssid`/`wifi_password` 迁移一次 | 只在「离线 → 在线」跃迁时记一次成功（以**收到心跳**为准，不以"下发成功"为准） |
+  | 快速重连 | 端点已在 NVS ⇒ 板子上电**自行**连接（固件本职）；上位机侧只做兜底 | T3 环境指纹变化（换网 / 本机 IP 变了）⇒ 立即重下发；重试退避 0 / 5 / 15 / 30 / 60 秒 |
+
+  「连上了」的唯一判据是收到板子的 EIHB 心跳（超时 5 秒），不是下发回执。
+  板子的自我重连约每 10 秒一轮；上位机只在环境变化或长期离线时介入。
+- 新增命令 `wifi_link_status`（前端 2 秒轮询）。
+- 新增 `keyboard_audio::send_config_json`（UDP 直投配置，上限 2048 字节，与固件 `kConfigMaxJsonLen` 对齐）。
+
+### 变更
+
+- **「Wi-Fi 已连接」徽标不再是前端硬写的。** 以前点一下「连接」就
+  `setWifiConnected(true)`，与板子实际状态无关，于是「点了成功但麦克风不出声」可以一直挂着；
+  现在徽标只显示后端的 `board_online`（= 收到板子心跳）。
+- **`payload::build_firmware_payload(profile)` 已删除**，改为
+  `build_firmware_payload_with_wifi(profile, Option<WifiEndpoint>)` —— 强制每个调用方
+  显式表态「这一次要不要带 Wi-Fi 端点」，从类型上消灭"忘了带端点 ⇒ 板子被清网"这一整类问题。
+- `wifi_connect` 返回值改为 `{ssid, channel, saved_to_board, lan_ipv4, hint}`。
+  设置页「Wi-Fi 配置」新增「刷新状态」按钮与链路状态明细（链路状态 / 上位机所处网络 /
+  本轮目标 / 最近失败 / 历史网络按成功证据排序）。
+- 配置 JSON 下发成功不再被表述为"已连接"——下发成功只说明端点进了 NVS。
+
+### 修复
+
+- **`wifi_connect` / `wifi_disconnect` 从来没有生效过。**
+  旧实现下发的是 `{"cmd":"wifi_connect",…}`，而开发板固件的配置协议**没有 `cmd` 字段**
+  且要求 `schema` 必填 ⇒ 整包被判 `InvalidSchema` 静默丢弃；
+  且旧实现不等回执就写日志"已下发"，所以故障对用户表现为"点了没反应、日志还说成功"。
+  现在改为下发完整配置载荷并等待 USB 回执。
+- **每次「下发到开发板」或「切换方案」都会清空板子的 Wi-Fi 端点。**
+  旧载荷只含 `schema` / `target_platform` / `profiles`，而固件
+  `ConfigState::apply_json` 是**整体替换**语义（未提及的字段一律回默认值），
+  于是 `wifi_ssid` / `audio_host` 被清成空串 ⇒ 固件的
+  `audio_ready() = enabled && !ssid.empty() && !host.empty() && port != 0` 为假
+  ⇒ 板子主动释放 Wi-Fi，麦克风静默失效。
+  已在 `push_config` 与 `host_action::handle_profile_switch` 改为带端点下发，
+  并在两处加注释钉住"别改回不带端点"。
+- **版本脚本漏掉了第 5 处版本号：`src-tauri/Cargo.lock`。**
+  `scripts/version.mjs` 原先只校验/同步四处（package.json / tauri.conf.json / Cargo.toml /
+  package-lock.json），而 `Cargo.lock` 里本包那条 `[[package]]` 也带版本号，
+  且是**唯一会被 `cargo build` 自动改写**的一处 —— 升级后不构建就停在旧号，
+  下次构建又被"改成"新号，于是版本文件在"一致 / 又不一致"之间来回摆，
+  先后取决于有没有跑过构建。现已纳入 `check` 与 `sync`（只认 name 为 `easyop` 的那一条，
+  不碰依赖版本），校验口径从"四处"改为"**五处**"。
+
+### ⚠️ 未完成 / 已知边界
+
+- **首次配网必须插 USB**：端点还没进 NVS 时板子不在网上，UDP 直投这条路
+  （其服务端判据是 `from == dest`）必然打不通。
+- 板子端**没有**主动扫描并上报周围 AP 的能力，环境判断全部在上位机侧完成
+  （没有为此改固件，也没有新增 Report ID）。
+- 麦克风来源不是「Wi-Fi 键盘麦克风」时，整条链路**主动停摆**（状态 `disabled`）——
+  这是故意的：用户选了别的来源，后台不该还在改板子的网络配置。
+- 历史文件 `wifi_known.json` 里**密码是明文**（与既有的 `config.json` 同级别，未新增暴露面，
+  但也未加密）。迁移是"只增不清"：`config.json` 里的旧字段保留，表单预填仍可用。
+- 「零下发、直接命中已在线心跳」的那一轮（例如重启上位机、板子本来就连着），
+  `last_channel` 会是空 —— 语义正确（本轮没走任何通道），但 UI 上略显空。
+- 既有未完成项照旧：`AsyncTaskPoll`、运行中逐行实时日志、失败自动重试、
+  键盘喇叭出声、板端灯语 `0x16`。
+
+---
+
+## [v0.36.0] — 2026-09-24
+
+### 变更
+
+- **内容台（studio）插件退出 ⌘SS 搜索，统一走侧边栏页签。**
+  移除 `studio.toggle` 命令和 overlay 浮层模式，清空 `contributes.tools`。
+  插件不再出现在 ⌘SS 搜索结果里。⌘SS 命令面板回归搜索/启动文件本职。
+  `contributes.tools` 机制本身保留，其他插件仍可按需声明。
+  影响：老用户以前能 ⌘SS 搜「内容台」打开，现在需改走侧边栏点「内容台」页签。
+  文档同步更新：AGENTS.md 冒烟路径、`路径A-插件页签接口契约.md`、`内容台规范.md`、
+  `easyop 插件系统设计文档.md`、`plugins/README.md`、`studio/README.md`。
+  验证台 145 项全过（原 156 项中 11 项 toggle/overlay 断言已移除/替换）。
+
+### 修复
+
+- （无）
+
+---
+
 ## [v0.35.4] — 2026-09-23
 
 > ⚠️ **本节为回顾补记**：原条目在 2026-09-24 13:24 与 v0.35.3 一起被**一次外部操作**

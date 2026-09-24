@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::model::{AppEntry, ConfigAck, Profile, Prompt};
 use crate::state::{self, AppState};
 use crate::system_apps::SystemApp;
-use crate::{device, host_action, payload, transport, validate, workbench};
+use crate::{device, host_action, validate, workbench};
 
 /// 词表 / 常量（供前端渲染下拉框与做前端预校验）。
 #[derive(Serialize)]
@@ -78,7 +78,13 @@ pub(crate) fn push_config(
         crate::log_buffer::err(format!("校验失败: {e}"));
         e
     })?;
-    let built = payload::build_firmware_payload(&profile);
+    // ⛔ 这里**必须**走"带端点"的构造：固件 `apply_json` 整体替换配置，
+    // 载荷里没提到的字段一律回默认值（`wifi_ssid` / `audio_host` 默认空串）。
+    // 旧代码只发 schema + target_platform + profiles ⇒ **每按一次「下发方案」，
+    // 板子上已配好的 Wi-Fi 端点就被清空一次**，随之按 `audio_enabled == false`
+    // 关掉 Wi-Fi。现象是"改了键位之后麦克风就不出声了"，且没有任何报错。
+    let (ssid, password) = app.state::<SessionManager>().get_wifi_config();
+    let built = crate::wifi_link::build_payload_with_endpoint(&app, &ssid, &password)?;
     // 更新主机端文本动作映射（含非ASCII的固定文本 → UUID）。
     *state.text_actions.write().unwrap() = built.text_map.clone();
     workbench::publish_board_input(&app, &profile);
@@ -417,40 +423,141 @@ pub(crate) fn workbench_prompt_remove(
 // ---------- 通信配置（Wi-Fi / 蓝牙 / 麦克风源）----------
 
 use crate::session::{SessionManager, MicSource};
-use serde_json::json;
 
-/// 下发 Wi-Fi 连接命令到开发板：开发板将连接指定 SSID/密码的无线网络。
-#[tauri::command]
-pub(crate) fn wifi_connect(ssid: String, password: String) -> Result<(), String> {
-    if ssid.trim().is_empty() {
-        return Err("Wi-Fi SSID 不能为空".to_string());
-    }
-    crate::log_buffer::info(format!("下发 Wi-Fi 连接命令: SSID={ssid} 密码长度={}", password.len()));
-    let json = json!({
-        "cmd": "wifi_connect",
-        "ssid": ssid,
-        "password": password,
-    })
-    .to_string();
-    transport::send_command(&json).map_err(|e| {
-        crate::log_buffer::err(format!("Wi-Fi 连接命令下发失败: {e}"));
-        e
-    })?;
-    crate::log_buffer::info("Wi-Fi 连接命令已下发");
-    Ok(())
+/// `wifi_connect` 的返回：**如实说明这一次到底发生了什么**。
+///
+/// 旧版本返回 `()`，界面上"连接成功"是**本地硬写**的（`setWifiConnected(true)`），
+/// 与板子真实状态无关。这个结构就是为了让"下发成功但板子没连上"能被看见。
+#[derive(serde::Serialize)]
+pub(crate) struct WifiConnectOutcome {
+    pub ssid: String,
+    /// 用哪条通道送到的：`usb-hid` / `wifi-udp` / `usb-hid + wifi-udp`。
+    pub channel: String,
+    /// 板子是否已把端点写进 NVS ⇒ **下次上电它能自己连，不需要上位机在场**。
+    pub saved_to_board: bool,
+    /// 本机 IPv4（板子要回连的地址）。
+    pub lan_ipv4: Option<String>,
+    /// 还没连上时给用户的一句话（连上了是 `None`）。
+    pub hint: Option<String>,
 }
 
-/// 下发 Wi-Fi 断开命令到开发板。
+/// 下发 Wi-Fi 端点并持久化：**把当前 Wi-Fi 写进板子的完整配置载荷**。
+///
+/// # ⛔ 旧实现为什么从来没生效过（2026-09-24 查清）
+///
+/// 旧实现发的是 `{"cmd":"wifi_connect","ssid":…,"password":…}`，但固件的配置解析器
+/// （`config_payload.cpp::parse_config_payload`）
+///
+/// 1. **没有 `cmd` 这个字段**：顶层只认 `schema` / `profiles` / `ptt_hotkey` /
+///    `audio_enabled` / `audio_source` / `microphone_source` / `audio_host` /
+///    `audio_port` / `wifi_ssid` / `wifi_password` / `speaker_sync_key` 等固定键；
+/// 2. **`schema` 必填且必须等于 `ai_keyboard.v1`**，否则整包判 `InvalidSchema`
+///    直接丢弃；
+/// 3. 而 `transport::send_command` **不等回执** ⇒ 上位机日志照样写"命令已下发"。
+///
+/// 三者叠加 = **点一下"连接"，界面变绿，板子什么都没收到**。用户唯一的线索是
+/// "麦克风还是不出声"，而那个现象有十几种解释。
+///
+/// # 现在的做法
+///
+/// 走 [`crate::wifi_link`]：拼**完整**载荷（键位方案 + Wi-Fi 端点），
+/// 先试 Wi-Fi UDP 直投（板子已在线时不用插 USB），再试 USB HID 配置通道
+/// （首次配网唯一可用的通道），并且**等 `0x11` 回执拿到 `saved`**。
+/// 「连接成功」以**收到板子心跳**为准，由看护线程判定并写进历史。
 #[tauri::command]
-pub(crate) fn wifi_disconnect() -> Result<(), String> {
-    crate::log_buffer::info("下发 Wi-Fi 断开命令");
-    let json = json!({ "cmd": "wifi_disconnect" }).to_string();
-    transport::send_command(&json).map_err(|e| {
-        crate::log_buffer::err(format!("Wi-Fi 断开命令下发失败: {e}"));
-        e
-    })?;
-    crate::log_buffer::info("Wi-Fi 断开命令已下发");
-    Ok(())
+pub(crate) fn wifi_connect(
+    app: AppHandle,
+    state: State<'_, SessionManager>,
+    link: State<'_, crate::wifi_link::WifiLink>,
+    ssid: String,
+    password: String,
+) -> Result<WifiConnectOutcome, String> {
+    let ssid = ssid.trim().to_string();
+    if ssid.is_empty() {
+        return Err("Wi-Fi SSID 不能为空".to_string());
+    }
+    // 先落本地（config.json）—— 它是"上位机认为该连哪个网"的真相源。
+    state.set_wifi_config(&ssid, &password);
+    crate::log_buffer::info(format!(
+        "Wi-Fi 连接：下发端点（SSID={}，密码长度={}）",
+        crate::wifi_link::mask_ssid(&ssid),
+        password.len()
+    ));
+
+    let outcome = crate::wifi_link::provision_with(
+        &app,
+        &link,
+        Some((&ssid, &password)),
+        "手动连接",
+        true,
+    )?;
+    // 登记成"等确认"：看护线程收到心跳时才把这条算作成功。
+    link.note_manual(&ssid);
+
+    let lan_ipv4 = crate::wifi_link::cached_lan_ipv4().into_iter().next();
+    if !outcome.any_ok() {
+        let hint = outcome
+            .error_text()
+            .unwrap_or_else(|| "两条下发通道都不可用".to_string());
+        crate::log_buffer::err(format!("Wi-Fi 连接：下发失败 — {hint}"));
+        return Err(hint);
+    }
+
+    let hint = if outcome.saved() {
+        None
+    } else {
+        Some(
+            "端点已发出，但没拿到板子的存盘回执（多半只走了 UDP 直投）。\
+             以「Wi-Fi 已连接」徽标为准。"
+                .to_string(),
+        )
+    };
+    Ok(WifiConnectOutcome {
+        ssid,
+        channel: outcome.channel_label(),
+        saved_to_board: outcome.saved(),
+        lan_ipv4,
+        hint,
+    })
+}
+
+/// 断开开发板的 Wi-Fi 音频。
+///
+/// # ⛔ 旧实现同样从来没生效过
+///
+/// 旧实现发 `{"cmd":"wifi_disconnect"}`，理由与 [`wifi_connect`] 完全一样
+/// （固件没有 `cmd` 字段、`schema` 必填）。而且它**连本地配置都没清** ——
+/// 于是"断开"之后 `mic_source` 仍是 `wifi`，下次启动看护线程又把它连回去。
+///
+/// # 现在怎么断开
+///
+/// 下发一份 **`wifi_ssid` 为空**的完整载荷：固件的
+/// `ConfigState::audio_enabled()` 是由 `wifi_ssid`/`audio_host`/`audio_port`
+/// 三者推导出来的（都非空才为真），所以空 SSID 就等于"关掉这条通道"，
+/// 板子会主动释放 Wi-Fi 省电。这是**唯一**在固件现有协议下语义正确的断开方式。
+#[tauri::command]
+pub(crate) fn wifi_disconnect(
+    app: AppHandle,
+    state: State<'_, SessionManager>,
+    link: State<'_, crate::wifi_link::WifiLink>,
+) -> Result<String, String> {
+    crate::log_buffer::info("Wi-Fi 断开：下发空端点（板子将释放 Wi-Fi）");
+    // 本地也要清掉，否则下次启动又会被自动连回去 —— 这正是旧实现的漏洞。
+    state.set_wifi_config("", "");
+    let outcome =
+        crate::wifi_link::provision_with(&app, &link, Some(("", "")), "手动断开", true)?;
+    if !outcome.any_ok() {
+        let hint = outcome.error_text().unwrap_or_else(|| "下发失败".to_string());
+        crate::log_buffer::err(format!("Wi-Fi 断开：下发失败 — {hint}"));
+        return Err(hint);
+    }
+    Ok(format!("已下发断开（通道 {}）", outcome.channel_label()))
+}
+
+/// Wi-Fi 链路的实时状态：给「设置 → 通用」那张卡片看。
+#[tauri::command]
+pub(crate) fn wifi_link_status(link: State<'_, crate::wifi_link::WifiLink>) -> crate::wifi_link::WifiLinkStatus {
+    link.status()
 }
 
 /// 蓝牙开关/配对类命令的**如实答复**。

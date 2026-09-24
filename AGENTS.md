@@ -155,8 +155,8 @@ vX.Y.Z: 一句话概括
 ## 8. 命令速查
 
 ```bash
-npm run version:check        # 校验：四处版本号一致 + CHANGELOG/README 有对应条目
-npm run version:sync         # 以 package.json 为准，同步其余三处版本号
+npm run version:check        # 校验：五处版本号一致 + CHANGELOG/README 有对应条目
+npm run version:sync         # 以 package.json 为准，同步其余四处版本号（含 src-tauri/Cargo.lock）
 npm run version:bump -- minor   # 升版本 + 同步 + 插入 CHANGELOG/README 骨架（patch|minor|major|x.y.z）
 
 npm run plugins:list         # 干跑：列出将被部署的插件（不改磁盘）
@@ -183,7 +183,7 @@ npm run cache:purge             # 备选：cargo clean 全清（连依赖，下�
 > 每轮编译白写 1.1 GB），除非要构建移动端。
 
 > **插件部署后需重启 easyop**，发现层在启动时扫描 `%APPDATA%\com.easyop.app\plugins\`。
-> 冒烟路径：⌘SS 搜"内容台"→ 打开面板 → 六阶段台账可用。
+> 冒烟路径：侧边栏点「内容台」→ 六阶段台账可用。
 
 ### ⚠️ 三个会吃掉你半小时的坑（2026-09-22 实测）
 

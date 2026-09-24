@@ -3,11 +3,11 @@
  * easyop 版本一致性工具（零依赖，Node 原生）
  *
  * 设计前提：**版本号只有一个真源 —— package.json 的 version**，
- * 其余三处（tauri.conf.json / Cargo.toml / package-lock.json）由本脚本同步。
+ * 其余四处（tauri.conf.json / Cargo.toml / package-lock.json / Cargo.lock）由本脚本同步。
  *
  * 用法：
- *   node scripts/version.mjs check              校验：四处版本号一致 + CHANGELOG / README 有对应条目
- *   node scripts/version.mjs sync               以 package.json 为准，同步其余三处版本号
+ *   node scripts/version.mjs check              校验：五处版本号一致 + CHANGELOG / README 有对应条目
+ *   node scripts/version.mjs sync               以 package.json 为准，同步其余四处版本号
  *   node scripts/version.mjs bump <spec>        升版本，同步版本号并插入 CHANGELOG / README 骨架
  *                                               spec = major | minor | patch | 0.7.0
  *
@@ -23,19 +23,60 @@ const F = {
   pkg: path.join(ROOT, "package.json"),
   conf: path.join(ROOT, "src-tauri", "tauri.conf.json"),
   cargo: path.join(ROOT, "src-tauri", "Cargo.toml"),
+  cargoLock: path.join(ROOT, "src-tauri", "Cargo.lock"),
   lock: path.join(ROOT, "package-lock.json"),
   changelog: path.join(ROOT, "CHANGELOG.md"),
   readme: path.join(ROOT, "README.md"),
 };
 const rel = (p) => path.relative(ROOT, p).split(path.sep).join("/");
 const read = (p) => readFileSync(p, "utf8");
+const nl = (s) => s.replace(/\r\n/g, "\n");
 
-// ---------- 读取四处版本号 ----------
+// ---------- 读取五处版本号 ----------
 
 /** 从 Cargo.toml 的 [package] 段取第一个 version（其余 version 属于依赖，不能碰） */
 function cargoVersionOrNull() {
   const m = read(F.cargo).match(/^version\s*=\s*"([^"]+)"/m);
   return m ? m[1] : null;
+}
+
+/**
+ * `Cargo.lock` 里**本包自身**那条 `[[package]]` 的版本。
+ *
+ * ⛔ 这是第 5 处版本号，也是唯一一处**会被 `cargo build` 自动改写**的。
+ * 早期只同步四处时踩过这个坑：升完版本不 build，`Cargo.lock` 还停在旧号，
+ * 下一次 `cargo build` 又会把它"改成"新号 ⇒ 版本文件在"已一致 / 又不一致"之间来回摆，
+ * 谁先谁后取决于有没有跑过构建。同步它，才真是"改了 A 也改了 B"。
+ *
+ * 只认 `[[package]]` 块里 `name` 恰好等于包名的那一条 —— 依赖各有各的版本，碰不得。
+ */
+const CARGO_LOCK_PKG = "easyop";
+
+/** 返回「本包 [[package]] 块」的起始偏移（相对已归一化为 \n 的文本），找不到返回 null */
+function cargoLockBlockStart(text) {
+  const marker = `[[package]]\nname = "${CARGO_LOCK_PKG}"\n`;
+  const at = text.indexOf(marker);
+  return at < 0 ? null : at + marker.length;
+}
+
+function cargoLockVersionOrNull() {
+  const text = nl(read(F.cargoLock));
+  const from = cargoLockBlockStart(text);
+  if (from === null) return null;
+  const m = text.slice(from).match(/^version\s*=\s*"([^"]+)"/m);
+  return m ? m[1] : null;
+}
+
+function writeCargoLockVersion(version) {
+  const raw = read(F.cargoLock);
+  const text = nl(raw);
+  const from = cargoLockBlockStart(text);
+  if (from === null) return false; // 本包还没进 lock（从未 build）⇒ 交给 cargo 自生，不硬造
+  const rest = text.slice(from);
+  const m = rest.match(/^version\s*=\s*"[^"]+"/m);
+  if (!m || m[0] === `version = "${version}"`) return false;
+  writeKeepEol(F.cargoLock, text.slice(0, from) + rest.replace(m[0], `version = "${version}"`), raw);
+  return true;
 }
 
 function readVersions() {
@@ -44,6 +85,7 @@ function readVersions() {
     { label: "tauri.conf.json", file: rel(F.conf), version: JSON.parse(read(F.conf)).version },
     { label: "Cargo.toml", file: rel(F.cargo), version: cargoVersionOrNull() },
     { label: "package-lock.json", file: rel(F.lock), version: JSON.parse(read(F.lock)).version },
+    { label: "Cargo.lock", file: rel(F.cargoLock), version: cargoLockVersionOrNull() },
   ];
 }
 
@@ -113,6 +155,7 @@ export function sync(version) {
   if (writeJsonVersion(F.conf, version)) done.push(rel(F.conf));
   if (writeCargoVersion(version)) done.push(rel(F.cargo));
   if (writeJsonVersion(F.lock, version)) done.push(rel(F.lock));
+  if (writeCargoLockVersion(version)) done.push(rel(F.cargoLock));
   return done;
 }
 
@@ -170,11 +213,11 @@ function check() {
   const ok = bad.length === 0 && hasCh && hasRd;
   if (!ok) {
     console.log("\n结论：❌ 版本纪律未满足。");
-    if (bad.length) console.log(`  · 执行 \`node scripts/version.mjs sync\` 可把其余三处拉到 ${pkgV}`);
+    if (bad.length) console.log(`  · 执行 \`node scripts/version.mjs sync\` 可把其余四处拉到 ${pkgV}`);
     if (!hasCh) console.log(`  · 到 CHANGELOG.md 补 [v${pkgV}] 条目（新增 / 变更 / 修复）`);
     if (!hasRd) console.log(`  · 到 README.md §版本历史 补 v${pkgV} 摘要`);
   } else {
-    console.log(`\n结论：✅ 四处版本号一致，变更说明齐备（v${pkgV}）。`);
+    console.log(`\n结论：✅ 五处版本号一致，变更说明齐备（v${pkgV}）。`);
   }
   return ok;
 }

@@ -22,6 +22,10 @@ use crate::log_buffer;
 /// 默认 UDP 端口（与固件一致）。
 pub const DEFAULT_PORT: u16 = 17333;
 
+/// 配置 JSON 的长度上限。**与固件 `kConfigMaxJsonLen` 必须一致**：
+/// 固件侧 `receive_buffer` 只开到这么大，多一个字节就会被整包丢弃。
+pub const CONFIG_JSON_MAX_BYTES: usize = 2048;
+
 /// 心跳超时：超过此时间未收到 EIHB 则判定开发板离线。
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,6 +82,46 @@ impl KeyboardAudioManager {
 
         log_buffer::info(format!("keyboard_audio: UDP 监听已启动 :{port}"));
         Ok(Self { inner })
+    }
+
+    /// 把一份完整配置 JSON **直投**给开发板（走 Wi-Fi 控制通道，不插 USB）。
+    ///
+    /// # 为什么这条路走得通
+    ///
+    /// 固件控制任务在解析 EICC 失败后有一条**配置直达通道**
+    /// （`keyboard_audio.cpp`：`received > 2 && buffer[0] == '{' && from == dest`）——
+    /// 首字节是 `{` 的数据报会被当成配置文件，走**与 USB / BLE 完全相同**的
+    /// "应用 + 存 NVS + HID 回执"路径。于是"刷新端点"不必再要求插上 USB。
+    ///
+    /// # 两个必须知道的边界（写在这里，免得下次有人以为它万能）
+    ///
+    /// 1. **判据是 `from == dest`**：板子只接受来自它已配置的上位机地址的配置包。
+    ///    所以本机 IPv4 一变，这条路就断了 —— 那种情况只能靠 USB 重新配网。
+    ///    （这是刻意的安全设计，不是缺陷。）
+    /// 2. **要等心跳**：控制地址是从 EIHB 心跳里学来的，没收到过心跳就没有目的地。
+    /// 固件侧 `kConfigMaxJsonLen = 2048`，超长包会被板子直接丢弃并记一条 warn。
+    pub fn send_config_json(&self, json: &str) -> Result<(), String> {
+        let addr = match *self.inner.control_addr.lock().unwrap() {
+            Some(a) => a,
+            None => {
+                return Err("控制地址未知（还没收到过板子心跳）".to_string());
+            }
+        };
+        if json.len() > CONFIG_JSON_MAX_BYTES {
+            return Err(format!(
+                "配置 JSON 超长（{} 字节 > 固件上限 {CONFIG_JSON_MAX_BYTES}）",
+                json.len()
+            ));
+        }
+        self.inner
+            .socket
+            .send_to(json.as_bytes(), addr)
+            .map_err(|e| format!("UDP 直投失败：{e}"))?;
+        log_buffer::info(format!(
+            "keyboard_audio: 配置已直投开发板（{} 字节）",
+            json.len()
+        ));
+        Ok(())
     }
 
     /// 开发板是否在线（最近 5 秒内收到过 EIHB 心跳）。
