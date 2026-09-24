@@ -12,6 +12,7 @@ import type { Tab, PluginPageInfo } from "./components/Sidebar";
 import ProfileSwitcher from "./components/ProfileSwitcher";
 import Workbench from "./components/Workbench";
 import PluginPageContainer from "./components/PluginPageContainer";
+import { ensurePluginActivated, invokePluginCommand } from "./pluginHost";
 import EncoderStatus from "./components/EncoderStatus";
 import ProfileManager from "./components/ProfileManager";
 import RemapEditor from "./components/RemapEditor";
@@ -265,6 +266,33 @@ export default function App() {
     }).then((fn) => {
       unlistenTerminal = fn;
     });
+    // 内容台旋钮导航：焦点切换 + 确认执行。
+    // 旋钮左旋/右旋 → 后端更新焦点 → emit studio-focus → 前端提示当前选中项。
+    // 旋钮按下 → 后端 emit studio-action → 前端调 studio 插件命令执行。
+    let unlistenStudioFocus: UnlistenFn | undefined;
+    let unlistenStudioAction: UnlistenFn | undefined;
+    listen<{ index: number; label: string }>("studio-focus", (ev) => {
+      const { label } = ev.payload;
+      notify("ok", `内容台 → ${label}`);
+    }).then((fn) => {
+      unlistenStudioFocus = fn;
+    });
+    listen<{ action: string; label: string }>("studio-action", async (ev) => {
+      const { action, label } = ev.payload;
+      notify("ok", `内容台执行：${label}…`);
+      try {
+        await ensurePluginActivated("studio");
+        const r = await invokePluginCommand("studio", "studio.quick_action", { action });
+        if (r && typeof r === "object" && "ok" in r) {
+          const result = r as { ok: boolean; message?: string; code?: string };
+          notify(result.ok ? "ok" : "err", result.ok ? `✔ ${result.message || label}` : `✘ ${result.code || "ERROR"}：${result.message || "未知错误"}`);
+        }
+      } catch (e) {
+        notify("err", `内容台执行失败：${String(e)}`);
+      }
+    }).then((fn) => {
+      unlistenStudioAction = fn;
+    });
     return () => {
       clearInterval(deviceTimer);
       clearInterval(workbenchTimer);
@@ -274,6 +302,8 @@ export default function App() {
       unlistenDesk?.();
       unlistenVoice?.();
       unlistenTerminal?.();
+      unlistenStudioFocus?.();
+      unlistenStudioAction?.();
     };
   }, [highlight, loadAll, notify, refreshDevice, refreshWorkbench, vocabulary?.host_action_prefix]);
 

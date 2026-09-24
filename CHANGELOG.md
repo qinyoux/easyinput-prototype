@@ -7,6 +7,58 @@
 
 ---
 
+## [v0.38.0] — 2026-09-25
+
+### 新增
+
+- **内容台旋钮导航（选中→确认两步模式）。** 编码器旋转在 5 个功能间切换焦点
+  （新建选题 / 一条龙 / 推进阶段 / 导出 / +公众号），按下执行高亮项。
+  3 个具名动作 `studio_prev` / `studio_next` / `studio_confirm`，对应保留 UUID
+  `…000e` / `…000f` / `…0010`。Rust 端 `STUDIO_FOCUS: AtomicU8` 维护焦点，
+  emit `studio-focus` / `studio-action` 事件 → 前端 `App.tsx` 监听 →
+  `invokePluginCommand` 调插件 `studio.quick_action` 命令路由。
+  **属对外契约变更（新增 UUID 映射），但向后兼容**（旧固件不触发这些 UUID 即不受影响）。
+- **`eo.clipboard_read` 宿主 API。** 新增 Tauri 命令 `eo_clipboard_read`，
+  供插件读取系统剪贴板文本。起因：`eo.get_selection()` 模拟 Ctrl+C 时 easyop 已切到前台，
+  按键发给 easyop 而非原应用，取不到外部选区。`clipboard_read` 作为 fallback。
+  Rust 端 `clipboard_util::read_clipboard()` 公开函数，前端 `pluginHost.ts` 的 `eo` 对象挂载。
+- **内容台自动生成情报卡 + 一条龙流水线。** `gen.intel` 命令用 LLM 从选题标题生成情报卡
+  （受众 / 平台 / 风格 / 关键信息点）；`gen.all` 命令顺序执行情报卡→标题→正文→口语化，
+  中途失败可断点续跑（跳过已落库步骤）。
+- **正文字数可配置。** `BODY_SYSTEM` 从常量改为函数，默认 500 字，面板加字数输入框，
+  值存 `eo.storage` 的 `config.wordCount`。
+- **内容台双主题支持（深色 / 浅色）。** CSS 改为插件私有变量驱动（30+ 变量），
+  `[data-theme="light"] .studio-panel` 覆盖浅色值。跟随 `<html data-theme>` 属性切换，
+  不硬编码颜色。深色：深蓝渐变 + 白色星点；浅色：淡蓝白渐变 + 淡蓝星点。
+- **内容台 UI 优化。** 卡片网格布局（`.sp-grid` + `.sp-card`），星空/银河系主题，
+  帮助按钮（「?」）+ 帮助弹窗（使用说明）。
+- **《内容台插件架构设计》文档**（`docs/内容台插件架构设计.md`）：6 章完整架构设计，
+  涵盖插件集成机制 / 按键映射 / 主题兼容 / 测试验证 / 使用说明 / 版本更新。
+
+### 变更
+
+- **内容台插件退出 ⌘SS 搜索，统一走侧边栏页签。** `plugin.json` 删除 `studio.toggle`
+  命令、清空 `contributes.tools`、清理 `activationEvents`。`index.js` 删除 overlay 相关
+  逻辑（`cmdToggle` / `mountPanel` / `destroyPanel`），统一为页签模式。
+  **影响**：用户打开内容台的入口从 ⌘SS 搜索改为侧边栏「内容台」页签，更直接。
+- **`search_hits` 逻辑修复。** `plugin_registry.rs` 原逻辑"tools 为空 = 全部命令进搜索"，
+  清空 tools 反而让所有命令出现在 ⌘SS。改为"只有被 tools 显式引用的命令才进搜索"。
+- **`PluginPageInfo` 序列化修复。** Rust 端 snake_case 前端 camelCase，缺
+  `#[serde(rename_all = "camelCase")]`，导致页签点击后 `pluginId=undefined`。已补上。
+- 内容台插件版本 0.3.0 → 0.4.0，命令数 11 → 13（新增 `gen.intel` / `gen.all` /
+  `quick_action`），tools 清零，pages 保持 1。
+- 验证台 harness.mjs 从 111 项扩充到 181 项，新增 `clipboard_read` stub、
+  `chatReplies` 队列、旋钮 quick_action 路由等断言。
+
+### 修复
+
+- **「新建选题」报"没有选中文本"**：根因是 `eo.get_selection()` 的 Ctrl+C 时序陷阱
+  （easyop 切前台后按键发给 easyop 而非原应用）。改为三段式 fallback：
+  输入框有值 → 直接用；`get_selection` 成功 → 用；否则 → `clipboard_read` fallback。
+  错误提示也改为引导用户先复制再点。
+
+---
+
 ## [v0.37.1] — 2026-09-24
 
 ### 修复

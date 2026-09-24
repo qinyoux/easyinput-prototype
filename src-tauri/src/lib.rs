@@ -445,6 +445,7 @@ fn plugins_dir() -> String {
 
 /// 插件页签信息（供前端侧栏动态追加导航项）。
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginPageInfo {
     plugin_id: String,
     page_id: String,
@@ -1360,6 +1361,7 @@ pub fn run() {
             plugin_pages,
             plugin_trigger_activate,
             plugin_host::eo_get_selection,
+            plugin_host::eo_clipboard_read,
             plugin_host::eo_replace_selection,
             plugin_host::eo_inject,
             plugin_host::eo_storage_get,

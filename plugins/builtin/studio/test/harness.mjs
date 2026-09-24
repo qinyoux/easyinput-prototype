@@ -48,6 +48,11 @@ function makeEo(opts) {
       calls.push(["get_selection"]);
       return opts.selection || "";
     },
+    clipboard_read: async () => {
+      calls.push(["clipboard_read"]);
+      if (opts.clipboardThrows) throw new Error(opts.clipboardThrows);
+      return opts.clipboard || "";
+    },
     replace_selection: async (text) => {
       calls.push(["replace_selection", text]);
     },
@@ -69,6 +74,7 @@ function makeEo(opts) {
     chat: async (messages, o) => {
       calls.push(["chat", messages, o]);
       if (opts.chatThrows) throw new Error(opts.chatThrows);
+      if (opts.chatReplies) return opts.chatReplies.shift() ?? "（桩回复）";
       return opts.chatReply ?? "（桩回复）";
     },
     run: async (program, args, o) => {
@@ -120,7 +126,7 @@ async function bootstrap(opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 极简 DOM 桩 —— 只为把「页签渲染」和「⌘SS 浮层挂载」两条路径真跑起来。
+// 极简 DOM 桩 —— 只为把「页签渲染」路径真跑起来。
 //
 // 不追求通用：只实现插件实际用到的方法。querySelector 不做真解析，
 // 而是按 `[data-sp="x"]` 的约定返回一个占位节点——插件只按这个约定取节点，
@@ -216,7 +222,7 @@ async function main() {
   {
     const { commands, calls } = await bootstrap();
     const EXPECTED = [
-      "studio.toggle",
+
       "studio.state",
       "studio.topics.list",
       "studio.topics.save",
@@ -225,8 +231,11 @@ async function main() {
       "studio.gen.title",
       "studio.gen.body",
       "studio.gen.humanize",
+      "studio.gen.intel",
+      "studio.gen.all",
       "studio.export",
       "studio.doctor",
+      "studio.quick_action",
     ];
     for (const id of EXPECTED) check(`注册了 ${id}`, typeof commands[id] === "function");
     check("激活时写了日志", calls.some((c) => c[0] === "log.info"));
@@ -258,6 +267,69 @@ async function main() {
 
     const rmMissing = await commands["studio.topics.remove"]({ id: "nope" });
     check("删不存在的选题报 NO_TOPIC", rmMissing.ok === false && rmMissing.code === "NO_TOPIC");
+  }
+
+  // ── 2b. 剪贴板 fallback：get_selection 失败后读剪贴板 ──────────────
+  console.log("\n②b 剪贴板 fallback（get_selection 空 → clipboard_read）");
+  {
+    const src = readFileSync(join(PLUGIN_DIR, "index.js"), "utf8");
+    check("源码含 clipboard_read fallback", /eo\.clipboard_read/.test(src));
+    check("源码含剪贴板提示文案", /Ctrl\+C/.test(src));
+    check("源码 source=clipboard", /source\s*=\s*['"]clipboard['"]/.test(src));
+
+    const { commands, store, calls } = await bootstrap({
+      selection: "",
+      clipboard: "从外部应用复制的内容",
+    });
+    const r = await commands["studio.topics.save"]({ title: "", source: "selection" });
+    check("空标题 + 空选区 → BAD_ARGS（命令层不 fallback）", r.ok === false);
+    check("命令层不自动调 clipboard_read", !calls.some((c) => c[0] === "clipboard_read"));
+  }
+
+  // ── 2c. 快捷动作 studio.quick_action（旋钮确认） ──────────────────
+  console.log("\n②c 快捷动作 studio.quick_action（旋钮确认）");
+  {
+    // studio_new：从剪贴板取标题
+    const { commands: c1, store: s1 } = await bootstrap({
+      selection: "",
+      clipboard: "旋钮复制的素材",
+    });
+    const r1 = await c1["studio.quick_action"]({ action: "studio_new" });
+    check("studio_new 从剪贴板建选题", r1.ok === true, JSON.stringify(r1));
+    check("studio_new 标题正确", s1.topics?.[0]?.title === "旋钮复制的素材");
+
+    // studio_new：选中文本优先于剪贴板
+    const { commands: c2, store: s2 } = await bootstrap({
+      selection: "选中的文本",
+      clipboard: "剪贴板内容",
+    });
+    const r2 = await c2["studio.quick_action"]({ action: "studio_new" });
+    check("studio_new 优先取选中文本", s2.topics?.[0]?.title === "选中的文本");
+
+    // studio_new：都没有则失败
+    const { commands: c3 } = await bootstrap({ selection: "", clipboard: "" });
+    const r3 = await c3["studio.quick_action"]({ action: "studio_new" });
+    check("studio_new 无文本 → BAD_ARGS", r3.ok === false && r3.code === "BAD_ARGS");
+
+    // studio_pipeline：无当前选题 → NOT_READY
+    const { commands: c4 } = await bootstrap({});
+    const r4 = await c4["studio.quick_action"]({ action: "studio_pipeline" });
+    check("studio_pipeline 无选题 → NOT_READY", r4.ok === false && r4.code === "NOT_READY");
+
+    // studio_advance：有选题 → 调 stage.advance
+    const { commands: c5, store: s5 } = await bootstrap({});
+    await c5["studio.topics.save"]({ title: "测试选题", intel: intel() });
+    const r5 = await c5["studio.quick_action"]({ action: "studio_advance" });
+    check("studio_advance 有选题 → 成功", r5.ok === true, JSON.stringify(r5));
+
+    // 未知动作 → BAD_ARGS
+    const { commands: c6 } = await bootstrap({});
+    const r6 = await c6["studio.quick_action"]({ action: "bogus" });
+    check("未知动作 → BAD_ARGS", r6.ok === false && r6.code === "BAD_ARGS");
+
+    // 缺 action 参数 → BAD_ARGS
+    const r7 = await c6["studio.quick_action"]();
+    check("缺 action → BAD_ARGS", r7.ok === false && r7.code === "BAD_ARGS");
   }
 
   // ── 3. 阶段流转与门禁 ───────────────────────────────────────────────
@@ -373,6 +445,52 @@ async function main() {
     check("去 AI 味成功", h.ok === true, JSON.stringify(h));
     check("算了前后字数", h.data.before === 10 && h.data.after === 10, JSON.stringify(h.data));
     check("阶段推进到 humanized", store.topics[0].stage === "humanized");
+  }
+
+  // ── 4b. 生成情报卡（studio.gen.intel）──────────────────────────────
+  console.log("\n④b 生成情报卡（studio.gen.intel）");
+  {
+    const INTEL_REPLY = JSON.stringify({
+      angle: ["从用户痛点切入", "从技术原理切入"],
+      fact: ["相关设备温升 50℃", "市场占比 30%"],
+      quote: ["某专家说：这是趋势"],
+      risk: ["可能存在争议"],
+    });
+    const { commands, store, calls } = await bootstrap({
+      store: { topics: [{ id: "t1", title: "测试选题", stage: "inspiration", intel: { angle: [], fact: [], quote: [], risk: [] } }] },
+      chatReply: INTEL_REPLY,
+    });
+    const r = await commands["studio.gen.intel"]({ id: "t1" });
+    check("情报卡生成成功", r.ok, JSON.stringify(r));
+    check("返回条数", r.data.count === 6, `count=${r.data.count}`);
+    check("情报落库", store.topics[0].intel.angle.length === 2, JSON.stringify(store.topics[0].intel));
+    check("阶段推进到 intel", store.topics[0].stage === "intel", store.topics[0].stage);
+    check("调了 eo.chat", calls.some((c) => c[0] === "chat"));
+  }
+
+  // ── 4c. 一条龙（studio.gen.all）────────────────────────────────────
+  console.log("\n④c 一条龙（studio.gen.all）");
+  {
+    const INTEL_REPLY = JSON.stringify({
+      angle: ["角度一", "角度二"], fact: ["事实一"], quote: ["金句一"], risk: [],
+    });
+    const { commands, store, calls } = await bootstrap({
+      store: { topics: [{ id: "t1", title: "一条龙测试", stage: "inspiration", intel: { angle: [], fact: [], quote: [], risk: [] } }] },
+      chatReplies: [
+        INTEL_REPLY,                                    // gen.intel
+        "标题一\n标题二\n标题三",                         // gen.title
+        "这是正文内容，足够长的正文用于测试。".repeat(20),  // gen.body
+        "这是去AI味后的正文。".repeat(20),                 // gen.humanize
+      ],
+    });
+    const r = await commands["studio.gen.all"]({ id: "t1" });
+    check("一条龙成功", r.ok, JSON.stringify(r));
+    check("走了 4 步", r.data.steps.length === 4, JSON.stringify(r.data.steps));
+    check("情报卡已生成", store.topics[0].intel.angle.length === 2);
+    check("标题已生成", store.topics[0].titles.length === 3);
+    check("正文已生成", !!(store.topics[0].body || "").trim());
+    check("去AI味已生成", !!(store.topics[0].humanized || "").trim());
+    check("调了 4 次 eo.chat", calls.filter((c) => c[0] === "chat").length === 4);
   }
 
   // ── 5. 导出（eo.run）─────────────────────────────────────────────────
@@ -517,12 +635,15 @@ async function main() {
     check("消息提示手动粘贴", /手动粘贴/.test(r.message || ""), r.message);
   }
 
-  // ── 6. 无 DOM 时 toggle 必须报错 ────────────────────────────────────
-  console.log("\n⑥ 面板挂载边界（Node 无 DOM）");
+  // ── 6. 页签渲染边界 ───────────────────────────────────────────────
+  console.log("\n⑥ 页签渲染边界（无 DOM 时 renderPage 安全跳过）");
   {
-    const { commands } = await bootstrap();
-    const r = await commands["studio.toggle"]();
-    check("无 DOM 时 toggle 返回 NOT_READY（不谎报已打开）", r.ok === false && r.code === "NOT_READY", JSON.stringify(r));
+    const { pages } = await bootstrap({ withPages: true, pagesSink: {} });
+    // 无 document 时 renderPage 应安全跳过，不抛异常
+    delete globalThis.document;
+    const life = pages["studio.board"](null);
+    check("无容器时 renderPage 同步返回 lifecycle", !!life && typeof life === "object");
+    check("无容器时 lifecycle 仍提供 refresh/dispose", typeof life.refresh === "function" && typeof life.dispose === "function");
   }
 
   // ── 7. 契约交叉校验：插件用的 eo.* 必须真实存在 ──────────────────────
@@ -539,6 +660,7 @@ async function main() {
 
     const apiSurface = [
       "get_selection",
+      "clipboard_read",
       "replace_selection",
       "inject",
       "storage",
@@ -552,6 +674,7 @@ async function main() {
     // 宿主侧：pluginHost.ts 里每个 eo 方法对应的 tauri 命令必须存在
     const HOST_CMD = {
       get_selection: "eo_get_selection",
+      clipboard_read: "eo_clipboard_read",
       replace_selection: "eo_replace_selection",
       inject: "eo_inject",
       storage: "eo_storage_get",
@@ -582,6 +705,8 @@ async function main() {
     for (const id of declared) check(`清单声明的 ${id} 真有实现`, typeof commands[id] === "function");
     const impl = Object.keys(commands);
     for (const id of impl) check(`实现的 ${id} 已在清单声明`, declared.includes(id));
+    check("tools 为空（studio 走页签，不进 ⌘SS）", Array.isArray(mf.contributes.tools) && mf.contributes.tools.length === 0);
+    check("studio.toggle 不在命令里（已移除）", !declared.includes("studio.toggle"));
     for (const t of mf.contributes.tools) {
       check(`tools 引用的 ${t.command} 已声明`, declared.includes(t.command));
     }
@@ -653,8 +778,7 @@ async function main() {
     const panelRoot = container.children[0];
     check("渲染后容器里挂上了面板根节点", !!panelRoot);
     check("面板根节点带 data-studio=panel", !!panelRoot && panelRoot.getAttribute("data-studio") === "panel");
-    check("页签模式标记 data-studio-mode=page", !!panelRoot && panelRoot.getAttribute("data-studio-mode") === "page");
-    check("页签模式带 is-page class", !!panelRoot && /is-page/.test(panelRoot.className), panelRoot && panelRoot.className);
+    check("面板根节点 class 为 studio-panel", !!panelRoot && panelRoot.className === "studio-panel", panelRoot && panelRoot.className);
     check("样式注入进了 document.head", dom.head.children.length > 0);
     check("P3 容器仍是面板根节点的父节点（未被移走）", !!panelRoot && panelRoot.parentNode === container);
 
@@ -668,29 +792,10 @@ async function main() {
     check("dispose 后容器被清空", container.children.length === 0);
     check("dispose 后样式也从 head 摘除", dom.head.children.length === 0, `head=${dom.head.children.length}`);
 
-    // —— ⌘SS 浮层回归：页签改造不能把老路径搞坏 ——
-    const r1 = await commands["studio.toggle"]();
-    check("⌘SS 浮层仍能打开", r1.ok && r1.data.open === true, JSON.stringify(r1));
-    const overlay = dom.body.children[0];
-    check("浮层用 .studio-overlay 包装承担定位", !!overlay && /studio-overlay/.test(overlay.className), overlay && overlay.className);
-    check(
-      "浮层内层面板不带 is-page（两种模式共用同一份 DOM）",
-      !!overlay && overlay.children[0] && !/is-page/.test(overlay.children[0].className),
-      overlay && overlay.children[0] && overlay.children[0].className,
-    );
-    const r2 = await commands["studio.toggle"]();
-    check("再 toggle 一次收起浮层", r2.ok && r2.data.open === false, JSON.stringify(r2));
-    check("收起后 body 里不留浮层残骸", dom.body.children.length === 0, `body=${dom.body.children.length}`);
-
-    // —— P2：静态扫描，position:fixed 只允许挂在浮层包装类上 ——
+    // —— P2：页签面板不得用 position:fixed（会脱离宿主布局） ——
     const src = readFileSync(join(PLUGIN_DIR, "index.js"), "utf8");
-    const fixedOwners = [...src.matchAll(/\.([a-z][a-z0-9-]*)\s*\{[^}]*position:\s*fixed/gi)].map((m) => m[1]);
-    check(
-      "position:fixed 只挂在 .studio-overlay 上",
-      fixedOwners.every((c) => c === "studio-overlay"),
-      fixedOwners.join(",") || "(无)",
-    );
-    check("页签面板类 .studio-panel 自身无 fixed", !/\.studio-panel\s*\{[^}]*position:\s*fixed/.test(src));
+    check("面板样式无 position:fixed", !/\.studio-panel\s*\{[^}]*position:\s*fixed/.test(src));
+    check("源码无 .studio-overlay 残留", !/studio-overlay/.test(src));
 
     // —— 契约文档在位 ——
     check("契约文档存在", existsSync(join(REPO, "docs", "路径A-插件页签接口契约.md")));

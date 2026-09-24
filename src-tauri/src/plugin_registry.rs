@@ -47,8 +47,8 @@ pub struct CommandDecl {
 
 /// `contributes.tools[]`：把某个命令挂进 ⌘SS 面板的「内置工具」区。
 ///
-/// 一个插件若声明了 `tools`，则**只有被 tools 引用的命令**会进搜索；
-/// 若没声明 tools，则它的全部命令都可被搜到（title + keywords）。
+/// 只有被 `tools` 显式引用的命令才进 ⌘SS 搜索。
+/// `tools` 为空 = 作者明确表示没有命令需要进搜索（插件走页签等其他入口）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDecl {
     /// 指向同插件内已声明的命令 id。
@@ -410,14 +410,14 @@ pub fn search_hits(query_lower: &str) -> Vec<PluginHit> {
 
     for p in g.iter() {
         let cs = &p.manifest.contributes;
-        let has_tools = !cs.tools.is_empty();
+
 
         for cmd in &cs.commands {
             let tool = cs.tools.iter().find(|t| t.command == cmd.id);
 
-            // 有 tools 声明的插件：只有被声明为 tool 的命令进搜索（作者显式选择了哪些该出现）；
-            // 没有 tools 的插件：全部命令都可搜到。
-            if has_tools && tool.is_none() {
+            // 只有被 tools 显式引用的命令才进 ⌘SS 搜索。
+            // tools 为空 = 作者明确表示没有命令需要进搜索（插件走页签等其他入口）。
+            if tool.is_none() {
                 continue;
             }
 
@@ -610,6 +610,40 @@ mod tests {
         assert_eq!(search_hits("nihao").len(), 1, "关键词应命中");
         assert_eq!(search_hits("打招呼").len(), 1, "标题应命中");
         assert_eq!(search_hits("zzz").len(), 0, "无关词不应命中");
+
+        *store().lock().unwrap() = vec![];
+    }
+
+    /// tools 为空时，命令不进 ⌘SS 搜索（插件走页签等其他入口）。
+    #[test]
+    fn search_hits_empty_tools_no_search() {
+        let plugin = LoadedPlugin {
+            manifest: PluginManifest {
+                id: "solo".to_string(),
+                name: "独立".to_string(),
+                version: None,
+                main: "index.js".to_string(),
+                activation_events: vec![],
+                contributes: Contributes {
+                    commands: vec![CommandDecl {
+                        id: "solo.run".to_string(),
+                        title: "跑起来".to_string(),
+                        keywords: vec!["paoqi".to_string()],
+                    }],
+                    tools: vec![],
+                    pages: vec![],
+                },
+                capabilities: vec![],
+                description: None,
+            },
+            dir: PathBuf::from("."),
+            builtin: false,
+        };
+        *store().lock().unwrap() = vec![plugin];
+
+        assert_eq!(search_hits("paoqi").len(), 0, "tools 为空时关键词不应命中");
+        assert_eq!(search_hits("跑起来").len(), 0, "tools 为空时标题不应命中");
+        assert_eq!(search_hits("独立").len(), 0, "tools 为空时插件名不应命中");
 
         *store().lock().unwrap() = vec![];
     }

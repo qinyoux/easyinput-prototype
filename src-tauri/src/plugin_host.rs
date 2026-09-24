@@ -86,6 +86,14 @@ pub async fn eo_get_selection() -> Result<String, String> {
         .map_err(|e| format!("get_selection 失败: {e}"))?
 }
 
+/// 读系统剪贴板当前文本内容。
+#[tauri::command]
+pub async fn eo_clipboard_read() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| clipboard_util::read_clipboard())
+        .await
+        .map_err(|e| format!("clipboard_read 失败: {e}"))?
+}
+
 /// 替换选中文本。
 #[tauri::command]
 pub async fn eo_replace_selection(text: String) -> Result<(), String> {

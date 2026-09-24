@@ -100,6 +100,15 @@ pub const UUID_SS_PALETTE: &str = "00000000-0000-4000-8000-000000000008";
 /// 匹配，换段只在运行期表现为"按键没反应"。
 pub const UUID_CLI_TERMINAL: &str = "00000000-0000-4000-8000-00000000000d";
 
+/// 主机端「内容台」旋钮导航的保留 UUID。
+///
+/// 与浮窗工作台同构：旋钮左旋/右旋在功能列表间切换焦点，
+/// 按下确认执行当前高亮的功能。焦点状态由主机端 `host_action.rs` 维护。
+/// 固件不认识这些语义，只当作普通 host_action 回发。
+pub const UUID_STUDIO_PREV: &str = "00000000-0000-4000-8000-00000000000e";
+pub const UUID_STUDIO_NEXT: &str = "00000000-0000-4000-8000-00000000000f";
+pub const UUID_STUDIO_CONFIRM: &str = "00000000-0000-4000-8000-000000000010";
+
 /// Agent 任务台的槽位按键保留 UUID。
 ///
 /// # 为什么任务台按键必须借 `host_action` 通道
@@ -257,6 +266,32 @@ pub const NAMED_ACTIONS: &[&str] = &[
     "ss_palette",
     // ---- easyop 主机端专有（启动终端并预置命令）----
     "cli_terminal",
+    // ---- easyop 主机端专有（内容台旋钮导航）----
+    "studio_prev",
+    "studio_next",
+    "studio_confirm",
+];
+
+/// 内容台旋钮导航的功能列表（按焦点顺序排列）。
+///
+/// 旋钮左旋/右旋在此列表间循环切换焦点，按下确认时，
+/// 主机端按当前焦点索引 emit `studio-action` 事件，
+/// 前端收到后调 studio 插件的 `studio.quick_action` 命令执行对应功能。
+pub const STUDIO_ACTION_IDS: &[&str] = &[
+    "studio_new",
+    "studio_pipeline",
+    "studio_advance",
+    "studio_export",
+    "studio_wechat",
+];
+
+/// 内容台功能列表的中文标签（与 `STUDIO_ACTION_IDS` 一一对应）。
+pub const STUDIO_ACTION_LABELS: &[&str] = &[
+    "新建选题",
+    "一条龙",
+    "推进阶段",
+    "导出",
+    "+公众号",
 ];
 
 /// 修饰键 token 白名单（`normalize` 后：去掉空格/下划线/连字符、转小写）。

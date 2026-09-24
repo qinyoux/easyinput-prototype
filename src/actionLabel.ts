@@ -1,6 +1,6 @@
 // 动作标签与分组：把 ActionSpec 翻译成界面可读的名称与类型分组。
 // 磁贴工作台、侧栏筛选、⌘SS 命令面板都从这里取标签，避免各处重复一份映射。
-import { ACTION_KIND_LABELS, DESK_SLOT_OPTIONS, NAMED_ACTION_LABELS, WORKBENCH_ACTIONS, SS_PALETTE_ACTIONS, CLI_TERMINAL_ACTIONS, KEY_UI } from "./constants";
+import { ACTION_KIND_LABELS, DESK_SLOT_OPTIONS, NAMED_ACTION_LABELS, WORKBENCH_ACTIONS, SS_PALETTE_ACTIONS, CLI_TERMINAL_ACTIONS, STUDIO_ACTIONS, KEY_UI } from "./constants";
 import type { ActionSpec, AppEntry, Profile } from "./types";
 
 /** 侧栏的动作类型筛选维度。「all」是聚合视图，其余各自对应一种动作类型。 */
@@ -10,6 +10,7 @@ export type ActionGroup =
   | "workbench"
   | "ss_palette"
   | "terminal"
+  | "studio"
   | "desk"
   | "voice"
   | "hotkey"
@@ -24,6 +25,7 @@ export const ACTION_GROUPS: { id: ActionGroup; label: string }[] = [
   { id: "workbench", label: "提示词库" },
   { id: "ss_palette", label: "⌘SS 命令面板" },
   { id: "terminal", label: "启动终端" },
+  { id: "studio", label: "内容台" },
   { id: "voice", label: "语音" },
   { id: "hotkey", label: "组合键" },
   { id: "text", label: "文本" },
@@ -41,6 +43,7 @@ export function groupOf(action: ActionSpec): ActionGroup {
       if (WORKBENCH_ACTIONS.includes(action.value)) return "workbench";
       if (SS_PALETTE_ACTIONS.includes(action.value)) return "ss_palette";
       if (CLI_TERMINAL_ACTIONS.includes(action.value)) return "terminal";
+      if (STUDIO_ACTIONS.includes(action.value)) return "studio";
       return VOICE_NAMED.includes(action.value) ? "voice" : "named";
     case "hotkey":
       return "hotkey";

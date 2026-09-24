@@ -1,7 +1,8 @@
 # easyop 插件目录
 
-一个子目录 = 一个插件。easyop 启动时扫 `plugin.json`，把插件声明的**命令**读进注册表，
-使它们出现在 ⌘SS 搜索结果里；命令被触发时由 `plugin_host` 激活并执行 `index.js`。
+一个子目录 = 一个插件。easyop 启动时扫 `plugin.json`，把插件声明的**命令**和**页签**读进注册表。
+声明了 `contributes.pages` 的插件会出现在侧边栏；声明了 `contributes.tools` 的插件命令会出现在 ⌘SS 搜索结果里。
+命令被触发时由 `plugin_host` 激活并执行 `index.js`。
 
 ## 目录约定
 
@@ -28,7 +29,7 @@ npm run plugins:deploy -- studio   # 只装某个（按需）
 npm run plugins:deploy -- --dry    # 只演练
 ```
 
-装完重启 easyop（或在插件管理页点刷新 → `plugins_rescan`），然后 ⌘SS 搜关键词。
+装完重启 easyop（或在插件管理页点刷新 → `plugins_rescan`），然后侧边栏点页签（声明了 `tools` 的插件还可从 ⌘SS 搜关键词进入）。
 
 > 长期方案是让 easyop 直接把 `builtin/` 也扫进来（或 `tauri.conf.json` 打包 `resources`），
 > 那样就不需要这一步。当前是权宜。
@@ -50,7 +51,10 @@ npm run plugins:deploy -- --dry    # 只演练
 ### 搜索可见性规则
 
 - 声明了 `tools` → **只有被 `tools` 引用的命令**进 ⌘SS 搜索；
-- 没声明 `tools` → 全部命令都可搜到（按 `title` + `keywords`）。
+- 没声明 `tools`（或 `tools` 为空）→ **不进 ⌘SS 搜索**（走页签入口）。
+
+> v0.38.0 起逻辑反转：原先"tools 为空 = 全部可搜"，清空 tools 反而让所有命令进搜索。
+> 现改为"只有被 tools 显式引用的命令才进搜索"。内容台已清空 tools，统一走侧边栏页签。
 
 ### 校验（加载期即挡，不留到执行期）
 
@@ -73,6 +77,7 @@ npm run plugins:deploy -- --dry    # 只演练
 | `eo.log.info/warn/error(msg)` | `eo_log_*` | ✅ |
 | `eo.chat(messages, opts)` | `eo_chat` | ✅ 非流式（`opts`: `system` / `temperature` / `max_tokens` / `clean`） |
 | `eo.run(program, args, opts)` | `eo_run` | ✅（`opts`: `timeoutSecs` / `cwd`；返回 `exit_code` / `stdout` / `stderr` / `timed_out` / `cancelled`） |
+| `eo.clipboard_read()` | `eo_clipboard_read` | ✅ 读系统剪贴板文本（v0.38.0 新增，作为 `get_selection` 的 fallback） |
 
 `context` 还带：`pluginId` / `pluginDir`（插件目录绝对路径，用于定位自带脚本）/ `registerCommand(id, fn)`。
 
@@ -83,12 +88,12 @@ npm run plugins:deploy -- --dry    # 只演练
 | `eo.fs.write` / `paths` | 插件**无法自己写文件** | 自写脚本 + `eo.run`（内容台就是这么绕的） |
 | `eo.panel.open` | 插件**开不了独立窗口**，UI 只能挂主窗浮层 | 主窗内 DOM 浮层（内容台面板） |
 | `eo.chat_stream` | 拿不到流式增量 | `eo.chat` 一次性返回 |
-| `eo.reveal` / `eo.search` / `eo.clipboard_*` | 打开产物目录 / 搜文件 / 剪贴板 | 无 |
-| `eo.dispatch_action` | 插件动作绑不到物理键 | `contributes.keyActions` 也还没消费 |
+| `eo.reveal` / `eo.search` | 打开产物目录 / 搜文件 | 无 |
+| `eo.dispatch_action` | 插件动作绑不到物理键 | `contributes.keyActions` 也还没消费（内容台旋钮走宿主 UUID 通道绕过） |
 | `eo.config` | 插件**读不到 easyop 配置**（ASR / 按键方案 / 应用库） | 只能硬编码路径 |
 
-> 也就是说：《内容台规范》§2.1 列的 11 项"继承"，目前真兑现的是 **6 项**
-> （LLM / 选中文本 / 文本注入 / 日志 / 子进程 / 本地存储）。
+> 也就是说：《内容台规范》§2.1 列的 11 项"继承"，目前真兑现的是 **7 项**
+> （LLM / 选中文本 / 文本注入 / 日志 / 子进程 / 本地存储 / 剪贴板读）。
 
 ## 进度
 
@@ -105,7 +110,7 @@ npm run plugins:deploy -- --dry    # 只演练
 1. `plugins/builtin/<id>/plugin.json` + `index.js`（`export function activate(context){}`）；
 2. `npm run plugins:deploy -- <id>`；
 3. `npm run plugins:test`（如果你照内容台建了 `test/harness.mjs`）；
-4. 重启 easyop → ⌘SS 搜关键词 → 回车。
+4. 重启 easyop → 侧边栏点页签（或 ⌘SS 搜关键词，如果声明了 tools）。
 
 **入口文件必须自包含**：宿主用 `blob:` URL 动态 `import()`，blob 模块里**不能再 import 相对路径**
 的文件。要拆多文件就先打包成单文件产物再放进插件目录。

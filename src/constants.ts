@@ -42,6 +42,10 @@ export const NAMED_ACTION_LABELS: Record<string, string> = {
   ss_palette: "⌘SS 命令面板",
   // 启动终端并预置命令（easyop 主机端专有动作）
   cli_terminal: "启动终端",
+  // 内容台旋钮导航（easyop 主机端专有动作）
+  studio_prev: "内容台 · 上一项",
+  studio_next: "内容台 · 下一项",
+  studio_confirm: "内容台 · 确认",
 };
 
 /** 提示词库相关的具名动作 ID，界面分组与提示文案都以此为准。 */
@@ -62,6 +66,13 @@ export const CLI_TERMINAL_ACTION = "cli_terminal";
 
 /** 上者的数组形式，供分组判断复用同一份 ID。 */
 export const CLI_TERMINAL_ACTIONS: string[] = [CLI_TERMINAL_ACTION];
+
+/** 内容台旋钮导航相关的具名动作 ID。 */
+export const STUDIO_ACTIONS: string[] = [
+  "studio_prev",
+  "studio_next",
+  "studio_confirm",
+];
 
 /** 动作类型的中文名，用于类型选择下拉。 */
 export const ACTION_KIND_LABELS: Record<string, string> = {

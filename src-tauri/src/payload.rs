@@ -26,6 +26,9 @@ pub fn reserved_uuid_for_named(name: &str) -> Option<&'static str> {
         "workbench_confirm" => Some(UUID_WORKBENCH_CONFIRM),
         "ss_palette" => Some(UUID_SS_PALETTE),
         "cli_terminal" => Some(UUID_CLI_TERMINAL),
+        "studio_prev" => Some(UUID_STUDIO_PREV),
+        "studio_next" => Some(UUID_STUDIO_NEXT),
+        "studio_confirm" => Some(UUID_STUDIO_CONFIRM),
         _ => None,
     }
 }
@@ -44,6 +47,9 @@ pub fn named_for_reserved_uuid(uuid: &str) -> Option<&'static str> {
         UUID_WORKBENCH_CONFIRM => Some("workbench_confirm"),
         UUID_SS_PALETTE => Some("ss_palette"),
         UUID_CLI_TERMINAL => Some("cli_terminal"),
+        UUID_STUDIO_PREV => Some("studio_prev"),
+        UUID_STUDIO_NEXT => Some("studio_next"),
+        UUID_STUDIO_CONFIRM => Some("studio_confirm"),
         _ => None,
     }
 }

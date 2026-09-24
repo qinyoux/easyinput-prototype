@@ -124,6 +124,8 @@ async function runPlugin(
   const eo = {
     get_selection: () =>
       timed(pluginId, "get_selection", () => invoke<string>("eo_get_selection")),
+    clipboard_read: () =>
+      timed(pluginId, "clipboard_read", () => invoke<string>("eo_clipboard_read")),
     replace_selection: (text: string) =>
       timed(pluginId, "replace_selection", () => invoke<void>("eo_replace_selection", { text })),
     inject: (text: string) =>
@@ -258,4 +260,21 @@ export function getPluginPageRenderer(
   pageId: string,
 ): ((container: HTMLElement) => PageLifecycle) | undefined {
   return pageRenderers.get(`${pluginId}:${pageId}`);
+}
+/**
+ * 从外部调用已激活插件的已注册命令（供事件监听器等使用）。
+ *
+ * 与 `execCommand` 不同：不走初始激活流程，直接查 `activatedPlugins` 表。
+ * 命令函数签名是 `(args?) => Promise<unknown>`，args 透传给插件。
+ */
+export async function invokePluginCommand(
+  pluginId: string,
+  commandId: string,
+  args?: unknown,
+): Promise<unknown | undefined> {
+  const commands = activatedPlugins.get(pluginId);
+  if (!commands) return undefined;
+  const fn = commands[commandId] as ((args?: unknown) => Promise<unknown>) | undefined;
+  if (!fn) return undefined;
+  return fn(args);
 }

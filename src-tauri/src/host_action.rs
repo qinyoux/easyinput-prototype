@@ -10,7 +10,7 @@
 //! - 普通 UUID → 在应用库中解析并打开本机目标。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -18,8 +18,9 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::constants::{
-    HOST_ACTION_V1_HEADER_LEN, KIND_HOST_ACTION, REPORT_ID_APP_COMMAND, UUID_NEXT_PROFILE,
-    UUID_PREVIOUS_PROFILE, UUID_TOGGLE_PROFILE,
+    HOST_ACTION_V1_HEADER_LEN, KIND_HOST_ACTION, REPORT_ID_APP_COMMAND, STUDIO_ACTION_IDS,
+    STUDIO_ACTION_LABELS, UUID_NEXT_PROFILE, UUID_PREVIOUS_PROFILE, UUID_STUDIO_CONFIRM,
+    UUID_STUDIO_NEXT, UUID_STUDIO_PREV, UUID_TOGGLE_PROFILE,
 };
 use crate::device;
 use crate::launcher;
@@ -164,6 +165,9 @@ fn try_open_all() -> Vec<windows::Win32::Foundation::HANDLE> {
     handles
 }
 
+/// 内容台旋钮导航的焦点索引（0-based，在 `STUDIO_ACTION_IDS` 中循环）。
+static STUDIO_FOCUS: AtomicU8 = AtomicU8::new(0);
+
 fn handle_host_action(
     app: &AppHandle,
     apps: &Arc<RwLock<Vec<AppEntry>>>,
@@ -272,6 +276,40 @@ fn handle_host_action(
                 serde_json::json!({ "uuid": uuid2, "message": message, "ok": ok }),
             );
         });
+        return;
+    }
+
+    // 3.8. 保留 UUID：内容台旋钮导航（prev/next/confirm）。
+    //
+    // 与浮窗工作台同构：左旋/右旋在功能列表间循环切换焦点，
+    // 按下确认时 emit `studio-action` 事件给前端，前端调插件命令执行。
+    // 焦点状态由 `STUDIO_FOCUS`（AtomicU8）维护，进程生命周期内持久。
+    if uuid == UUID_STUDIO_PREV || uuid == UUID_STUDIO_NEXT {
+        let count = STUDIO_ACTION_IDS.len() as u8;
+        let cur = STUDIO_FOCUS.load(Ordering::Relaxed);
+        let next = if uuid == UUID_STUDIO_PREV {
+            (cur + count - 1) % count
+        } else {
+            (cur + 1) % count
+        };
+        STUDIO_FOCUS.store(next, Ordering::Relaxed);
+        let label = STUDIO_ACTION_LABELS.get(next as usize).copied().unwrap_or("?");
+        log_buffer::info(format!("内容台焦点 → {next}：{label}"));
+        let _ = app.emit("studio-focus", serde_json::json!({
+            "index": next,
+            "label": label,
+        }));
+        return;
+    }
+    if uuid == UUID_STUDIO_CONFIRM {
+        let cur = STUDIO_FOCUS.load(Ordering::Relaxed);
+        let action = STUDIO_ACTION_IDS.get(cur as usize).copied().unwrap_or("studio_new");
+        let label = STUDIO_ACTION_LABELS.get(cur as usize).copied().unwrap_or("?");
+        log_buffer::info(format!("内容台确认 → {action}（{label}）"));
+        let _ = app.emit("studio-action", serde_json::json!({
+            "action": action,
+            "label": label,
+        }));
         return;
     }
 

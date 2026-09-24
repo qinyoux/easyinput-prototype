@@ -59,6 +59,22 @@ pub fn get_selected_text() -> Result<String, String> {
     }
 }
 
+/// 读系统剪贴板当前文本内容。
+///
+/// 与 `get_selected_text` 不同：不模拟 Ctrl+C，直接读剪贴板当前内容。
+/// 用于用户已手动 Ctrl+C 复制后，fallback 取剪贴板文本。
+pub fn read_clipboard() -> Result<String, String> {
+    unsafe {
+        open_clipboard(10)?;
+        let text = read_clipboard_text();
+        let _ = CloseClipboard();
+        match text {
+            Some(t) if !t.is_empty() => Ok(t),
+            _ => Err("剪贴板为空".to_string()),
+        }
+    }
+}
+
 /// 替换当前选中文本：设置新文本到剪贴板 → 模拟 Ctrl+V。
 ///
 /// 调用前需确保目标应用中仍有选区（用户在 LLM 处理期间不应移动光标）。

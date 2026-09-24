@@ -1,22 +1,14 @@
 {
   "id": "studio",
   "name": "内容台",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "easyop 的内容生产工作台：选题台账 → AI 生成（标题/正文/去AI味）→ 导出成品包。随 easyop 发布的内置插件。",
   "main": "index.js",
   "activationEvents": [
-    "onCommand:studio.toggle",
-    "onPage:studio.board",
-    "onKeyword:内容台",
-    "onKeyword:选题"
+    "onPage:studio.board"
   ],
   "contributes": {
     "commands": [
-      {
-        "id": "studio.toggle",
-        "title": "打开内容台",
-        "keywords": ["内容台", "studio", "neirongtai", "写稿", "看板", "nrt"]
-      },
       {
         "id": "studio.state",
         "title": "内容台状态",
@@ -58,6 +50,16 @@
         "keywords": ["去ai味", "humanize", "润色", "runse", "rs"]
       },
       {
+        "id": "studio.gen.intel",
+        "title": "生成情报卡",
+        "keywords": ["情报卡", "生成", "qingbaoka", "qb"]
+      },
+      {
+        "id": "studio.gen.all",
+        "title": "一条龙生成",
+        "keywords": ["一条龙", "全自动", "yitiaolong", "yt"]
+      },
+      {
         "id": "studio.export",
         "title": "导出成品包",
         "keywords": ["导出", "export", "daochu", "dc", "排版", "公众号", "wechat"]
@@ -66,35 +68,14 @@
         "id": "studio.doctor",
         "title": "内容台自检",
         "keywords": ["自检", "环境", "doctor", "zijan", "zj"]
+      },
+      {
+        "id": "studio.quick_action",
+        "title": "快捷动作（旋钮确认）",
+        "keywords": ["快捷", "旋钮", "quick", "kuaijie", "kj"]
       }
     ],
-    "tools": [
-      {
-        "command": "studio.toggle",
-        "subtitle": "选题 → 生成 → 导出的工作台",
-        "keywords": ["内容台", "studio", "neirongtai", "写稿", "nrt"]
-      },
-      {
-        "command": "studio.gen.title",
-        "subtitle": "为当前选题生成 3 个标题候选",
-        "keywords": ["标题", "biaoti", "bt"]
-      },
-      {
-        "command": "studio.gen.body",
-        "subtitle": "为当前选题生成正文",
-        "keywords": ["正文", "zhengwen", "zw"]
-      },
-      {
-        "command": "studio.export",
-        "subtitle": "导出稿件并按需生成投放包",
-        "keywords": ["导出", "daochu", "dc", "排版"]
-      },
-      {
-        "command": "studio.doctor",
-        "subtitle": "检查 Python / pub.py / 目录是否就位",
-        "keywords": ["自检", "doctor", "zijan"]
-      }
-    ],
+    "tools": [],
     "pages": [
       {
         "id": "studio.board",
