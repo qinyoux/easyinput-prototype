@@ -46,6 +46,55 @@ use super::unread::{Lease, LeaseError, UnreadLedger, UnreadPersist, UnreadSnapsh
 /// 也给多 agent 协作增加无谓的冲突面。
 pub const UNREAD_FILE: &str = "agent_desk_unread.json";
 
+/// 运行时三态灯。
+///
+/// # 为什么判据必须在后端
+///
+/// 「什么算积压」「什么算运行中」是**业务判据**，不是渲染细节。若让前端从
+/// `busy` / `idle` / `queue.total_pending` 自己推，同一套判据就有了两份实现 ——
+/// 日后后端把"排队中"的定义一改，前端那份不会跟着动，界面会**静默地**显示错误档位。
+/// 这个项目在"字幕浮层显隐"上已经吃过一次完全一样的亏（前端又按状态推导了一遍），
+/// 所以这里直接定成契约：**后端给档位，前端只做颜色与文案映射**。
+///
+/// # 为什么是三档而不是"忙 / 闲"两档
+///
+/// | 档位 | 含义 | 为什么值得单独一档 |
+/// |---|---|---|
+/// | [`Idle`](LightState::Idle) | 没在跑、也没排队 | 正常待命 |
+/// | [`Running`](LightState::Running) | 有任务正在执行 | 引擎在干活，排队是正常深度 |
+/// | [`Backlog`](LightState::Backlog) | **有积压，却没有任何任务在跑** | 最该被看见的一档：它不正常 |
+///
+/// `Backlog` 就是原本"`busy == false` 而 `idle == false`"那个组合。在平铺计数器里，
+/// 它表现为两个各自为真、加起来却自相矛盾的词（"第 5 颗灯：灭" + "空闲：否"），
+/// 用户得逐条读、还要自己把两条拼起来才知道该不该管 —— 这正是**颜色一望即知、
+/// 文字说不清**的典型场景。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightState {
+    Idle,
+    Running,
+    Backlog,
+}
+
+impl LightState {
+    /// 由队列的两个计数推档位。
+    ///
+    /// **纯函数**，不碰任何状态 —— 所以整个灯语可以被单测直接钉住，
+    /// 而不必去搭一个"跑到一半"的队列。
+    ///
+    /// 优先级刻意是 `Running` 高于 `Backlog`：同时存在"在跑的"和"排队的"时，
+    /// 引擎正在工作，排队只是正常深度，**不是**需要用户处理的信号。
+    pub fn from_queue(running_count: usize, total_pending: usize) -> Self {
+        if running_count > 0 {
+            LightState::Running
+        } else if total_pending > 0 {
+            LightState::Backlog
+        } else {
+            LightState::Idle
+        }
+    }
+}
+
 /// 统一快照。
 ///
 /// `PartialEq` 是**核心机制**：只有它逐字段可比较，事件层才能判断"状态真的变了吗"，
@@ -55,12 +104,18 @@ pub const UNREAD_FILE: &str = "agent_desk_unread.json";
 pub struct RuntimeSnapshot {
     pub queue: QueueSnapshot,
     pub unread: UnreadSnapshot,
+    /// 三态灯档位（判据见 [`LightState`]）。UI 直接拿它选颜色与结论句。
+    pub light: LightState,
     /// 是否有任务正在执行（第 5 颗灯的另一个视角）。
+    ///
+    /// 与 `light` 重叠但**不替代**：`light` 是给界面看的语义档位，
+    /// 而这个布尔是给"第 5 颗灯"那种底层灯效用的原始输入。两者回答的问题不同 ——
+    /// 一个问"现在整体是什么状态"，一个问"此刻有没有东西在跑"。
     pub busy: bool,
     /// 是否完全空闲（既没在跑，也没有排队）。
     ///
     /// 与 `!busy` **不等价**：有积压但还没开始跑时 `busy == false` 而 `idle == false`。
-    /// UI 要区分这两种情形——前者是"待命"，后者是"正在消化积压"。
+    /// 这个组合现在由 `light == Backlog` 承载 —— 保留 `idle` 是为了不破坏既有消费者。
     pub idle: bool,
     /// 是否有任何未读（灯语的总开关）。
     pub any_unread: bool,
@@ -123,6 +178,7 @@ impl DeskRuntime {
         let queue = self.queue.snapshot();
         let unread = self.unread.snapshot();
         RuntimeSnapshot {
+            light: LightState::from_queue(queue.running_count, queue.total_pending),
             busy: queue.running_count > 0,
             idle: self.queue.is_idle(),
             any_unread: unread.total_pending > 0,
@@ -433,6 +489,54 @@ mod tests {
         assert_eq!(s.queue.running_count, 0);
         assert!(!s.busy, "没有任务在跑");
         assert!(!s.idle, "但队列里有东西，不算空闲");
+        // 灯语把上面这个"既不忙也不空闲"的组合收成了**一个**档位。
+        assert_eq!(s.light, LightState::Backlog);
+    }
+
+    // -----------------------------------------------------------------------
+    // 三态灯（红绿灯）
+    // -----------------------------------------------------------------------
+
+    /// 「什么算积压」的完整定义。**这四条断言就是整个灯语** ——
+    /// 前端只做颜色映射，不重推判据，所以这里错了界面上不会有人发现。
+    #[test]
+    fn light_state_covers_the_three_real_situations() {
+        // 没在跑、也没排队 ⇒ 空闲。
+        assert_eq!(LightState::from_queue(0, 0), LightState::Idle);
+
+        // 在跑 ⇒ 运行中。**哪怕还有积压也是运行中**：引擎在干活，
+        // 排队只是正常深度，不该被报成"需要处理"。
+        assert_eq!(LightState::from_queue(1, 0), LightState::Running);
+        assert_eq!(LightState::from_queue(2, 5), LightState::Running);
+
+        // 有积压却没人跑 ⇒ 积压。这是唯一"不正常"的一档。
+        assert_eq!(LightState::from_queue(0, 3), LightState::Backlog);
+    }
+
+    /// 序列化名是**前端契约**：改这里等于改 API，前端 `LightState` 必须同步。
+    #[test]
+    fn light_state_serializes_as_snake_case() {
+        let j = |s: LightState| serde_json::to_string(&s).unwrap();
+        assert_eq!(j(LightState::Idle), "\"idle\"");
+        assert_eq!(j(LightState::Running), "\"running\"");
+        assert_eq!(j(LightState::Backlog), "\"backlog\"");
+    }
+
+    /// 灯档位是**真变化**的一部分：从空闲到积压，事件必须发得出去。
+    ///
+    /// 这条守的是"灯会自己变" —— 若把 `light` 从 `RuntimeSnapshot` 的比较里漏掉，
+    /// 界面上的灯就会停在旧档位不动，而其它字段看起来一切正常。
+    #[test]
+    fn light_change_alone_triggers_an_event() {
+        let mut r = rt();
+        assert!(r.snapshot_if_changed().is_some());
+        assert_eq!(r.snapshot().light, LightState::Idle);
+
+        // 只入队、不启动 ⇒ 空闲 → 积压。除了 light（与派生它的 total_pending），
+        // 没有任何别的东西变。
+        r.queue_mut().enqueue(0, "排队中", "d1", 1_000).unwrap();
+        let s = r.snapshot_if_changed().expect("灯档位变了就必须发事件");
+        assert_eq!(s.light, LightState::Backlog);
     }
 
     #[test]

@@ -67,6 +67,8 @@
   --ok-rgb: 53, 194, 138;
   --ok-strong: #1f8a63;
   --warn: #f5b544;
+  /* 黄的分量通道：三态灯的光晕要用 rgba() 调透明度，而 hex 没法直接塞进 rgba()。 */
+  --warn-rgb: 245, 181, 68;
   --err: #ff5a6e;
   --err-rgb: 255, 90, 110;
   --err-strong: #b23b4a;
@@ -117,6 +119,7 @@
   --ok-rgb: 21, 128, 61;
   --ok-strong: #166534;
   --warn: #b45309;
+  --warn-rgb: 180, 83, 9;
   --err: #dc2626;
   --err-rgb: 220, 38, 38;
   --err-strong: #b91c1c;
@@ -3726,6 +3729,133 @@ body {
 
 .collapsible-inline-btn:hover {
   color: var(--accent-text);
+}
+
+/* ---------------------------------------------------------------------------
+   任务台运行时三态灯（红绿灯）
+   ---------------------------------------------------------------------------
+   把"现在到底行不行"从 7 个平铺计数器压成一眼。颜色一律走主题变量
+   （--ok 绿 / --warn 黄 / --accent 橙），深浅两主题自动适配，不写死色值。
+
+   为什么"运行中"用橙（品牌强调色）而不是红：红灯在中文语境里读作"坏了"，
+   而"有任务在跑"恰恰是系统最正常的时刻 —— 给它点红灯，人会去排查一个不存在的问题。
+
+   光晕颜色靠 `--glow-rgb` 按档位切换，**不能在 keyframes 里写死 accent** ——
+   否则"有积压"那档会闪出橙光，两档的动画就分不出来了。
+*/
+.desk-light {
+  --glow-rgb: var(--border-rgb);
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-2);
+}
+
+.desk-light.light-idle {
+  --glow-rgb: var(--ok-rgb);
+}
+.desk-light.light-running {
+  --glow-rgb: var(--accent-rgb);
+}
+.desk-light.light-backlog {
+  --glow-rgb: var(--warn-rgb);
+}
+
+/* 灯珠：光晕用 box-shadow 做，比 border 更省布局，也不吃点击区。 */
+.desk-light-bulb {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 0 4px rgba(var(--glow-rgb), 0.18);
+}
+
+.desk-light.light-idle .desk-light-bulb {
+  background: var(--ok);
+}
+.desk-light.light-running .desk-light-bulb {
+  background: var(--accent);
+}
+.desk-light.light-backlog .desk-light-bulb {
+  background: var(--warn);
+}
+
+/* 只有"在跑"和"积压"两档呼吸 —— 静止的绿是"没事"，让它安静待着。 */
+.desk-light.light-running .desk-light-bulb,
+.desk-light.light-backlog .desk-light-bulb {
+  animation: desk-light-pulse 1.8s ease-in-out infinite;
+}
+
+/* 只动光晕半径，**不动尺寸**：缩放灯珠会把整行文字顶得上下跳。 */
+@keyframes desk-light-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 4px rgba(var(--glow-rgb), 0.2);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(var(--glow-rgb), 0.05);
+  }
+}
+
+/* 关掉动效偏好（前庭敏感）时保留颜色，只停呼吸 —— 状态不靠动画才读得出来。 */
+@media (prefers-reduced-motion: reduce) {
+  .desk-light-bulb {
+    animation: none !important;
+  }
+}
+
+.desk-light-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.desk-light-verdict strong {
+  font-size: 14px;
+  color: var(--text);
+}
+
+/* 结论句也跟着上色：眼睛先看到颜色，再读字，两遍都在说同一件事。 */
+.desk-light.light-idle .desk-light-verdict strong {
+  color: var(--ok);
+}
+.desk-light.light-running .desk-light-verdict strong {
+  color: var(--accent-text);
+}
+.desk-light.light-backlog .desk-light-verdict strong {
+  color: var(--warn);
+}
+
+.desk-light-reason {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+/* 明细计数紧贴在灯箱下面，不再自带边框（灯箱已经是容器了）。 */
+.desk-light-stats {
+  margin-top: 10px;
+}
+
+/* 未读 > 0 时提亮。它和灯是**两条轴** —— 不能因为"灯是绿的"就被读成"没事干"。 */
+.desk-counters .warn,
+.desk-counters .warn strong {
+  color: var(--warn);
+}
+
+/* 调试模块内的子标题（①②）。比 h3 轻、比正文重 —— 只做分组，不再开一层卡片。 */
+.desk-sub-title {
+  margin: 16px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.02em;
 }
 
 .collapsible-inline-btn:focus-visible {

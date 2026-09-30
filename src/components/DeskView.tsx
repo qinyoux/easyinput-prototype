@@ -15,12 +15,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../api";
-import { CollapsibleSection } from "./Collapsible";
+import { CollapsibleHint, CollapsibleSection } from "./Collapsible";
 import type {
   ConsumeOutcome,
   DeskSnapshot,
   DispatchOutcome,
   Lease,
+  LightState,
   NoticeEventPayload,
   NoticePlayReport,
   NoticePrepareReport,
@@ -82,6 +83,66 @@ function brief(s: string, max = 28): string {
   return one.length > max ? `${one.slice(0, max)}…` : one;
 }
 
+// ---------------------------------------------------------------------------
+// 运行时三态灯（红绿灯）
+// ---------------------------------------------------------------------------
+
+/**
+ * 档位 → 界面文案。**这里只做映射，不做判据** ——
+ * 档位本身来自后端 `RuntimeSnapshot.light`（判据见 `agent_desk/state.rs` 的 `LightState`）。
+ *
+ * 颜色语义刻意跟中文习惯对齐，并且**不给"运行中"用红色**：
+ *
+ * | 档位 | 颜色 | 为什么 |
+ * |---|---|---|
+ * | `idle` | 绿 | 正常待命 |
+ * | `running` | 橙（品牌强调色）| 读作"在动"，而不是"出错" |
+ * | `backlog` | 黄 | 唯一"要你留意"的一档 |
+ *
+ * 红色（`--err`）在中文语境里读作"坏了"。而"有任务在跑"恰恰是系统最正常的时刻 ——
+ * 给它点红灯，用户会去排查一个并不存在的问题。
+ */
+const LIGHT_UI: Record<LightState, string> = {
+  idle: "空闲待命",
+  running: "正在执行",
+  backlog: "有积压，却没有任务在跑",
+};
+
+/**
+ * 灯旁边的第二行：**把"为什么是这个灯"直接写出来**，不让人自己推。
+ *
+ * 这是三态灯存在的全部理由。原先是 7 个平铺计数器（"第 5 颗灯：灭"、"空闲：否"…），
+ * 用户要逐条读、还要自己把两条拼起来，才知道该不该管。现在结论在灯上、理由在灯下。
+ */
+function lightDetail(rt: RuntimeSnapshot): string {
+  const running = rt.queue.running_count;
+  const pending = rt.queue.total_pending;
+  switch (rt.light) {
+    case "running":
+      return running === 1
+        ? `1 个槽位在执行${pending > 0 ? `，另有 ${pending} 条排队等着` : "，队列已空"}`
+        : `${running} 个槽位在执行${pending > 0 ? `，另有 ${pending} 条排队等着` : "，队列已空"}`;
+    case "backlog":
+      return `${pending} 条已入队，但没有任何槽位在跑 —— 这通常意味着卡住了，去上面「槽位」看一眼`;
+    default:
+      return rt.any_unread
+        ? "没有任务在跑，也没有排队；但有待听的未读（见下面那项）"
+        : "没有任务在跑，也没有排队";
+  }
+}
+
+/**
+ * 有未读时把这一项提亮。
+ *
+ * 未读是**另一条轴**（"有结果等你听"），不并进上面那盏灯 ——
+ * 一个任务可以在跑，同时你还有 3 条没听。硬塞进一盏灯只会让两件事互相掩盖。
+ * 但它在空闲时最容易被忽略，所以单独给一层颜色，保证"没有任务在跑"不会读成"没事干"。
+ */
+function unreadTone(rt: RuntimeSnapshot): string {
+  return rt.unread.total_pending > 0 ? "warn" : "";
+}
+
+
 export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Props) {
   const [snap, setSnap] = useState<DeskSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -106,6 +167,11 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
 
   const [dispatchSlot, setDispatchSlot] = useState(0);
   const [dispatchText, setDispatchText] = useState("");
+  /**
+   * 「取租约」操作哪个槽。**独立于派发槽位** —— 与 `renderSlot` 同一个理由：
+   * 派发和取租约是两件事，没理由被绑在同一个选择器上（否则调完一个必定带动另一个）。
+   */
+  const [leaseSlot, setLeaseSlot] = useState(0);
 
   // ---- 播报（Phase 3 第二段「后声」）----
   //
@@ -141,6 +207,14 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
 
   /** 供"已跑了多久"使用；轮询会带着它一起重渲染。 */
   const now = Date.now();
+
+  /**
+   * 「取租约」那个槽当前有几条未读。
+   *
+   * 取租约需要**有东西可播**：某槽未读为 0 时后端会拒（没有可播的内容），
+   * 所以按钮的可用性得看这个数 —— 让按钮先变灰，比点下去再报错的体验好。
+   */
+  const leasePending = rt?.unread.slots.find((x) => x.index === leaseSlot)?.pending ?? 0;
 
   const refresh = useCallback(async () => {
     try {
@@ -338,6 +412,28 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
     } finally {
       setOp(null);
     }
+  }
+
+  /**
+   * 模拟一次「按键播放」的**第一步**：取租约。
+   *
+   * 收回来的租约只存在前端（`lease`）——它不是一个后端常驻句柄，
+   * 而是"这一次播放的凭据"。之后的回执 / 释放都拿同一个 token 去说话，
+   * 后端凭 token 判断这条回执**是不是这一代**的（迟到回执不能消费新租约）。
+   */
+  function grantLease(slot: number) {
+    run(
+      `grant-${slot}`,
+      () => api.deskGrantPlayback(slot),
+      (l: Lease | undefined) => {
+        if (!l) return;
+        setLease(l);
+        notify(
+          "ok",
+          `S${slot + 1} 取到播放租约 token=${l.token}（第 ${l.generation} 代，共 ${l.granted_pending} 条未读）`,
+        );
+      },
+    );
   }
 
   /**
@@ -584,29 +680,10 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                       {isCancelling ? "取消中…" : "取消执行"}
                     </button>
                   )}
-                  {u && u.pending > 0 && (
-                    <button
-                      className="btn-ghost"
-                      disabled={op === `grant-${s.index}`}
-                      title="模拟「按键播放」：取到租约才能播，回执后才扣未读"
-                      onClick={() =>
-                        run(
-                          `grant-${s.index}`,
-                          () => api.deskGrantPlayback(s.index),
-                          (l: Lease | undefined) => {
-                            if (!l) return;
-                            setLease(l);
-                            notify(
-                              "ok",
-                              `S${s.index + 1} 取到播放租约 token=${l.token}（第 ${l.generation} 代，共 ${l.granted_pending} 条未读）`,
-                            );
-                          },
-                        )
-                      }
-                    >
-                      取租约
-                    </button>
-                  )}
+                  {/* 「取租约」原先长在这张卡上。已收进下面「调试工具 → ② 播放租约」：
+                      它要选槽、要观察账本变化，本来就该和「回执 / 释放」待在同一处 ——
+                      拆在两个板块里，一次播放演示要找两遍界面（v0.39.3）。
+                      这里只留只读状态：播放中 / 未读各有一个徽标在上面那行。 */}
                 </div>
               </div>
             );
@@ -614,16 +691,17 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         </div>
       </div>
 
-      {/* ---------------- 运行时：真实快照，不是示意图 ---------------- */}
+      {/* ---------------- 运行时：三态灯（红绿灯）+ 明细 ---------------- */}
       <div className="desk-section">
         <h3>
-          运行时（队列 + 未读）
+          运行时
           <span className="desk-tag">Phase 2</span>
         </h3>
         <p className="empty-hint desk-lead">
-          这里显示的是<strong>真实快照</strong>，不是示意。队列<strong>不持久化</strong>
-          （重启后"正在执行"的任务对应的进程/请求已经消失，恢复它只会得到幽灵任务），
-          未读<strong>持久化</strong>——所以重启后灯还亮着是对的。
+          这一块只回答一个问题：<strong>引擎现在行不行</strong>。
+          灯只有三档 —— 空闲（绿）· 正在执行（橙）·{" "}
+          <strong>有积压却没在跑</strong>（黄）。最后那档是唯一"要你留意"的：
+          有活排着队，却没有任何槽位在干，通常意味着卡住了。
         </p>
 
         {rtError && <p className="desk-bad">运行时状态读取失败：{rtError}</p>}
@@ -631,56 +709,105 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         {!rt ? (
           <p className="empty-hint">读取中…</p>
         ) : (
-          <div className="desk-counters">
-            <span>
-              正在执行槽位 <strong>{rt.queue.running_count}</strong>
-            </span>
-            <span>
-              待执行 <strong>{rt.queue.total_pending}</strong>
-            </span>
-            <span>
-              未读 <strong>{rt.unread.total_pending}</strong>
-            </span>
-            <span>
-              累计 完成 <strong>{rt.queue.completed}</strong> / 失败{" "}
-              <strong>{rt.queue.failed}</strong>
-            </span>
-            <span>
-              第 5 颗灯：
-              <strong className={rt.busy ? "desk-ok" : "desk-bad"}>
-                {rt.busy ? "亮" : "灭"}
-              </strong>
-            </span>
-            <span>
-              喇叭：
-              {rt.unread.playing_slot == null ? (
-                <strong>空闲</strong>
-              ) : (
-                <strong className="desk-ok">S{rt.unread.playing_slot + 1} 持有</strong>
+          <>
+            <div className={`desk-light light-${rt.light}`}>
+              <span className="desk-light-bulb" aria-hidden="true" />
+              <div className="desk-light-verdict">
+                <strong>{LIGHT_UI[rt.light]}</strong>
+                <span className="desk-light-reason">{lightDetail(rt)}</span>
+              </div>
+            </div>
+
+            <div className="desk-counters desk-light-stats">
+              <span>
+                执行中 <strong>{rt.queue.running_count}</strong>
+              </span>
+              <span>
+                待执行 <strong>{rt.queue.total_pending}</strong>
+              </span>
+              <span className={unreadTone(rt)}>
+                未读 <strong>{rt.unread.total_pending}</strong>
+              </span>
+              <span>
+                喇叭{" "}
+                {rt.unread.playing_slot == null ? (
+                  <strong>空闲</strong>
+                ) : (
+                  <strong className="desk-ok">S{rt.unread.playing_slot + 1} 持有</strong>
+                )}
+              </span>
+              <span>
+                累计 <strong>{rt.queue.completed}</strong> 完成 /{" "}
+                <strong>{rt.queue.failed}</strong> 失败
+              </span>
+              {rt.queue.active_drivers.length > 0 && (
+                <span className="mono">执行器 {rt.queue.active_drivers.join(" / ")}</span>
               )}
-            </span>
-            <span>
-              空闲：
-              <strong>{rt.idle ? "是" : "否"}</strong>
-              <em className="desk-hint-inline">
-                （"有积压没在跑"时 busy=灭、idle=否，两种情形不是一回事）
-              </em>
-            </span>
-            {rt.queue.active_drivers.length > 0 && (
-              <span className="mono">执行器：{rt.queue.active_drivers.join(" / ")}</span>
-            )}
-          </div>
+            </div>
+
+            {/* 两条"为什么"收进折叠：它们解释设计，不参与判断。 */}
+            <CollapsibleHint
+              id="desk-runtime-persist"
+              label="为什么重启后未读还在，队列却清零了？"
+            >
+              <p className="hint">
+                队列<strong>不持久化</strong>：一个"正在执行"的任务在重启后并不存在 ——
+                它对应的子进程 / HTTP 请求已经随进程一起消失了。把队列存下来再恢复，
+                只会得到一堆永远不会完成的<strong>幽灵任务</strong>。
+                <br />
+                未读<strong>持久化</strong>：它的定义是"有一条结果你还没听过"，
+                这件事不会因为重启而变得不成立 —— 所以重启后未读还在是对的，
+                你上次没听的那条结果仍然等着你。
+              </p>
+            </CollapsibleHint>
+
+            <CollapsibleHint id="desk-runtime-led" label="键盘上那 5 颗灯分别在显示什么？">
+              <ul className="desk-notes">
+                <li>
+                  <strong>第 1–4 颗</strong> = 四个槽各自的未读，绿色、亮度分三档
+                  （1–3 / 4–6 / 7 条以上）。正在播放的那个槽换一种颜色。
+                </li>
+                <li>
+                  <strong>第 5 颗</strong> = <strong>正在执行的槽数</strong>，不是一个开关：
+                  0 / 1 / 2 / 3 / 4 分别对应绿、黄、橙、紫、红五档。
+                </li>
+              </ul>
+              <p className="hint">
+                所以"第 5 颗灯"不能用"亮 / 灭"来概括 —— 那是它最早的简化说法，
+                已经不再准确（上面灯箱里的"执行中 N"才是同一件事的完整表达）。
+              </p>
+            </CollapsibleHint>
+          </>
         )}
       </div>
 
-      {/* ---------------- 调试：手动派发 + 播放租约 ---------------- */}
+      {/* ---------------- 调试工具：手动派发 + 播放租约 ----------------
+          默认收起，且**刻意留在原位**（不挪到页尾）。理由：Phase 3 接上按键录音之前，
+          它是唯一"不接硬件也能压完整条链路"的入口 —— 需要时找不到，代价比占版面大得多；
+          而"占版面"这件事，收起已经解决了。等 Phase 3 通了再谈挪位。 */}
       <div className="desk-section">
-        <h3>手动派发（调试）</h3>
+        <CollapsibleSection
+          id="desk-debug"
+          title="调试工具"
+          badges={<span className="desk-tag">手动派发 · 播放租约</span>}
+          summary={
+            !rt
+              ? "读取中…"
+              : `队列 ${rt.queue.total_pending} 条待执行 · 未读 ${rt.unread.total_pending} 条 · 喇叭${
+                  rt.unread.playing_slot == null
+                    ? "空闲"
+                    : `由 S${rt.unread.playing_slot + 1} 持有`
+                }`
+          }
+        >
         <p className="empty-hint desk-lead">
-          Phase 3 接上按键录音之前，这是<strong>唯一能手动验证整条编排链路</strong>的入口：
-          入队 → 执行 → 终态 → 未读 → 租约 → 消费。没有硬件也能复现问题。
+          这一整块<strong>不参与日常使用</strong> —— 按键能用了之后，
+          派发、播放这些动作都由键盘触发。它的价值在<strong>手上没有硬件时</strong>：
+          不接板子也能把整条编排链路压一遍
+          （入队 → 执行 → 终态 → 未读 → 租约 → 消费），复现问题、验回归都靠它。
         </p>
 
+        <h4 className="desk-sub-title">① 手动派发</h4>
         <div className="desk-dispatch">
           <div className="desk-dispatch-row">
             <label>槽位</label>
@@ -769,33 +896,45 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           </div>
         </div>
 
-        <div className="desk-lease">
-          <div className="desk-driver-title">
-            <strong>播放租约</strong>
-            {lease ? (
-              <span className="desk-tag ok">token={lease.token}</span>
-            ) : (
-              <span className="desk-tag">未持有</span>
-            )}
+        <h4 className="desk-sub-title">② 播放租约</h4>
+        <p className="hint">
+          模拟一次「按键播放」的生命周期：<strong>取租约 → 回执（听完）</strong>。
+          <strong>取租约本身不扣未读</strong>，只有回执才扣 ——
+          抢占、播到一半拔电，未读都保留。
+        </p>
+
+        {!lease ? (
+          <div className="desk-dispatch-row">
+            <label>槽位</label>
+            <select
+              value={leaseSlot}
+              onChange={(e) => setLeaseSlot(Number(e.target.value))}
+            >
+              {snap.slots.map((s) => (
+                <option key={s.index} value={s.index}>
+                  S{s.index + 1} · {s.mode}
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn-primary"
+              disabled={leasePending === 0 || op === `grant-${leaseSlot}`}
+              onClick={() => grantLease(leaseSlot)}
+            >
+              取租约
+            </button>
+            <span className="desk-hint-inline">
+              {leasePending > 0
+                ? `该槽有 ${leasePending} 条未读`
+                : "该槽没有未读 —— 没有可播的内容，取不到租约"}
+            </span>
           </div>
-          <div className="desk-driver-note">
-            {lease ? (
-              <>
-                S{lease.slot + 1} · 第 {lease.generation} 代 · 取租约时该槽有{" "}
-                {lease.granted_pending} 条未读。
-              </>
-            ) : (
-              <>
-                在左侧某个槽位卡上点「取租约」，即可模拟一次「按键播放」。
-                <strong>取租约本身不扣未读</strong>，只有回执（完整听完）才扣。
-              </>
-            )}
-          </div>
-          <div className="desk-driver-note">
-            ⚠️ Phase 3 才接音频下行——这里<strong>不会真的出声</strong>，它验证的是
-            账本与租约那一层：迟到回执不消费新租约、抢占不消费未读、播到一半拔电未读保留。
-          </div>
-          {lease && (
+        ) : (
+          <>
+            <div className="desk-driver-note ok">
+              当前持有 <strong>S{lease.slot + 1}</strong> · 第 {lease.generation} 代 ·
+              token={lease.token} · 取租约时该槽有 {lease.granted_pending} 条未读
+            </div>
             <div className="desk-dispatch-row">
               <button
                 className="btn-primary"
@@ -829,7 +968,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                     () => {
                       notify(
                         "ok",
-                        `已释放 S${lease.slot + 1} 的租约——抢占/中断都走这里，未读保持不动`,
+                        `已释放 S${lease.slot + 1} 的租约 —— 抢占 / 中断都走这里，未读保持不动`,
                       );
                       setLease(null);
                     },
@@ -839,8 +978,15 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                 释放（抢占 / 中断）
               </button>
             </div>
-          )}
-        </div>
+          </>
+        )}
+
+        <p className="hint">
+          ⚠️ Phase 3 才接音频下行 —— 这里<strong>不会真的出声</strong>，
+          它验证的是账本与租约那一层：迟到回执不消费新租约、抢占不消费未读、
+          播到一半拔电未读保留。
+        </p>
+        </CollapsibleSection>
       </div>
 
       {/* ---------------- 播报（Phase 3 第二段「后声」） ---------------- */}

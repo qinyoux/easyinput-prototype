@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 
-use crate::agent_desk::state::RuntimeSnapshot;
+use crate::agent_desk::state::{LightState, RuntimeSnapshot};
 use crate::constants::REPORT_ID_DESK_LED;
 use crate::transport;
 
@@ -289,6 +289,9 @@ mod tests {
                 playing_slot: playing,
                 slots: unread_slots,
             },
+            // 派生值一律走同一个纯函数，**不在测试里手写档位** ——
+            // 否则灯语一改，测试会拿旧档位把新实现"验证"过。
+            light: LightState::from_queue(running_count, 0),
             busy: running_count > 0,
             idle: running_count == 0,
             any_unread: unread.iter().any(|n| *n > 0),
@@ -439,6 +442,7 @@ mod tests {
                     SlotUnreadView { index: 0, pending: 5, generation: 0, leased: false },
                 ],
             },
+            light: LightState::from_queue(0, 0),
             busy: false,
             idle: true,
             any_unread: true,

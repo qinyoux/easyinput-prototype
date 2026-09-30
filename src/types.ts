@@ -420,10 +420,21 @@ export interface UnreadSnapshot {
   slots: SlotUnreadView[];
 }
 
+/**
+ * 运行时三态灯。**档位由后端给**（`RuntimeSnapshot.light`），前端只做颜色与文案映射。
+ *
+ * ⛔ 不要在前端从 `busy` / `idle` / `queue.total_pending` 自己推档位 ——
+ * 那会让"什么算积压"有了两份实现：后端一改判据，这里不会跟着动，
+ * 界面就会**静默地**显示错误颜色。本项目在"字幕浮层显隐"上已经吃过一次这个亏。
+ */
+export type LightState = "idle" | "running" | "backlog";
+
 /** 运行时总快照（事件 `agent-desk-state` 的载荷）。 */
 export interface RuntimeSnapshot {
   queue: QueueSnapshot;
   unread: UnreadSnapshot;
+  /** 三态灯档位，语义见 {@link LightState}。 */
+  light: LightState;
   busy: boolean;
   /** 完全空闲（没在跑、也没排队）。注意与 `!busy` 不等价。 */
   idle: boolean;
