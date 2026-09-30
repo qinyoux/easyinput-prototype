@@ -663,37 +663,16 @@ impl DeskManager {
 // 视图结构（给前端的投影，不含密钥）
 // ---------------------------------------------------------------------------
 
-/// Driver 的 UI 视图。
-///
-/// **`api_key` 不在这里**——前端的设置页用它自己的输入框管理密钥，
-/// 列表视图不需要看到它，少一处暴露面。
-#[derive(Clone, Debug, Serialize)]
-pub struct DriverView {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
-    pub enabled: bool,
-    /// 是否已具备发起请求的最小条件。
-    pub configured: bool,
-    /// **能否被调度**（校验无错 + 已启用 + 配置完整）。
-    ///
-    /// 与 `configured` 分开：`configured` 只回答"key/命令填了没"，
-    /// 而"能不能真的跑"还要看形态与完成信号是否自洽。两个都给出，
-    /// 前端才能说清"是缺 key 还是配错了"。
-    pub schedulable: bool,
-    /// 完成信号的中文标签。
-    pub completion_label: String,
-    /// 完成可信度（`已校验` / `未校验`）。
-    pub confidence: String,
-    /// 是否会经过世界门禁。
-    pub gated: bool,
-    pub capabilities: Vec<String>,
-    /// 硬错误：这些会让该执行器被拒绝调度，必须展示。
-    pub errors: Vec<String>,
-    /// 软警告：能跑但有风险（可信度中 / 缺 HOME），**必须展示而不是静默吞掉**。
-    pub warnings: Vec<String>,
-    pub note: String,
-}
+// ⚠️ 原 `DriverView`（执行器的 UI 视图）已于 v0.39.2 移除。
+//
+// 原因：任务台的「执行器」板块是**重复的第三份** ——
+//   ① 配置与「探测」在「模型配置 → ④ 执行器」（同一个 `desk_probe_driver`）；
+//   ② 不可调度的具体原因在 `blockers` 里已**按槽位逐条列**（见 `build_snapshot`）；
+//   ③ 真派发时 `resolve_driver` 还会再报一次。
+// 前端的 `DriverView` 类型与任务台板块同步删除。⛔ 不要再加回来：
+// 加回来 = 同一条判据维护两份，迟早漂移成"面板说可用、按下去报错"。
+//
+// 注意：`DriverProbe`（探测返回体）**保留** —— 它属于模型配置页，勿一并删除。
 
 /// 槽位视图。
 #[derive(Clone, Debug, Serialize)]
@@ -721,7 +700,6 @@ pub struct DeskSnapshot {
     pub tts_model: String,
     pub output_dir: String,
     pub config_path: String,
-    pub drivers: Vec<DriverView>,
     pub slots: Vec<SlotView>,
 }
 
@@ -1640,32 +1618,6 @@ fn build_snapshot(mgr: &DeskManager) -> DeskSnapshot {
         blockers.push("TTS 未填 API Key（完成后无法播报总结）".into());
     }
 
-    let drivers = registry
-        .entries()
-        .iter()
-        .map(|e| {
-            let d = &e.config;
-            DriverView {
-                id: d.id.clone(),
-                label: d.label.clone(),
-                kind: match d.kind {
-                    DriverKind::Api => "api".into(),
-                    DriverKind::Cli => "cli".into(),
-                },
-                enabled: d.enabled,
-                configured: d.is_configured(),
-                schedulable: e.is_schedulable(),
-                completion_label: d.completion.kind.label().to_string(),
-                confidence: d.completion.confidence().label().to_string(),
-                gated: !d.completion.evidence_cmd.trim().is_empty(),
-                capabilities: d.capabilities.iter().map(|c| c.label().to_string()).collect(),
-                errors: e.validation.errors.clone(),
-                warnings: e.validation.warnings.clone(),
-                note: d.note.clone(),
-            }
-        })
-        .collect();
-
     let slots = cfg
         .slots
         .iter()
@@ -1725,7 +1677,6 @@ fn build_snapshot(mgr: &DeskManager) -> DeskSnapshot {
             .path()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "(未初始化)".into()),
-        drivers,
         slots,
     }
 }

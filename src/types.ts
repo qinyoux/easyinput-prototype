@@ -340,25 +340,10 @@ export interface ProbeConfig {
   root: string;
 }
 
-/** 执行器的 UI 视图（**不含密钥**）。 */
-export interface DriverView {
-  id: string;
-  label: string;
-  kind: string;
-  enabled: boolean;
-  configured: boolean;
-  /** 能否被调度（校验无错 + 已启用 + 配置完整）。与 configured 不是一回事。 */
-  schedulable: boolean;
-  completion_label: string;
-  confidence: string;
-  gated: boolean;
-  capabilities: string[];
-  /** 硬错误：会导致拒绝调度，必须展示。 */
-  errors: string[];
-  /** 软警告：能跑但有风险（可信度中 / 缺 HOME），必须展示而不是静默吞掉。 */
-  warnings: string[];
-  note: string;
-}
+// ⚠️ 原 `DriverView`（执行器的 UI 视图）已于 v0.39.2 移除，后端 `DeskSnapshot.drivers` 同步删除。
+// 原因：任务台那个「执行器」板块是重复的第三份——配置与「探测」在「模型配置 → ④ 执行器」，
+// 不可调度的原因在页首 `blockers` 里已按槽位逐条列出。⛔ 不要再加回来。
+// 注意：`DriverProbe`（探测返回体）**仍然保留**，它属于模型配置页，勿一并删除。
 
 /** 槽位视图。 */
 export interface SlotView {
@@ -379,7 +364,6 @@ export interface DeskSnapshot {
   tts_model: string;
   output_dir: string;
   config_path: string;
-  drivers: DriverView[];
   slots: SlotView[];
 }
 

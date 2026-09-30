@@ -20,7 +20,6 @@ import type {
   ConsumeOutcome,
   DeskSnapshot,
   DispatchOutcome,
-  DriverProbe,
   Lease,
   NoticeEventPayload,
   NoticePlayReport,
@@ -86,9 +85,6 @@ function brief(s: string, max = 28): string {
 export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Props) {
   const [snap, setSnap] = useState<DeskSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [probes, setProbes] = useState<Record<string, DriverProbe>>({});
-  const [probing, setProbing] = useState<string | null>(null);
-
   const [rt, setRt] = useState<RuntimeSnapshot | null>(null);
   /** 每槽当前正在续接的会话（`null` = 没有会话，下次任务新起一轮）。 */
   const [sessionInfo, setSessionInfo] = useState<(SessionView | null)[]>([]);
@@ -318,23 +314,6 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
       un?.();
     };
   }, [refreshNoticeStatus]);
-
-  async function probe(id: string) {
-    setProbing(id);
-    try {
-      const env = await api.deskProbeDriver(id);
-      if (!env.ok || !env.data) {
-        notify("err", env.message ?? env.code);
-        return;
-      }
-      setProbes((p) => ({ ...p, [id]: env.data! }));
-      notify(env.data.ready ? "ok" : "err", env.data.detail);
-    } catch (e) {
-      notify("err", String(e));
-    } finally {
-      setProbing(null);
-    }
-  }
 
   /** 统一包一层：连点保护 + 错误如实上报 + 成功后刷新运行时。 */
   async function run<T>(
@@ -1261,75 +1240,12 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         )}
         </CollapsibleSection>
       </div>
-
-      {/* ---------------- 执行器 ---------------- */}
-      <div className="desk-section">
-        <h3>执行器</h3>
-        <p className="empty-hint desk-lead">
-          完成判定是<strong>显式配置</strong>，不是隐式假设：填了「世界门禁」才算
-          <strong>已校验</strong>；只靠进程退出码的只能是<strong>未校验</strong>——
-          进程结束不等于任务做成。
-        </p>
-        <ul className="desk-drivers">
-          {snap.drivers.map((d) => {
-            const p = probes[d.id];
-            return (
-              <li key={d.id} className={`desk-driver ${d.enabled ? "" : "off"}`}>
-                <div className="desk-driver-main">
-                  <div className="desk-driver-title">
-                    <strong>{d.label}</strong>
-                    <span className="desk-tag">{d.kind === "api" ? "API" : "CLI"}</span>
-                    {!d.enabled && <span className="desk-tag">未启用</span>}
-                    {/* 可调度 = 校验无错 + 已启用 + 配置完整。比单纯的 configured 严格。 */}
-                    {d.enabled && d.schedulable && <span className="desk-tag ok">可调度</span>}
-                    {d.enabled && !d.schedulable && (
-                      <span className="desk-tag warn">不会被执行</span>
-                    )}
-                  </div>
-                  <div className="desk-driver-sub">
-                    完成信号：{d.completion_label} ·{" "}
-                    <span className={d.confidence === "已校验" ? "desk-ok" : "desk-bad"}>
-                      {d.confidence}
-                    </span>
-                    {d.gated && <span className="desk-tag">世界门禁</span>}
-                    {d.capabilities.length > 0 && (
-                      <span className="desk-caps">{d.capabilities.join(" / ")}</span>
-                    )}
-                  </div>
-                  {/* 硬错误会让它被拒绝调度，必须显式展示——否则用户只会看到"点了没反应"。 */}
-                  {d.errors.map((e, i) => (
-                    <div className="desk-driver-note bad" key={`e${i}`}>
-                      ✕ {e}
-                    </div>
-                  ))}
-                  {/* 软警告：能跑但有风险。**不静默吞掉**，否则"能跑"和"跑得对"就分不清了。 */}
-                  {d.warnings.map((w, i) => (
-                    <div className="desk-driver-note warn" key={`w${i}`}>
-                      ! {w}
-                    </div>
-                  ))}
-                  {d.note && <div className="desk-driver-note">{d.note}</div>}
-                  {p && (
-                    <div className={`desk-driver-note ${p.ready ? "ok" : "bad"}`}>
-                      探测（{p.scope}）：{p.detail}
-                    </div>
-                  )}
-                </div>
-                <div className="desk-driver-ops">
-                  <button
-                    className="btn-ghost"
-                    onClick={() => probe(d.id)}
-                    disabled={probing === d.id}
-                    title="仅做静态配置检查，不会真跑一次"
-                  >
-                    {probing === d.id ? "检查中…" : "检查"}
-                  </button>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
+      {/* 执行器的展示与「检查」**故意不在这里**：配置与探测都在
+          「模型配置 → ④ 执行器」（同一个 desk_probe_driver 命令，见 docs/任务台使用说明.md §3.1）；
+          不可调度的具体原因还会在页首 blockers 里**按槽位逐条列**
+          （"槽位 S2 的执行器「X」配置有误：…"），派发失败时 resolve_driver 还会再报一次。
+          ⇒ 本板块是第 3 份重复，v0.39.2 移除。⛔ 不要再加回来：加回来就等于
+          把同一条判据维护两份，迟早漂移成"面板说可用、按下去报错"。 */}
     </div>
   );
 }

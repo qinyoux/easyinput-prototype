@@ -7,6 +7,59 @@
 
 ---
 
+## [v0.39.2] — 2026-09-30
+
+### 移除
+
+- **任务台移除「执行器」板块**（`src/components/DeskView.tsx`）。
+  该板块只做"**显示 + 检查**"两件事，而这两件在别处**各已有一份**，它是重复的**第三份**：
+
+  1. **配置与「探测」在「模型配置 → ④ 执行器」** —— 调的是同一个 `desk_probe_driver`，
+     报的是同一份错误文本。`docs/任务台使用说明.md` §3.1 指定的排障路径本来就是它。
+  2. **不可调度的原因在页首 `blockers` 里已按槽位逐条列出** ——
+     `build_snapshot` 对每个 `SlotBinding::Exact` 都做 `is_schedulable()` 判定并给出
+     `"槽位 S2 的执行器「X」配置有误：{errors}"`。**带槽位号，比原板块更明确**
+     （原板块只说"某执行器不可调度"，不说"哪个槽受影响"）。
+  3. 真派发时 `resolve_driver` 还会再报一次（"槽位 S2 的执行器「X」不可调度：{why}"）。
+
+  ⇒ 同一条判据维护两份，迟早漂移成"面板说可用、按下去报错"（`build_snapshot` 的注释
+  记着上一次正是这么踩的）。故删除。**⛔ 不要再加回来。**
+
+- 后端 **`DeskSnapshot.drivers` 字段与 `DriverView` 结构体**一并删除；
+  前端 `src/types.ts` 的 `DriverView` 接口同步移除。
+  ⚠️ **`desk_probe_driver` 命令与 `DriverProbe` 保留** —— 它们属于模型配置页，勿一并删除。
+
+### 变更
+
+- `DriverRegistry::entries()` 降为 **`#[cfg(test)]`**：唯一调用方是被删的那个板块，
+  现仅剩一条单测用它验证"**不可用的执行器也要留在表里**"这个不变量。
+  不降级会多出一条 `never used` 警告。
+- 删除 **`Confidence::label()`**：唯一调用方是 `DriverView`。任务历史存的是
+  `high`/`medium` **机器串**（供筛选），不是中文标签；前端「已校验 / 未校验」字样
+  是它自己的文案，不受影响。
+
+### 验证
+
+- `cargo check --lib` → exit 0，**54 warnings**（与改动前一致，**零净增**）
+- `cargo test --lib -- --test-threads=1` → **444 passed / 0 failed / 4 ignored**
+  - ⚠️ 在主工作区跑**跑不起来**：并行 agent 的未跟踪新文件 `src-tauri/src/live_translate.rs`
+    的测试代码有 `E0063`（`RecordedSentence` 缺 `start_ms`/`end_ms`），与本改动无关。
+  - 故改用**隔离 worktree**（`git worktree add --detach <tmp> HEAD` + 只复制本改动涉及的
+    3 个 `agent_desk/**` 文件）取证，结果即上。
+- `npm run build`（tsc + vite）→ exit 0，67 modules
+- `npx tsc --noEmit` → exit 0
+- `node scripts/version.mjs check` → exit 0（五处 0.39.2 一致）
+
+### ⚠️ 未完成 / 待注意
+
+- **未在 easyop 真窗口人眼复核**：任务台现为 5 个板块（槽位 / 运行时 / 手动派发 / 播报 / 任务历史），
+  删块后的**留白变化未经目视确认**。按 `AGENTS.md` 属"仅编译通过"。
+- **一处信息缺口，判定为可接受**：**没有绑定到任何槽位**的执行器若不可调度，
+  不会出现在 `blockers` 里（那里只检查被槽位引用的）。但这类执行器**跑不了任何任务**，
+  没有实际后果。若将来要报，应在 `build_snapshot` 里补，**而不是恢复那个板块**。
+
+---
+
 ## [v0.39.1] — 2026-09-30
 
 ### 新增

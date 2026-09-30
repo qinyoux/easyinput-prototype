@@ -134,15 +134,6 @@ pub enum Confidence {
     Medium,
 }
 
-impl Confidence {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Confidence::High => "已校验",
-            Confidence::Medium => "未校验",
-        }
-    }
-}
-
 /// 完成判定配置。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
