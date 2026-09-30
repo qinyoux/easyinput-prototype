@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../api";
+import { CollapsibleSection } from "./Collapsible";
 import type {
   ConsumeOutcome,
   DeskSnapshot,
@@ -864,19 +865,28 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
       </div>
 
       {/* ---------------- 播报（Phase 3 第二段「后声」） ---------------- */}
+      {/* 默认收起：这一块连后端注释都写着"锦上添花"，日常用不到却常年占半屏。
+          收起后标题旁的徽标照旧给状态 —— 这是"摘要化"，不是"藏起来"。
+          ⚠️ 下面的内容块**没有**跟着缩进 2 格：本项目多 agent 并行，
+          为包裹而重排几百行空白会淹没真实 diff（AGENTS.md §4.3）。 */}
       <div className="desk-section">
-        <h3>
-          播报
-          <span className="desk-tag">Phase 3 · 后声</span>
-          {noticeStatus &&
-            (noticeStatus.offline_ready ? (
-              <span className="desk-tag ok">离线可用</span>
-            ) : (
-              <span className="desk-tag warn">
-                {noticeStatus.cached}/{noticeStatus.total} 已预合成
-              </span>
-            ))}
-        </h3>
+        <CollapsibleSection
+          id="desk-notice"
+          title="播报"
+          badges={
+            <>
+              <span className="desk-tag">Phase 3 · 后声</span>
+              {noticeStatus &&
+                (noticeStatus.offline_ready ? (
+                  <span className="desk-tag ok">离线可用</span>
+                ) : (
+                  <span className="desk-tag warn">
+                    {noticeStatus.cached}/{noticeStatus.total} 已预合成
+                  </span>
+                ))}
+            </>
+          }
+        >
         <p className="empty-hint desk-lead">
           喇叭念的是 <strong>Notice</strong>（状态播报），它和 <strong>未读</strong>
           是<strong>两条独立通道</strong> ——
@@ -1120,20 +1130,34 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
             </div>
           </>
         )}
+        </CollapsibleSection>
       </div>
 
       {/* ---------------- 任务历史 ---------------- */}
       <div className="desk-section">
-        <h3 className="desk-h3-flex">
-          任务历史
-          <button
-            className="btn-ghost desk-h3-btn"
-            onClick={refreshHistory}
-            title="立刻重新读一次（平时每 10 秒自动刷新）"
-          >
-            刷新
-          </button>
-        </h3>
+        {/* 「刷新」与折叠按钮**并列**，不是嵌进去 —— button 不能嵌套 button
+            （见 Collapsible.tsx 的约束 2）。它靠 .desk-h3-btn 的 margin-left:auto
+            贴到右侧，点它不会切换折叠。 */}
+        <CollapsibleSection
+          id="desk-history"
+          title="任务历史"
+          actions={
+            <button
+              className="btn-ghost desk-h3-btn"
+              onClick={refreshHistory}
+              title="立刻重新读一次（平时每 10 秒自动刷新）"
+            >
+              刷新
+            </button>
+          }
+          summary={
+            historyErr
+              ? "读取失败"
+              : history.length === 0
+                ? "还没有记录"
+                : `最近 ${history.length} 条`
+          }
+        >
         <p className="empty-hint desk-lead">
           后台执行的前提是"不用守着看"，所以必须留下<strong>能追溯的痕迹</strong>：
           每次派发跑了多久、什么结果、完整输出在哪、产物是什么。
@@ -1235,6 +1259,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
             })}
           </ul>
         )}
+        </CollapsibleSection>
       </div>
 
       {/* ---------------- 执行器 ---------------- */}

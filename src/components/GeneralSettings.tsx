@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as api from "../api";
 import { THEME_MODE_LABELS, useTheme, type ThemeMode } from "../theme";
+import { CollapsibleHint, CollapsibleNote } from "./Collapsible";
 import {
   PASTE_STYLE_OPTIONS,
   TERMINAL_KIND_OPTIONS,
@@ -367,12 +368,16 @@ export default function GeneralSettings() {
 
           <p className="hint">
             配置下发到开发板后，开发板将连接此 Wi-Fi 并通过 UDP 发送音频。SSID 和密码会自动保存到配置文件，下次启动自动回填。
-            <br />
-            <strong>接好一次之后就不必再手动连了</strong>：端点由上位机写进板子的 NVS，
-            板子<strong>上电即自行连接</strong>（每约 10 秒重试一轮）；上位机只在你
-            <strong>换了网络、或本机 IP 变了</strong>时自动重下发。历史网络会一直留着，
-            下次回到那张网会直接命中。
           </p>
+          {/* 首句是"填完会怎样"（填写必需），留下常显；后面的自动重连机制是原理，收起来。 */}
+          <CollapsibleHint id="gen-wifi-auto" label="接好之后还要每次手动连吗">
+            <p className="hint">
+              <strong>接好一次之后就不必再手动连了</strong>：端点由上位机写进板子的 NVS，
+              板子<strong>上电即自行连接</strong>（每约 10 秒重试一轮）；上位机只在你
+              <strong>换了网络、或本机 IP 变了</strong>时自动重下发。历史网络会一直留着，
+              下次回到那张网会直接命中。
+            </p>
+          </CollapsibleHint>
         </div>
 
         <div className="field">
@@ -397,11 +402,14 @@ export default function GeneralSettings() {
             请到 Windows「设置 → 蓝牙和其他设备 → 添加设备」里与开发板配对，
             配对成功后拔掉 USB 线，按键依然可用。
           </p>
-          <p className="hint">
-            此前这里的开关与「配对」按钮<strong>都不生效</strong>——下发的命令开发板固件
-            并不认识（它的配置协议只接受固定的配置字段，没有指令字段），所以按了等于没按。
-            已如实改为不提供这两个按钮，而不是继续假装它们有用。
-          </p>
+          {/* 第二段是"为什么这里没按钮"的历史沿革 —— 排查时才需要，默认收起。 */}
+          <CollapsibleHint id="gen-ble-history" label="为什么这里没有开关和配对按钮">
+            <p className="hint">
+              此前这里的开关与「配对」按钮<strong>都不生效</strong>——下发的命令开发板固件
+              并不认识（它的配置协议只接受固定的配置字段，没有指令字段），所以按了等于没按。
+              已如实改为不提供这两个按钮，而不是继续假装它们有用。
+            </p>
+          </CollapsibleHint>
           <div className="row">
             <span className="kb-audio-badge offline">连接状态：{bleStatus}</span>
           </div>
@@ -531,16 +539,19 @@ export default function GeneralSettings() {
             </select>
           </div>
           <p className="hint">{PASTE_STYLE_OPTIONS.find((o) => o.value === pasteStyle)?.hint}</p>
-          <p className="hint">
-            <strong>为什么需要这一项</strong>：<code>Ctrl+V</code> 在终端里的 TUI 程序
-            （codex / vim / htop 等）中<strong>粘不进去</strong> —— TUI 会把终端置于
-            raw mode 直接读按键字节，<code>Ctrl+V</code> 在那里是字面量 <code>0x16</code>，
-            会被 TUI 当成自己的快捷键吃掉。终端级粘贴由<strong>终端模拟器</strong>处理，
-            而不同终端的键位<strong>不一样</strong>（本机实测）：
-            <code>Windows Terminal</code> 用 <code>Ctrl+Shift+V</code>（或鼠标右键），
-            <code>Git Bash</code> 用 <code>Shift+Insert</code>。选「自动」时按焦点窗口
-            类名选对应那组键；认不出的窗口回落 <code>Ctrl+V</code>。
-          </p>
+          {/* 当前选项的 hint 常显（"这一格选了会怎样"）；下面这段是 TUI raw mode 的原理，收起。 */}
+          <CollapsibleHint id="gen-paste-why" label="为什么需要这一项">
+            <p className="hint">
+              <code>Ctrl+V</code> 在终端里的 TUI 程序
+              （codex / vim / htop 等）中<strong>粘不进去</strong> —— TUI 会把终端置于
+              raw mode 直接读按键字节，<code>Ctrl+V</code> 在那里是字面量 <code>0x16</code>，
+              会被 TUI 当成自己的快捷键吃掉。终端级粘贴由<strong>终端模拟器</strong>处理，
+              而不同终端的键位<strong>不一样</strong>（本机实测）：
+              <code>Windows Terminal</code> 用 <code>Ctrl+Shift+V</code>（或鼠标右键），
+              <code>Git Bash</code> 用 <code>Shift+Insert</code>。选「自动」时按焦点窗口
+              类名选对应那组键；认不出的窗口回落 <code>Ctrl+V</code>。
+            </p>
+          </CollapsibleHint>
           {pasteStyleStatus && (
             <p className={`hint ${pasteStyleStatus.ok ? "ok" : "bad"}`}>{pasteStyleStatus.msg}</p>
           )}
@@ -577,18 +588,25 @@ export default function GeneralSettings() {
       </div>
 
       <div className="settings-section">
-        <h3 className="settings-section-title">终端启动</h3>
+        <CollapsibleNote
+          id="gen-terminal"
+          title="终端启动"
+          brief={
+            <>
+              拆成两步：<strong>按一下绑了这个动作的键</strong>，开一个终端窗口并把下面这条命令
+              打进输入框（<strong>不回车</strong>）→ 再<strong>按语音键说话</strong>，
+              识别到的内容接在命令后面 → 回车即执行。
+            </>
+          }
+        >
         <p className="hint">
-          把「启动环境」和「输入内容」拆成两步：<strong>按一下绑了这个动作的键</strong>
-          → 开一个终端窗口并把下面这条命令打进输入框（<strong>不回车</strong>）
-          → 再<strong>按语音键说话</strong>，识别到的内容接在命令后面 → 回车即执行。
-          <br />
           为什么不能把命令当参数交给终端：<code>cmd /k &lt;命令&gt;</code> 是<strong>直接执行</strong>；
           要「只打进去、等你说完」，只能先开窗口、再往窗口里打键。
           <br />
           焦点已经在一个终端上时<strong>不会再开新窗口</strong>，而是直接往那个终端里预置 ——
           于是「上次没等到窗口」时，点一下终端、再按一次键就能接上。
         </p>
+        </CollapsibleNote>
         <div className="field">
           <label>要预置的命令（前缀，不含回车）</label>
           <div className="row">

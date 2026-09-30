@@ -1,6 +1,6 @@
 [package]
 name = "easyop"
-version = "0.38.0"
+version = "0.39.1"
 description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
 authors = ["easyop"]
 edition = "2021"

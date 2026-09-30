@@ -43,6 +43,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as api from "../api";
 import DriverEditor from "./DriverEditor";
+import { CollapsibleHint, CollapsibleNote } from "./Collapsible";
 import type {
   DeskConfig,
   DriverConfig,
@@ -408,11 +409,18 @@ export default function ApiSettings({ notify }: Props) {
     <div className="settings-page">
       {/* ---------- 页首：本页边界 ---------- */}
       <div className="settings-section">
-        <h3 className="settings-section-title">这一页管什么</h3>
+        <CollapsibleNote
+          id="api-page-scope"
+          title="这一页管什么"
+          brief={
+            <>
+              放三类东西：<strong>① 连到外部模型服务的配置</strong>（端点 / 密钥 / 模型 /
+              资源 ID）、<strong>② 这些功能的触发按键</strong>、
+              <strong>③ 被调度的一方本身</strong>（执行器）。
+            </>
+          }
+        >
         <p className="hint">
-          放三类东西：<strong>① 连到外部模型服务的配置</strong>（端点 / 密钥 / 模型 / 资源 ID）、
-          <strong>② 这些功能的触发按键</strong>、<strong>③ 被调度的一方本身</strong>（执行器）。
-          <br />
           反向的都不在这里 —— Everything 是本地程序路径、Wi-Fi 与麦克风是设备通信、
           粘贴方式与字幕浮层是行为开关，它们留在「<strong>设置</strong>」页。
         </p>
@@ -424,15 +432,21 @@ export default function ApiSettings({ notify }: Props) {
           ⚠️ <strong>按键类（触发键 / 编辑键）是立即生效</strong>的，不参与"保存"；
           <strong>执行器的改动（含新增 / 删除）也必须点保存</strong>才算落盘。
         </p>
+        </CollapsibleNote>
       </div>
 
       {/* ---------- §1 语音识别 ---------- */}
       <div className="settings-section">
-        <h3 className="settings-section-title">① 语音识别（ASR）</h3>
+        <CollapsibleNote
+          id="api-asr"
+          title="① 语音识别（ASR）"
+          brief="语音输入的识别通道（火山引擎流式 ASR）。"
+        >
         <p className="hint">
-          语音输入的识别通道（火山引擎流式 ASR）。与它配套的触发键放在紧下面 ——
+          与它配套的触发键放在紧下面 ——
           识别配置和"怎么开始录"是同一件事的两面。
         </p>
+        </CollapsibleNote>
         <div className="field">
           <label>服务地址</label>
           <div className="row">
@@ -508,14 +522,19 @@ export default function ApiSettings({ notify }: Props) {
 
       {/* ---------- §2 语音编辑 ---------- */}
       <div className="settings-section">
-        <h3 className="settings-section-title">② 语音编辑（LLM）</h3>
+        <CollapsibleNote
+          id="api-llm"
+          title="② 语音编辑（LLM）"
+          brief="轻量云端小模型，用于提示词优化、文本拓展、快速响应。"
+        >
         <p className="hint">
-          轻量云端小模型，用于提示词优化、文本拓展、快速响应。选中文本 → 按编辑键说修改要求
+          选中文本 → 按编辑键说修改要求
           → 再按编辑键确认 → LLM 编辑后自动替换。
           <br />
           它与「语音合成」是<strong>两套独立配置</strong>：一个把话说成文字、一个把文字说成声音，
           服务商和密钥都各填各的。
         </p>
+        </CollapsibleNote>
         <div className="field">
           <label>LLM 后端</label>
           <div className="row">
@@ -634,11 +653,17 @@ export default function ApiSettings({ notify }: Props) {
       ) : (
         <>
           <div className="settings-section">
-            <h3 className="settings-section-title">③ 语音合成（TTS）</h3>
+            <CollapsibleNote
+              id="api-tts"
+              title="③ 语音合成（TTS）"
+              brief={
+                <>
+                  用于把任务总结念出来。默认走<strong>豆包语音合成大模型</strong>（火山引擎 v3
+                  单向流式）。
+                </>
+              }
+            >
             <p className="hint">
-              用于把任务总结念出来。默认走<strong>豆包语音合成大模型</strong>（火山引擎 v3
-              单向流式）。
-              <br />
               <strong>两种传输按端点前缀自动选</strong>：<code>https://</code> 走 HTTP
               chunked + NDJSON（一次 POST 读整条流），<code>wss://</code> 走 WebSocket
               二进制帧（发一帧、收一串音频帧）。同一份配置、同一个服务，只是"这句话怎么送出去"不同。
@@ -646,6 +671,7 @@ export default function ApiSettings({ notify }: Props) {
               豆包两条路都直接要 48 kHz，所以<strong>不需要重采样</strong>；百炼只支持 HTTP，
               输出 24 kHz，由后端转成 48 kHz。
             </p>
+            </CollapsibleNote>
             <div className="field">
               <label>服务商</label>
               <div className="row">
@@ -806,10 +832,12 @@ export default function ApiSettings({ notify }: Props) {
                 24 kHz。豆包直接按 {FIRMWARE_SAMPLE_RATE} Hz 请求；百炼输出的 24 kHz
                 由后端重采样。改这个值必须同步改固件并重新烧录。
               </p>
-              <p className="hint">
-                文本上限是<strong>客户端自保</strong>：豆包服务端实测接受 1500 字，
-                真正卡时长的是固件「单条音频不超过 150 秒」——总结侧按 180 字左右生成足够。
-              </p>
+              <CollapsibleHint id="api-tts-chars" label="为什么要有文本上限">
+                <p className="hint">
+                  文本上限是<strong>客户端自保</strong>：豆包服务端实测接受 1500 字，
+                  真正卡时长的是固件「单条音频不超过 150 秒」——总结侧按 180 字左右生成足够。
+                </p>
+              </CollapsibleHint>
             </div>
 
             <div className="field">
@@ -837,12 +865,18 @@ export default function ApiSettings({ notify }: Props) {
 
           {/* ---------- §4 执行器（模型 + CLI Agent）---------- */}
           <div className="settings-section">
-            <h3 className="settings-section-title">④ 执行器（被调度的一方）</h3>
+            <CollapsibleNote
+              id="api-drivers"
+              title="④ 执行器（被调度的一方）"
+              brief={
+                <>
+                  「任务台」派发任务时挑的就是这里的东西。<strong>这是执行器唯一的编辑入口</strong>
+                  {" "}—— 命令 / 参数 / 超时 / 完成判定 / 能力声明全在它自己的展开块里，
+                  不用再去「任务台」页翻第二遍。
+                </>
+              }
+            >
             <p className="hint">
-              「任务台」派发任务时挑的就是这里的东西。<strong>这是执行器唯一的编辑入口</strong> ——
-              命令 / 参数 / 超时 / 完成判定 / 能力声明全在它自己的展开块里，
-              不用再去「任务台」页翻第二遍。
-              <br />
               <strong>按需添加</strong>：右上角两个按钮分别加"直连模型"和"CLI 执行器"，
               <strong>不需要改代码</strong>。分组不是分类癖 —— 这两类东西的风险完全不同：
               API 型是<strong>一次 HTTP 往返</strong>（快、便宜、只出文本），
@@ -855,6 +889,7 @@ export default function ApiSettings({ notify }: Props) {
               ⚠️ 预置执行器只能<strong>停用</strong>不能删除（后端会在启动时补回缺失的预置，
               删了会"自己回来"）；自建的不受此限。
             </p>
+            </CollapsibleNote>
             <DriverEditor
               drivers={cfg.drivers}
               slots={cfg.slots}
