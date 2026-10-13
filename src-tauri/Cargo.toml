@@ -1,6 +1,6 @@
 [package]
 name = "easyop"
-version = "0.39.3"
+version = "0.41.15"
 description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
 authors = ["easyop"]
 edition = "2021"
@@ -81,9 +81,52 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 http = "1"
 cpal = "0.15"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 flate2 = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
+# ============================================================================
+# [patch] tao：修一个上游未修的 UB（2026-09-30）
+# ============================================================================
+#
+# 症状：同时跑两条任务台任务时，进程**无任何业务报错直接闪退**（退出码 0xc0000409，
+#       WER 记为 BEX64），日志里只有一行
+#       `unsafe precondition(s) violated: hint::assert_unchecked ...`。
+#
+# 根因（有完整回溯，见 .workbuddy/forensics/2026-09-30-rc-abort.md）：
+#   tao 的 Windows 事件循环 runner 是 `Rc<EventLoopRunner<T>>`（**计数非原子**），
+#   它被包在 `EventLoopWindowTarget` 里，而该类型经 Tauri 一路走到
+#   `AppHandle::clone()`（tauri-2.11.5/src/app.rs:481 -> WryHandle -> Context
+#   -> DispatcherMainThreadContext -> window_target）。偏偏 `AppHandle` 是
+#   `Send + Sync + Clone`，官方推荐用法就是"进线程/异步块前先 clone 一个"。
+#   => 多个线程同时 clone/drop `AppHandle` 会**并发读改写同一个非原子计数**，
+#      计数被写坏到 0；下一次 `Rc::clone` 命中 `assert_unchecked(strong != 0)`
+#      的 UB 检查 => `panic_nounwind` => **不 unwinding，直接 abort**（进程消失）。
+#
+# 为什么不在自己代码里"别跨线程 clone"绕开（试过一次，会换地方再冒）：
+#   2026-09-23 崩的是同一个病的另一个出口（`tauri::tray::TrayIcon` 里 tray-icon 的
+#   `Rc`，当时改成全局托盘监听器绕过去了）；这次换成了 tao 这条链。全项目还有
+#   29 处 `AppHandle::clone` + 34 处 `get_webview_window`（后者内部也会 clone 一个
+#   `AppHandle`，见 tauri-2.11.5/src/manager/mod.rs:671 的 `.cloned()`）。
+#   "堵出口"是打地鼠，且每处都要人工判断调用点跑在哪个线程上。要堵的是**那个计数器**。
+#
+# 改动（tao 0.35.3 起共 2 处，均带 `[easyop patch]` 标记）：
+#   src/platform_impl/windows/event_loop/runner.rs : Rc<...> -> Arc<...>（别名）
+#   src/platform_impl/windows/event_loop.rs        : Rc::new(...) -> Arc::new(...)
+#   自动 trait 不变：`EventLoopRunner<T>` 内部是 Cell/RefCell，本来就 `!Send + !Sync`，
+#   所以 `Arc<EventLoopRunner<T>>` 与 `Rc<...>` 同为 `!Send + !Sync`，
+#   只是计数由非原子变原子 —— 只消除竞态，不改任何行为。
+#
+# ⚠️ 何时可以删掉这一节：
+#   tao 上游把 `EventLoopRunnerShared` 改成 Arc/原子计数之后（2026-09-30 查其 dev 分支
+#   仍是 `Rc`；相关问题 tauri-apps/tauri#10001 自 2024 年起开着）。
+#   删法：删本节 + `rm -rf vendor/tao`，并重跑"并发 clone 压测"确认（见上面 forensics 文档）。
+#
+# ⚠️ 有意接受的代价：vendor 里的 tao 被冻结在 0.35.3，不再跟随上游。
+#   若将来 tauri 要求 tao ^0.36，cargo 会报错（不会静默），届时重新 vendor 新版并把这
+#   两处改动照做一遍即可。
+[patch.crates-io]
+tao = { path = "vendor/tao" }

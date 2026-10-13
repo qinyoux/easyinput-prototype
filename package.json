@@ -1,7 +1,7 @@
 {
   "name": "easyop",
   "private": true,
-  "version": "0.39.3",
+  "version": "0.41.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,9 +14,12 @@
     "version:check": "node scripts/version.mjs check",
     "version:sync": "node scripts/version.mjs sync",
     "version:bump": "node scripts/version.mjs bump",
+    "a11y:contrast": "C:\\Espressif\\tools\\python\\python.exe scripts/audit_contrast.py",
+    "a11y:computed": "C:\\Espressif\\tools\\python\\python.exe scripts/probe_computed.py",
     "plugins:list": "node scripts/deploy-plugins.mjs --list",
     "plugins:deploy": "node scripts/deploy-plugins.mjs",
-    "plugins:test": "node plugins/builtin/studio/test/harness.mjs"
+    "plugins:test": "node plugins/builtin/studio/test/harness.mjs && node plugins/builtin/stylecam/test/harness.mjs && node plugins/builtin/stylecam/test/clamp-extra.mjs && C:\\Espressif\\tools\\python\\python.exe -m unittest discover plugins/builtin/stylecam/test -p \"test_*.py\" -v",
+    "plugins:build:stylecam": "node_modules\\@esbuild\\win32-x64\\esbuild.exe plugins/builtin/stylecam/src/main.js --bundle --format=esm --target=es2022 --outfile=plugins/builtin/stylecam/index.js"
   },
   "dependencies": {
     "@esbuild/win32-x64": "^0.21.5",
