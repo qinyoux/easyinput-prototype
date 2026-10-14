@@ -37,6 +37,11 @@
 //! Feature Report 总长 = 1（Report ID = `0x16`）+ 63 = 64 字节，与既有 `0x10`/`0x14`
 //! 的 64 字节形态一致（HID 描述符里 Report Count 一律 63）。
 //!
+//! # 现状：v2 语义已实机验证通过（2026-10-14，v0.43.2）
+//!
+//! 四态（执行蓝 / 播放青 / 待播绿 / 空闲全灭）+ 三档亮度 + S5 按键闪
+//! 均已在真板上确认为预期表现。期间踩过的坑见本文末尾「HID 描述符缓存」一节。
+//!
 //! # 下发节奏：心跳 + ttl
 //!
 //! 灯语**不是**"发一次就永远亮着"。每一帧自带 `ttl_ms`，到期后固件自动回落到既有
@@ -46,12 +51,33 @@
 //! - 拔掉 USB 同理（固件侧 ttl 与连接无关，只看本地时钟）。
 //!
 //! 心跳周期必须显著小于 ttl（这里 5s 心跳 / 15s ttl，容忍两次连续丢帧）。
+//!
+//! # 一个必须知道的外部约束：Windows 的 HID 描述符缓存
+//!
+//! 本模块调用 [`transport::send_feature_report`]（底层 `HidD_SetFeature`）下发 `0x16`。
+//! 若失败，**先怀疑设备没重新枚举，而不是先怀疑本文件的逻辑**。
+//!
+//! 2026-10-14 实测：全矩阵探测发现只有 `0x10` 能下发、`0x12`–`0x16` 全部返回
+//! `ERROR_INVALID_PARAMETER (0x57)`。而固件源码里`0x16` 描述符一直是齐的
+//! —— 根因是 **Windows 缓存了旧版 HID 报告描述符**，固件更新了描述符但设备没重新枚举，
+//! 主机侧仍按旧描述符校验，于是"协议对不上"表现为"参数无效"而不是"找不到设备"。
+//!
+//! **排查口诀**：灯完全不响应 → 先让设备重新枚举（关机再开机 / 拔插 USB /
+//! 设备管理器里禁用再启用），再回头看代码。反过来做会浪费很久。
+//!
+//! 顺带一个反直觉事实：`ERROR_INVALID_FUNCTION (0x01)` 与`0x57` 语义不同——
+//! 前者是"这个 Report ID 设备根本不支持"，后者是"支持但本次参数/长度不对"。
+//! 全矩阵探测要按错误码分类读，别一律当成"失败"。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 
-use crate::agent_desk::state::{LightState, RuntimeSnapshot};
+use crate::agent_desk::state::RuntimeSnapshot;
+// `LightState` 只被下方 `#[cfg(test)]` 的构造器用到，主代码不碰。
+// 不加 cfg 限定的话，release 构建会报 unused import 警告。
+#[cfg(test)]
+use crate::agent_desk::state::LightState;
 use crate::constants::REPORT_ID_DESK_LED;
 use crate::transport;
 
@@ -73,8 +99,7 @@ pub const HEARTBEAT_MS: u64 = 5_000;
 /// 默认 ttl（毫秒）。**必须显著大于 [`HEARTBEAT_MS`]**，否则网络/调度抖一下灯就闪回。
 pub const DEFAULT_TTL_MS: u32 = 15_000;
 
-/// 单槽未读数的亮度分档上限（第 3 档）。到顶不再增——见 [`unread_tier`]。
-const UNREAD_TIER_MAX: u32 = 3;
+/// 单槽未读数的最高档位。**刻意不是 9 档线性亮度**，理由见 [`brightness_tier`]。
 
 /// 一个颜色。值域与固件既有色板一致（0–30 量级，不是 0–255）。
 ///
@@ -107,27 +132,66 @@ impl Rgb {
     }
 }
 
-/// 某槽有未读时用的底色（与固件 `kCompletedUnread` 同色）。
-const UNREAD_COLOR: Rgb = Rgb::new(0, 24, 5);
+/// **槽位待播底色**（有未读等你听）。与固件 `kCompletedUnread` 同色。
+const PENDING_COLOR: Rgb = Rgb::new(0, 24, 5);
 
-/// 喇叭正在播这个槽时的颜色。
+/// 槽位**执行**色：任务已下发、正在跑。
 ///
-/// **刻意不用绿色**：绿色已经表示"有未读等你听"，而"正在播"是另一件事
-/// （此刻正在消费未读）。用白色让这两种状态一眼可分，而不是靠亮度去猜。
-const PLAYING_COLOR: Rgb = Rgb::new(18, 22, 22);
+/// 选**蓝**而不是复用黄色/橙色：黄色与橙色在 WS2812 上相邻，色觉障碍者几乎分不开，
+/// 而"正在跑"是最高频、最需要一眼认出的状态，必须占一个色相上离其他三色都远的位置。
+const RUNNING_COLOR: Rgb = Rgb::new(0, 12, 30);
 
-/// 第 5 颗灯：运行数 0–4 → 绿 / 黄 / 橙 / 紫 / 红。
+/// 槽位**播放**色：喇叭正在念这个槽的结果。
 ///
-/// 语义是**负载指示**：越忙越"烫"。两端的取舍：
-/// - 0 运行时亮**绿**（待命），不是灭 —— 灭留给"设备没连上/未初始化"，两者必须可区分；
-/// - 4 运行时红，与固件 `kFailed` 的红同色 —— 满负荷是需要被注意的状态。
-const RUN_COLORS: [Rgb; 5] = [
-    Rgb::new(0, 24, 5),  // 0 · 绿（待命）
-    Rgb::new(24, 20, 0), // 1 · 黄
-    Rgb::new(30, 12, 0), // 2 · 橙（与固件 kWaitingUser 同色）
-    Rgb::new(16, 0, 28), // 3 · 紫
-    Rgb::new(30, 0, 8),  // 4 · 红（与固件 kFailed 同色）
-];
+/// **刻意不用白色**（v1 曾用白 `{18,22,22}`）：白在三色通道都拉满，亮度高、耗电大，
+/// 且与"待播绿"在低亮度下容易糊在一起。改用**青**，色相独立于绿/蓝，且亮度
+/// 明显低于蓝（14 vs 30），远处扫一眼也能分开"在念"和"在跑"。
+const PLAYING_COLOR: Rgb = Rgb::new(0, 20, 14);
+
+/// 槽位**空闲**色：既没在跑、也没在播、也没有未读。
+///
+/// **全灭**（`Rgb::OFF`）。这与 v2 初稿相反——初稿用极暗蓝 `(0,1,2)`，
+/// 理由是"全灭要留给设备没连上"。真机证明那个理由**站不住**：
+/// ① WS2812 在 0–30 量级下 `(0,1,2)` 实际可辨，用户会读成"这槽有微弱状态"，
+///    与"空闲 = 没事"直接矛盾；② 真正的掉线本来就另有判据（`send_feature_report`
+///    报错 + `led_ok` 日志翻转），不需要靠"全灭"这个视觉信号来表达。
+/// 现在空闲就是灭，语义最直接：**亮 = 有状态，灭 = 没事**。
+const IDLE_COLOR: Rgb = Rgb::OFF;
+
+// ── 待播亮度三档 ────────────────────────────────────────────────────────
+//
+// 三档而非 9 档线性：人眼对亮度是**对数**感知，而 `MAX_UNREAD_PER_SLOT = 9`
+// 若线性分 1/9，最暗那档是 `{0, 24, 5} × 1/9 ≈ {0, 2, 0}` —— 实际接近看不见，
+// 等于白占一个档位。三档每档都清晰可辨，且"到顶不再增"的意图不变。
+//
+// 分母固定 3：档位 t ∈ {1,2,3} 直接就是亮度分数，语义与"第几档"完全对齐。
+
+/// 未读数分档的**分母**（= 最高档位）。亮度分数 = 档位 / 本常数。
+const BRIGHTNESS_DENOM: u32 = 3;
+
+/// 最高档位。到顶不再增——未读再多也是第 3 档。
+const BRIGHTNESS_MAX_TIER: u32 = BRIGHTNESS_DENOM;
+
+/// 第 5 颗灯：按键反馈专用。
+
+/// 按键按下时第 5 颗灯闪一次的**全亮**色。
+///
+/// 用中性白：这一下表达的是"设备收到了你这一按"，是**输入确认**而不是任务状态，
+/// 必须与任何槽位语义色都不同，也不该被误读成某个槽在跑。
+const KEYPRESS_FLASH_COLOR: Rgb = Rgb::new(30, 30, 30);
+
+/// 按键闪烁的**持续时间**（毫秒）。
+///
+/// 取 120ms：短到不干扰（不会让人以为"这一槽在跑"），长到余光能捕捉到。
+/// 再短会错过（人眼对极短闪光只能感知到"暗了一下"），再长就会和状态色混淆。
+pub const KEYPRESS_FLASH_MS: u64 = 120;
+
+/// 第 5 颗灯按键闪烁后的**保持态**：全灭。
+///
+/// 与 [`IDLE_COLOR`] 一致——空闲即灭。S5 只在按键后那 120ms 里亮，
+/// 之后必须回到全灭，否则"第五颗常亮一点"会被当成某种常驻状态。
+const KEYPRESS_IDLE_COLOR: Rgb = Rgb::OFF;
+
 
 /// 一帧灯语。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -178,50 +242,141 @@ impl DeskLedFrame {
     }
 }
 
-/// 由快照算出 5 颗灯的颜色。**纯函数**：不碰设备、不碰全局状态。
+/// 槽位灯色。**四选一**，互斥，优先级从上到下。
 ///
-/// 布局：
-/// - 第 1–4 颗（index 0–3）= 槽 1–4 的未读（绿，亮度分 3 档）；
-/// - 第 5 颗（index 4）= 正在执行的槽数（0–4 → 绿/黄/橙/紫/红）。
-pub fn language_for(snapshot: &RuntimeSnapshot) -> [Rgb; PIXEL_COUNT] {
-    let mut pixels = [Rgb::OFF; PIXEL_COUNT];
-
-    for slot in 0..(PIXEL_COUNT - 1) {
-        let Some(view) = snapshot.unread.slots.get(slot) else {
-            // 快照槽数比灯珠少：留灭。不 panic、也不"借用"别的槽的数据。
-            continue;
-        };
-        pixels[slot] = if view.leased {
-            PLAYING_COLOR
-        } else {
-            match unread_tier(view.pending) {
-                Some((numerator, denominator)) => UNREAD_COLOR.scaled(numerator, denominator),
-                None => Rgb::OFF,
-            }
-        };
-    }
-
-    let running = snapshot.queue.running_count.min(RUN_COLORS.len() - 1);
-    pixels[PIXEL_COUNT - 1] = RUN_COLORS[running];
-    pixels
+/// 排优先级不是随手定的，取决于"哪个更紧急"：
+/// **播放 > 执行 > 待播 > 空闲**。理由是前两者都是**当下正在发生**的事，
+/// 此刻就在发生的事必须压过"攒着等你处理"的事，否则灯会在你干活时一直提示未读。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotLight {
+    /// 有未读结果等你听（亮度按未读数分三档）。
+    Pending,
+    /// 任务已下发、正在执行。
+    Running,
+    /// 喇叭正在念这个槽的结果。
+    Playing,
+    /// 没事。
+    Idle,
 }
 
-/// 未读数 → 亮度档位 `(分子, 分母)`。返回 `None` 表示"无未读、灭灯"。
+/// 由快照算出这个槽该显示什么**状态**（不含亮度）。
 ///
-/// **刻意不是 9 档线性亮度**：`MAX_UNREAD_PER_SLOT` 是 9，若按 1/9…9/9 线性，
-/// 最暗那档是 `{0, 24, 5} × 1/9 = {0, 2, 0}` —— 在 WS2812 上基本等于看不见，
-/// 而人眼对亮度是**对数**感知的，线性分档在低端几乎不可分辨。
-/// 改 3 档（1–3 / 4–6 / ≥7）后每一档都清晰可辨，且"到顶不再增"的意图不变。
-fn unread_tier(pending: u32) -> Option<(u32, u32)> {
+/// 纯函数：不碰设备、不碰全局状态。播放优先于执行——两个能同时成立
+/// （任务还没跑完就先播了上一条的结果），此时"正在念"是更贴近用户耳朵的事实。
+pub fn slot_light_for(
+    running: bool,
+    playing: bool,
+    pending: u32,
+) -> SlotLight {
+    if playing {
+        SlotLight::Playing
+    } else if running {
+        SlotLight::Running
+    } else if pending > 0 {
+        SlotLight::Pending
+    } else {
+        SlotLight::Idle
+    }
+}
+
+/// 把一个状态映射成颜色。`pending` 只在 [`SlotLight::Pending`] 下被用到。
+pub fn color_for(state: SlotLight, pending: u32) -> Rgb {
+    match state {
+        SlotLight::Running => RUNNING_COLOR,
+        SlotLight::Playing => PLAYING_COLOR,
+        SlotLight::Idle => IDLE_COLOR,
+        // 只有待播需要按未读数调亮度。
+        SlotLight::Pending => match brightness_tier(pending) {
+            Some((numerator, denominator)) => PENDING_COLOR.scaled(numerator, denominator),
+            None => IDLE_COLOR,
+        },
+    }
+}
+
+/// 未读数 → 亮度档位 `(分子, 分母)`。返回 `None` 表示"无未读"。
+///
+/// 档位边界：1–3 → 第 1 档；4–6 → 第 2 档；≥7 → 第 3 档（到顶饱和）。
+/// 分子就是档位本身（1/3、2/3、3/3），分母固定 [`BRIGHTNESS_DENOM`]。
+pub fn brightness_tier(pending: u32) -> Option<(u32, u32)> {
     if pending == 0 {
         return None;
     }
-    let tier = ((pending + 2) / 3).min(UNREAD_TIER_MAX);
-    Some((tier, UNREAD_TIER_MAX))
+    let tier = ((pending + 2) / 3).min(BRIGHTNESS_MAX_TIER);
+    Some((tier, BRIGHTNESS_DENOM))
+}
+
+/// 由快照算出 5 颗灯的颜色。**纯函数**：不碰设备、不碰全局状态。
+///
+/// 布局：
+/// - 第 1–4 颗（index 0–3）= 槽 1–4 的状态色，四选一（执行/播放/待播/空闲）；
+///   待播时亮度按未读数分三档。
+/// - 第 5 颗（index 4）= **按键反馈**，不表达任何槽位状态。
+///
+/// `flash` **刻意不进 `RuntimeSnapshot`**：那份结构是 `Serialize + Eq` 的对外契约，
+/// 而闪烁依据是 `Instant`（单调时钟，不可序列化、跨进程比较无意义）。
+/// 把它塞进去会为了一个灯效去改序列化合同 —— 那是把局部需求泄漏到公共结构。
+pub fn language_for(snapshot: &RuntimeSnapshot, flash: Option<&KeypressFlash>) -> [Rgb; PIXEL_COUNT] {
+    let mut pixels = [IDLE_COLOR; PIXEL_COUNT];
+
+    for slot in 0..(PIXEL_COUNT - 1) {
+        // 队列视图给"是否在执行"，未读视图给"是否在播"和"未读数"——三者在不同结构里。
+        // 缺任一视图时按"没有该信息"处理（false / 0），绝不让整个映射 panic。
+        let running = snapshot
+            .queue
+            .slots
+            .get(slot)
+            .and_then(|s| s.running.as_ref())
+            .is_some();
+        let view = snapshot.unread.slots.get(slot);
+        let playing = view.map(|v| v.leased).unwrap_or(false);
+        let pending = view.map(|v| v.pending).unwrap_or(0);
+
+        pixels[slot] = color_for(slot_light_for(running, playing, pending), pending);
+    }
+
+    pixels[PIXEL_COUNT - 1] = keypress_color(flash);
+    pixels
+}
+
+/// 第 5 颗灯的颜色：`flash` 尚在有效期内 ⇒ 全亮，否则保持极暗。
+///
+/// **只判"距上次按下是否已超过 [`KEYPRESS_FLASH_MS`]"，不比较时间戳大小**：
+/// `Instant::elapsed()` 在时钟异常时会返回一个**饱和的巨大值**（而不是 panic 或负数），
+/// 所以这里"超过阈值 ⇒ 熄灭"的单向判断天然安全，不会出现常亮。
+/// 墙钟（`SystemTime`）会因时区同步/NTP 校正跳变，用它做闪烁必然出鬼，
+/// 所以 [`KeypressFlash`] 存的是 `Instant` 而不是时间戳。
+fn keypress_color(flash: Option<&KeypressFlash>) -> Rgb {
+    match flash {
+        Some(f) => {
+            if f.since.elapsed().as_millis() as u64 <= KEYPRESS_FLASH_MS {
+                KEYPRESS_FLASH_COLOR
+            } else {
+                KEYPRESS_IDLE_COLOR
+            }
+        }
+        None => KEYPRESS_IDLE_COLOR,
+    }
 }
 
 /// 全局单调序号。`fetch_add` 保证多线程下也**不会复用**同一个值。
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// 一次按键闪烁的记录：按下时刻。
+///
+/// **用单调时钟（[`Instant`]）而不是墙钟**：灯语只关心"距刚才多久"，
+/// 而用户改系统时间会让墙钟跳变——那会让一次 120ms 的闪烁变成常亮或永不亮。
+/// `Instant` 不受系统时间调整影响。
+#[derive(Clone, Copy, Debug)]
+pub struct KeypressFlash {
+    pub since: std::time::Instant,
+}
+
+impl KeypressFlash {
+    pub fn now() -> Self {
+        Self { since: std::time::Instant::now() }
+    }
+}
+
 
 /// 取下一个序号。从 1 开始（0 保留给"尚未发过任何帧"）。
 pub fn next_sequence() -> u32 {
@@ -230,14 +385,20 @@ pub fn next_sequence() -> u32 {
 
 /// 把快照算成灯语并下发给设备。
 ///
+/// `flash` 是最近一次按键时刻；心跳重发时传 `None` 即可（第 5 颗会保持暗）——
+/// 闪烁只有"按下那一瞬间"才有意义，心跳续期不需要重复表达它。
+///
 /// 失败**必须**把原因带回去（"失败不静默"）：调用方要么显示它、要么记日志，
 /// 但不能假装灯已经变了。
-pub fn push_snapshot(snapshot: &RuntimeSnapshot) -> Result<DeskLedFrame, String> {
+pub fn push_snapshot(
+    snapshot: &RuntimeSnapshot,
+    flash: Option<&KeypressFlash>,
+) -> Result<DeskLedFrame, String> {
     let frame = DeskLedFrame {
         sequence: next_sequence(),
         ttl_ms: DEFAULT_TTL_MS,
         active: true,
-        pixels: language_for(snapshot),
+        pixels: language_for(snapshot, flash),
     };
     transport::send_feature_report(&frame.encode())?;
     Ok(frame)
@@ -253,16 +414,31 @@ pub fn push_clear() -> Result<DeskLedFrame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_desk::queue::{QueueSnapshot, SlotQueueView};
+    use crate::agent_desk::queue::{
+        QueueSnapshot, QueuedTask, RunningTask, SlotQueueView, TaskId,
+    };
     use crate::agent_desk::unread::{SlotUnreadView, UnreadSnapshot};
 
-    /// 构造一个可控的快照：给定各槽未读数、运行数、播放中的槽。
-    fn snapshot(unread: &[u32], running_count: usize, playing: Option<usize>) -> RuntimeSnapshot {
+    /// 构造一个可控的快照：给定各槽未读数、各槽是否在跑、播放中的槽。
+    fn snapshot(
+        unread: &[u32],
+        running: &[bool],
+        playing: Option<usize>,
+    ) -> RuntimeSnapshot {
         let slot_count = 4;
         let queue_slots = (0..slot_count)
             .map(|index| SlotQueueView {
                 index,
-                running: None,
+                running: running.get(index).copied().unwrap_or(false).then(|| RunningTask {
+                    task: QueuedTask {
+                        id: index as TaskId + 1,
+                        slot: index,
+                        prompt: "p".into(),
+                        driver_id: "d".into(),
+                        enqueued_at_ms: 0,
+                    },
+                    started_at_ms: 0,
+                }),
                 pending: Vec::new(),
                 depth: 0,
             })
@@ -275,6 +451,7 @@ mod tests {
                 leased: playing == Some(index),
             })
             .collect();
+        let running_count = running.iter().filter(|r| **r).count();
         RuntimeSnapshot {
             queue: QueueSnapshot {
                 running_count,
@@ -296,6 +473,11 @@ mod tests {
             idle: running_count == 0,
             any_unread: unread.iter().any(|n| *n > 0),
         }
+    }
+
+    /// 全空闲基准：四槽都没跑、没播、没未读。
+    fn idle_snapshot() -> RuntimeSnapshot {
+        snapshot(&[0; 4], &[false; 4], None)
     }
 
     #[test]
@@ -360,72 +542,153 @@ mod tests {
         assert_eq!(&report[9..13], &0u32.to_le_bytes());
     }
 
+    // ── 四种状态：互斥且可区分 ────────────────────────────────────────────
+
     #[test]
-    fn no_unread_leaves_first_four_pixels_dark() {
-        let pixels = language_for(&snapshot(&[0, 0, 0, 0], 0, None));
-        for (i, pixel) in pixels.iter().enumerate().take(PIXEL_COUNT - 1) {
-            assert_eq!(*pixel, Rgb::OFF, "槽 {i} 无未读必须是灭的");
+    fn four_states_map_to_four_distinct_colors() {
+        let colors = [
+            RUNNING_COLOR,
+            PLAYING_COLOR,
+            PENDING_COLOR,
+            IDLE_COLOR,
+        ];
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "状态色 {i} 与 {j} 必须不同");
+            }
         }
     }
 
     #[test]
-    fn unread_brightness_has_three_tiers_and_saturates() {
-        let one = language_for(&snapshot(&[1, 0, 0, 0], 0, None))[0];
-        let four = language_for(&snapshot(&[4, 0, 0, 0], 0, None))[0];
-        let seven = language_for(&snapshot(&[7, 0, 0, 0], 0, None))[0];
-        let nine = language_for(&snapshot(&[9, 0, 0, 0], 0, None))[0];
-        let huge = language_for(&snapshot(&[200, 0, 0, 0], 0, None))[0];
+    fn slot_state_is_exactly_one_of_four() {
+        // 穷举 2^3 组合（running / playing / pending），断言互斥优先级：
+        // playing > running > pending > idle。
+        assert_eq!(slot_light_for(true, true, 0), SlotLight::Playing);
+        assert_eq!(slot_light_for(false, true, 0), SlotLight::Playing);
+        assert_eq!(slot_light_for(true, false, 0), SlotLight::Running);
+        assert_eq!(slot_light_for(true, false, 5), SlotLight::Running, "执行优先于待播");
+        assert_eq!(slot_light_for(false, false, 5), SlotLight::Pending);
+        assert_eq!(slot_light_for(false, false, 0), SlotLight::Idle);
+        assert_eq!(slot_light_for(false, true, 5), SlotLight::Playing, "播放优先级最高");
+    }
 
-        // 三档彼此不同
-        assert_ne!(one, four);
-        assert_ne!(four, seven);
-        // 亮度单调不减
-        assert!(one.g < four.g && four.g < seven.g, "亮度必须随未读数递增");
-        // 到上限不再增（9 与 200 同一档）
-        assert_eq!(nine, seven);
-        assert_eq!(huge, seven, "超过上限必须饱和，不能继续变亮");
-        // 色相必须仍是"未读绿"的缩放：绿色通道主导。
-        // 不断言 r/b 恰好为 0 —— 底色里 b=5，缩到 1/3 档是 1（整数截断），
-        // 写死成 0 会让这条测试变成"看运气"的东西。判"主导"才是有意义的判据。
+    #[test]
+    fn running_slot_is_blue_and_is_not_confused_with_pending_green() {
+        // 这条正对着实机踩到的坑：以前"亮着"会被读成"在执行"，
+        // 现在执行与待播必须是色相上离得开的两种颜色。
+        let pixels = language_for(&snapshot(&[0; 4], &[true, false, false, false], None), None);
+        assert_eq!(pixels[0], RUNNING_COLOR);
+        assert_ne!(RUNNING_COLOR, PENDING_COLOR);
         assert!(
-            one.g > one.r && one.g > one.b,
-            "未读灯必须以绿为主导，实际 {one:?}"
+            RUNNING_COLOR.b > RUNNING_COLOR.g && RUNNING_COLOR.b > RUNNING_COLOR.r,
+            "执行必须是蓝主导，实际 {RUNNING_COLOR:?}"
+        );
+        assert!(
+            PENDING_COLOR.g > PENDING_COLOR.b && PENDING_COLOR.g > PENDING_COLOR.r,
+            "待播必须是绿主导，实际 {PENDING_COLOR:?}"
         );
     }
 
     #[test]
-    fn playing_slot_is_white_not_green_so_it_is_never_confused_with_unread() {
-        let pixels = language_for(&snapshot(&[3, 0, 0, 0], 0, Some(0)));
-        assert_eq!(pixels[0], PLAYING_COLOR);
-        assert_ne!(pixels[0], UNREAD_COLOR.scaled(1, 3));
-        // 白色三通道都非零 —— 这是它与绿色最直观的区别
-        assert!(pixels[0].r > 0 && pixels[0].g > 0 && pixels[0].b > 0);
+    fn playing_slot_is_cyan_and_distinct_from_running_blue() {
+        let pixels = language_for(&snapshot(&[0; 4], &[true, false, false, false], Some(0)), None);
+        assert_eq!(pixels[0], PLAYING_COLOR, "播放优先于执行");
+        assert_ne!(PLAYING_COLOR, RUNNING_COLOR, "播放与执行不能同色");
+        assert!(PLAYING_COLOR.g > 0 && PLAYING_COLOR.b > 0 && PLAYING_COLOR.r == 0);
     }
 
     #[test]
-    fn running_count_maps_to_five_distinct_colors() {
-        let colors: Vec<Rgb> = (0..=4)
-            .map(|n| language_for(&snapshot(&[0; 4], n, None))[PIXEL_COUNT - 1])
-            .collect();
-        for i in 0..colors.len() {
-            for j in (i + 1)..colors.len() {
-                assert_ne!(colors[i], colors[j], "运行数 {i} 与 {j} 必须不同色");
-            }
+    fn idle_slot_is_fully_off() {
+        let pixels = language_for(&idle_snapshot(), None);
+        for (i, pixel) in pixels.iter().enumerate().take(PIXEL_COUNT - 1) {
+            assert_eq!(*pixel, Rgb::OFF, "槽 {i} 空闲必须全灭");
         }
-        assert_eq!(colors[0], RUN_COLORS[0]);
-        assert_eq!(colors[4], RUN_COLORS[4]);
+        // 语义收敛成一句话：**亮 = 有状态，灭 = 没事**。
+        // 掉线另有判据（send_feature_report 报错 + led_ok 日志翻转），
+        // 不再靠"全灭"这个视觉信号去表达。
+        assert_eq!(IDLE_COLOR, Rgb::OFF, "空闲就是全灭，不做极暗蓝");
+    }
+
+    // ── 待播三档亮度 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn brightness_tier_boundaries_are_one_to_three_four_to_six_seven_plus() {
+        assert_eq!(brightness_tier(0), None);
+        assert_eq!(brightness_tier(1), Some((1, 3)));
+        assert_eq!(brightness_tier(3), Some((1, 3)), "3 仍是第 1 档");
+        assert_eq!(brightness_tier(4), Some((2, 3)), "4 进第 2 档");
+        assert_eq!(brightness_tier(6), Some((2, 3)), "6 仍是第 2 档");
+        assert_eq!(brightness_tier(7), Some((3, 3)), "7 进第 3 档");
+        assert_eq!(brightness_tier(9), Some((3, 3)), "到上限不再增");
+        assert_eq!(brightness_tier(200), Some((3, 3)), "必须饱和不能越界");
     }
 
     #[test]
-    fn running_count_beyond_four_saturates_at_red() {
-        let red = language_for(&snapshot(&[0; 4], 4, None))[PIXEL_COUNT - 1];
-        let more = language_for(&snapshot(&[0; 4], 99, None))[PIXEL_COUNT - 1];
-        assert_eq!(more, red, "运行数超过灯能表达的档位必须饱和，不能越界");
+    fn pending_brightness_increases_monotonically_across_three_tiers() {
+        let one = language_for(&snapshot(&[1, 0, 0, 0], &[false; 4], None), None)[0];
+        let four = language_for(&snapshot(&[4, 0, 0, 0], &[false; 4], None), None)[0];
+        let seven = language_for(&snapshot(&[7, 0, 0, 0], &[false; 4], None), None)[0];
+
+        assert_ne!(one, four, "第 1、2 档必须不同");
+        assert_ne!(four, seven, "第 2、3 档必须不同");
+        assert!(one.g < four.g && four.g < seven.g, "亮度必须随档位递增");
+        // 三档都必须是绿主导（缩放不改变色相）
+        for (name, c) in [("第1档", one), ("第2档", four), ("第3档", seven)] {
+            assert!(c.g > c.r && c.g > c.b, "{name} 必须绿主导，实际 {c:?}");
+        }
     }
 
     #[test]
-    fn fewer_slots_than_pixels_does_not_panic_and_leaves_them_dark() {
-        // 快照只有 2 个槽（协议允许的退化输入），不能 panic、也不许借用别的槽的数据。
+    fn pending_brightness_does_not_leak_into_other_states() {
+        // 未读再多也不该改变"执行"或"播放"的颜色——亮度分档只属于待播。
+        let one = language_for(&snapshot(&[1, 0, 0, 0], &[true, false, false, false], None), None)[0];
+        let many = language_for(&snapshot(&[9, 0, 0, 0], &[true, false, false, false], None), None)[0];
+        assert_eq!(one, many, "执行态不得受未读数影响");
+        assert_eq!(one, RUNNING_COLOR);
+    }
+
+    // ── S5 按键闪烁 ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fifth_pixel_is_keypress_feedback_not_a_slot_state() {
+        let snap = snapshot(&[3, 3, 3, 3], &[false; 4], None);
+        let no_flash = language_for(&snap, None);
+        let with_flash = language_for(&snap, Some(&KeypressFlash::now()));
+
+        // 闪烁只影响第 5 颗，前 4 颗（槽位状态）必须一模一样。
+        assert_eq!(no_flash[..PIXEL_COUNT - 1], with_flash[..PIXEL_COUNT - 1]);
+
+        let fifth = with_flash[PIXEL_COUNT - 1];
+        assert_eq!(fifth, KEYPRESS_FLASH_COLOR, "按下 120ms 内必须是全亮");
+        assert_ne!(fifth, no_flash[PIXEL_COUNT - 1], "闪烁与保持态必须不同");
+        // S5 不得复用任何槽位语义色，否则会被误读成某个槽的状态。
+        for state_color in [RUNNING_COLOR, PLAYING_COLOR, PENDING_COLOR, IDLE_COLOR] {
+            assert_ne!(fifth, state_color, "S5 不能复用槽位状态色");
+        }
+    }
+
+    #[test]
+    fn fifth_pixel_returns_to_dim_after_flash_expires() {
+        // 直接用过期时刻构造：闪了 1 秒，早过了 120ms。
+        let expired = KeypressFlash { since: std::time::Instant::now() - std::time::Duration::from_secs(1) };
+        let pixels = language_for(&idle_snapshot(), Some(&expired));
+        assert_eq!(pixels[PIXEL_COUNT - 1], KEYPRESS_IDLE_COLOR, "超时后必须灭回去");
+        assert_ne!(KEYPRESS_IDLE_COLOR, KEYPRESS_FLASH_COLOR);
+    }
+
+    #[test]
+    fn fifth_pixel_without_any_keypress_is_off() {
+        let pixels = language_for(&idle_snapshot(), None);
+        assert_eq!(pixels[PIXEL_COUNT - 1], Rgb::OFF, "S5 静止时必须全灭");
+        // 心跳重发时不传闪烁 ⇒ 第 5 颗保持灭，不会每 5 秒假闪一次。
+        assert_eq!(KEYPRESS_IDLE_COLOR, Rgb::OFF);
+    }
+
+    // ── 退化输入 ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn fewer_slots_than_pixels_does_not_panic_and_leaves_them_idle() {
+        // 快照只有 1 个槽（协议允许的退化输入），不能 panic、也不许借用别的槽的数据。
         let snap = RuntimeSnapshot {
             queue: QueueSnapshot {
                 running_count: 0,
@@ -438,19 +701,29 @@ mod tests {
             unread: UnreadSnapshot {
                 total_pending: 0,
                 playing_slot: None,
-                slots: vec![
-                    SlotUnreadView { index: 0, pending: 5, generation: 0, leased: false },
-                ],
+                slots: vec![SlotUnreadView { index: 0, pending: 5, generation: 0, leased: false }],
             },
             light: LightState::from_queue(0, 0),
             busy: false,
             idle: true,
             any_unread: true,
         };
-        let pixels = language_for(&snap);
-        assert_ne!(pixels[0], Rgb::OFF, "存在的槽必须正常点亮");
-        assert_eq!(pixels[1], Rgb::OFF);
-        assert_eq!(pixels[3], Rgb::OFF);
+        let pixels = language_for(&snap, None);
+        assert_ne!(pixels[0], IDLE_COLOR, "存在的槽必须按未读点亮");
+        assert_eq!(pixels[0], PENDING_COLOR.scaled(2, 3), "5 条未读 = 第 2 档");
+        assert_eq!(pixels[1], IDLE_COLOR, "不存在的槽必须是空闲色");
+        assert_eq!(pixels[3], IDLE_COLOR);
+    }
+
+    #[test]
+    fn slot_index_selects_its_own_pixel_only() {
+        // 钦友实机报的第二个现象：按 S2 灯还是 S1 亮。根因是映射没读"哪个槽在跑"。
+        // 这条测试把"槽位隔离"钉死：只有自己那一颗会变。
+        let pixels = language_for(&snapshot(&[0; 4], &[false, true, false, false], None), None);
+        assert_eq!(pixels[0], IDLE_COLOR, "槽 1 没跑必须是空闲");
+        assert_eq!(pixels[1], RUNNING_COLOR, "槽 2 在跑必须是执行色");
+        assert_eq!(pixels[2], IDLE_COLOR);
+        assert_eq!(pixels[3], IDLE_COLOR);
     }
 
     #[test]

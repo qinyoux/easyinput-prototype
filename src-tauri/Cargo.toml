@@ -1,6 +1,6 @@
 [package]
 name = "easyop"
-version = "0.41.15"
+version = "0.43.2"
 description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
 authors = ["easyop"]
 edition = "2021"
@@ -42,6 +42,20 @@ tauri-build = { version = "2", features = [] }
 # **构建依赖图（host）**里，而 Cargo resolver v2（edition 2021 默认）**不跨
 # 宿主图与目标图合并特性** —— 挂到 `[dependencies]` 实测无效，报同一个错。
 indexmap = { version = "1.9", features = ["std"] }
+
+# ============================================================================
+[features] # Tauri 官方模板标准项，**不要删**
+# ============================================================================
+# `custom-protocol` 决定 `tauri::generate_context!()` 生成哪种加载器：
+#   - 开启：把 `frontendDist`（../dist）**内嵌进 exe**，用自定义协议 tauri:// 读
+#   - 关闭：退回 dev 模式，去 `devUrl`（http://localhost:1420）拉页面
+#
+# 2026-10-14 实测踩坑：本文件原先没有这一节，`npm run tauri build` 与
+# `tauri build` 走的都是 Tauri CLI，它会自动带上这个 feature，所以从没人发现；
+# 一次手工 `cargo build --release` 直接出包，双击就是
+# "localhost 拒绝连接 / ERR_CONNECTION_REFUSED"（devUrl 没服务器）。
+# ⇒ **出包必须走 Tauri CLI，或手工补 `--features custom-protocol`**。
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }

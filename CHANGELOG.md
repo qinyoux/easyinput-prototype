@@ -7,6 +7,237 @@
 
 ---
 
+## [v0.43.2] — 2026-10-14
+
+> 署名：workbuddy / easyinput-prototype / AI小助手
+
+> patch：**任务台灯语 v2 通过真机验证**，关闭 v0.43.1 的最大遗留项。
+> 同时修两处会让"下一位agent / 下一个打包的人"掉坑的配置缺失（见「修复」）。
+> **不改协议、不改固件、不改任何既有配置。**
+
+### 新增
+
+- **`device_led` 模块文档新增「Windows HID 描述符缓存」一节**：
+  把本轮排障的核心结论沉淀成代码旁的知识——灯完全不响应时**先让设备重新枚举**，
+  不要先怀疑代码。同时记下 `0x01`（设备不支持该 Report ID）与 `0x57`
+  （支持但参数/长度不对）的语义区别，提醒全矩阵探测必须按错误码分类读。
+- **使用说明新增「已完成的硬件联动」小节**：灯语过去被列在「当前未实现的能力」
+  表里（虽然那行写了⚠️），结构上会让人以为它还没做完；现已移出并明确标注验证日期。
+
+### 变更
+
+- **代码内灯语状态标注**：v2 语义**待复验 → 已实机验证**（`agent_desk/mod.rs` 模块表、
+  `device_led.rs` 模块文档、`docs/任务台设计方案.md` §16.5）。
+- **设计方案 §19 已知问题第7 条关闭**：改为记录"已复验通过 + 长期保留的排障口诀"。
+- 使用说明 §2 灯语对照补第5 颗的准确行为（**闪完即灭/平时全灭**）——
+  原文写"平时极暗"，那是 v0.43.1 之前的旧值，与代码不符。
+- 使用说明 §2 灯语对照补一条排错提醒：**灯完全不响应先让设备重新枚举**。
+
+### 修复
+
+- **`src-tauri/Cargo.toml` 缺 `[features] custom-protocol`**（Tauri 官方模板标准项）：
+  手工 `cargo build --release` 会产出**dev 模式包**——不内嵌前端资源，
+  双击即报 `ERR_CONNECTION_REFUSED`（去 `devUrl` localhost:1420 找页面）。
+  平时都用 `tauri build`（CLI 自动带该 feature），所以从未暴露。
+  **修法**：补 `[features] custom-protocol = ["tauri/custom-protocol"]`。
+  **判据**：exe 体积 17,611,264 → 17,890,816 B（+280 KB ≈ 内嵌的 dist）。
+  出包命令现固定为 `cargo build --release --features custom-protocol`。
+- **`transport::send_feature` 私有性**（`status_query.rs` 的未提交半成品调用它），
+  编译报 `E0603`。已放宽为 `pub(crate)`；**未改动 `status_query.rs` 一个字**
+  （多agent 协作纪律：不动他人半成品）。
+
+### ⚠️ 未完成
+
+- 无。灯语四项（四态 / 三档亮度 / 空闲全灭 / S5 按键闪）**均已在真机确认**，
+  逻辑侧 `cargo test --lib agent_desk` **273 passed / 0 failed**。
+- 说明：**HID 描述符缓存不是 bug，是 Windows 机制的固有约束**，无法"修掉"，
+  只能靠"出问题时知道该先干什么"来消化。已写入代码注释与两份文档。
+
+---
+
+## [v0.43.1] — 2026-10-14
+
+> 署名：qinyoux
+
+> patch：v2 灯语实机反馈后**推翻"空闲不灭灯"这条设计**。仅 `device_led.rs` 常量与
+> 两条测试，**不改协议、不改固件**。
+
+### 新增
+
+- 无。
+
+### 变更
+
+- **空闲状态改为全灭**（`IDLE_COLOR = Rgb::OFF`、`KEYPRESS_IDLE_COLOR = Rgb::OFF`）。
+  灯语语义收敛成一句：**亮 = 有状态，灭 = 没事**。
+- S5 保持态同步改全灭（原极暗白 `1,1,1`），静止时不再留一点微光。
+
+### 修复
+
+- **v0.43.0 那条"空闲要留极暗蓝、全灭留给掉线"的设计判断被实机证伪**，
+  两条理由都不成立：
+  ① WS2812 在 0–30 量级下 `(0,1,2)` **实际可辨**，用户会读成"这槽有微弱状态"，
+     与"空闲 = 没事"直接矛盾——这是实机可见的语义噪声，不是理论问题；
+  ② 真正的掉线**本来就有独立判据**：`send_feature_report` 返回 `Err`
+     + `led_ok` 布尔翻转 + 只在翻转时记的日志。用"全灭"这个视觉信号去表达掉线，
+     本来就是多余的间接编码，还制造了歧义。
+- 连带修正 `idle_slot_is_dim_but_not_fully_off` → `idle_slot_is_fully_off`、
+  `fifth_pixel_without_any_keypress_is_dim` → `..._is_off` 两条测试的断言与命名。
+
+### ⚠️ 未完成
+
+- **v2 灯语仍未实板复验**（空闲改全灭这一版尤其需要）。仅逻辑验证：
+  `cargo test --lib agent_desk` **273 passed / 0 failed**。
+  下一步：重插设备 / 重启宿主 HID 栈后实测四态 + 三档亮度 + 空闲全灭。
+- **"按 S1 后全亮蓝"尚未定位到宿主侧**。已排除的可能（逐条读码确认）：
+  `0x16` Report ID 正确、`queue.slots[].running` 快照链路完整、
+  `leds_[i] = pixels[i]` 固件渲染严格同序无衰减。
+  **最可能是固件回退到 `0x12` 渲染**——`agent_status_color(kRunning)` 返回
+  `{0,0,28}` 正是**蓝色**，且 `render_agent_status()` 会把 5 颗全上同色（居中衰减）。
+  即"全亮蓝"是 `0x12` 的特征，不是 `0x16` 的表现。
+  下一步：看 `led_ok` 是否翻转 / 有无"特征报告下发失败"日志，据此判定是 HID
+  描述符缓存（`0x16` 未被枚举）还是别的成因。
+
+---
+
+## [v0.43.0] — 2026-10-14
+
+> 署名：qinyoux
+
+> minor：任务台灯语（`0x16`）**v2 语义重定义**。起因是首次真机烧录后钦友实机报告
+> "按 S2 灯还是 S1 亮、第 4/5 颗同时亮绿，与文档不符"。诊断结论见
+> `.workbuddy/memory/2026-10-14.md`。**宿主侧单边改动，固件无需重烧**
+> （`0x16` 是逐像素通道，语义完全由宿主决定）。
+
+### 新增
+
+- **`SlotLight` 四态枚举**（`agent_desk::device_led`）：`Playing` / `Running` /
+  `Pending` / `Idle`，互斥，优先级 **播放 > 执行 > 待播 > 空闲**。
+  新增纯函数 `slot_light_for(running, playing, pending)` 与
+  `color_for(state, pending)`，把"判状态"与"选颜色"拆成两层各自可测。
+- **S5 按键闪烁**：`KeypressFlash`（存 `std::time::Instant`）+ `record_keypress()`。
+  按下时**当场下发**一帧全亮（`KEYPRESS_FLASH_COLOR`），120ms 后补一帧灭回去。
+  心跳续期**不传**闪烁标记，避免每 5 秒假闪一次。
+  `KEYPRESS_FLASH_MS = 120`、`KEYPRESS_FLASH_COLOR`、`KEYPRESS_IDLE_COLOR`
+  均为具名常量。
+- **三档亮度常量**：`BRIGHTNESS_DENOM = 3` / `BRIGHTNESS_MAX_TIER`，
+  档位边界由 `brightness_tier()` 单点定义并直接暴露给测试。
+
+### 变更
+
+- **灯语 v2 布局**（`language_for`）：
+  | 像素 | v1 | v2 |
+  |---|---|---|
+  | 1–4 | 各槽**未读**（绿，3 档亮度） | 各槽**状态四选一**（执行/播放/待播/空闲） |
+  | 5 | 全局运行数 0–4 绿/黄/橙/紫/红 | **按键反馈**（按下闪 120ms，其余时间极暗） |
+- **状态色**（色值仍为 0–30 量级，与固件既有色板一致）：
+  执行 `RUNNING_COLOR` 蓝 `(0,12,30)` / 播放 `PLAYING_COLOR` 青 `(0,20,14)` /
+  待播 `PENDING_COLOR` 绿 `(0,24,5)` / 空闲 `IDLE_COLOR` 极暗蓝 `(0,1,2)`。
+  播放色由 v1 的**白** `(18,22,22)` 改**青**：白三通道拉满、耗电大，且低亮度下
+  易与"待播绿"糊在一起；青色相独立且亮度明显低于蓝。
+- **空闲不灭灯**（`IDLE_COLOR` 极暗而非 `OFF`）：全灭必须保留给"设备没连上/
+  固件没烧/HID 没枚举"，否则"四槽空闲"与"掉线"长得一模一样、无法诊断。
+- **签名变更**：`language_for` / `push_snapshot` 新增 `flash: Option<&KeypressFlash>`。
+  闪烁**刻意不进 `RuntimeSnapshot`**——那份结构是 `Serialize + Eq` 的对外契约，
+  而 `Instant` 不可序列化，把灯效需求泄漏进公共结构是错的。
+- `DeskManager` 新增 `led_keypress` 字段；`handle_reserved_uuid` 在**所有校验之前**
+  调 `record_keypress`（它表达"设备收到了这一按"而非"这一按被采纳"，
+  被拒的按键也必须有反馈）。
+
+### 修复
+
+- **"按 S2 灯还是 S1 亮"——不是 BUG，是映射没读"哪个槽 running"**。
+  v1 的像素 1–4 只读 `unread.slots[i].pending`，`running` 只被聚合成第 5 颗的
+  一个数，**槽位维度的执行信息被整个丢掉**。"亮着"表达的是"有未读等你听"，
+  不是"在执行"，文档措辞叠加导致了误读。现已由
+  `slot_index_selects_its_own_pixel_only` 回归测试钉死槽位隔离。
+- 第 5 颗"常亮绿"改为**按键短闪**。v1 的 `running_count == 0 → 绿`（待命）会让
+  空闲时长期占用一颗灯表达"什么都没发生"，还会盖掉固件既有 idle 灯效。
+- 闪烁计时用 `Instant` 而非墙钟：系统时间被时区同步/NTP 校正跳变会让 120ms 的
+  闪烁变成常亮或永不亮。
+
+### ⚠️ 未完成
+
+- **v2 灯语尚未实板复验**：仅逻辑验证（`cargo test --lib agent_desk`
+  **273 passed / 0 failed**，新增 7 条）。固件 `0x16` 已于今日烧录并 hash 校验通过
+  （app bin `0x190BC0`，SHA256 `D4B3ED62…8AE16`），**本次改动不需要重烧固件**。
+  下一步：钦友重插设备 / 重启宿主 HID 栈（让新 Report ID 重新枚举）后，
+  对照四态 + 三档亮度实测。
+- **`docs/任务台使用说明.md` 与 `docs/任务台设计方案.md` 仍是 v1 描述**
+  （含"第 5 颗 = 运行数 0–4 五色"与"固件未烧"两处过期表述）。文档未在本版更新，
+  下一步补齐 v2 灯语对照表。
+
+---
+
+## [v0.42.0] — 2026-10-14
+
+> 署名：workbuddy/easyinput-prototype/锐
+
+> minor：任务台播报链路**三个实录 BUG 的根因修复 + 多任务播报人性化**。
+> 三个 BUG 均有日志 / rollout 文件 / 源码行号交叉实锤（诊断记录见
+> `.workbuddy/memory/2026-10-13.md`），修复各配回归测试钉死。
+> 改动集中在 `agent_desk`（Rust）与 `src/types.ts`，**无新增配置字段**。
+
+### 新增
+
+- **终态播报排队 + 合并提醒**（`notice_queue` / `drain_notice_queue`）：
+  喇叭被占用时，终态播报不再被丢弃，而是排队（上限 3 条）等当前播放结束后补播；
+  排队溢出丢**最旧**一条并计数，队列排空后补一条合并短通知
+  （`NoticeKind::ResultsWaiting`，code **11** 追加在闭集末尾 —— `code()` 即缓存
+  文件名契约，只能追加不能插队）。排队不打断任何人，包括用户的「播报未读」。
+- **事件类播报按 `(槽位, kind)` 记账**（`NoticeGate::should_emit_for`，
+  3 秒重复 guard）：S1 的「任务已完成」不再吞掉 S2 的「任务已完成」。
+  进度类保持全局账本（跃迁 + 最小间隔）—— 进度本就是由最老任务驱动的全局量。
+- **回归测试 10 条**：probe 首见 EOF 登记（`a_file_first_seen_is_registered_at_eof_and_history_is_ignored`）、
+  保活截止覆盖整段音频（`keepalive_deadline_covers_the_whole_audio`）、
+  双槽完成都能出声（`two_slots_completing_both_get_to_speak`）等。
+
+### 变更
+
+- **`desk_play_notice` 命令签名增加 `AppHandle` 参数**（前端 `invoke` 不变，
+  Tauri 自动注入）：试听播放结束后同样触发播报队列排水。
+- **`dispatch_task` 中「任务已开始」先于 `emit_state_if_changed` 发出**：
+  反序时两条同拍通知都过得了去抖，谁抢到通道全看调度运气；
+  正序时起点类先记账，随后的进度类正好被最小间隔挡住 —— 每次派发不再随机
+  剪断一半（v0.41.15 实录里那条"0 样本被抢占"日志的来源）。
+- **`PlaybackControl` 增加 `duration_ms()`**（设备侧精确值，含重采样与声道展开）：
+  两处等待超时（`speak_notice` / `desk_render_result`）改用它，删掉
+  `total_samples / 48_000` 的估算（既不除声道数也不顾设备采样率）。
+- **前端 `src/types.ts` 的 `NoticeKind` 联合类型补齐**：补上 v0.41.15 起就缺失的
+  `running_15min`，并同步新增 `results_waiting`（该类型缺口是 v0.41.15 CHANGELOG
+  「未完成」里记下的已知问题，本轮消除）。
+
+### 修复
+
+- **BUG 1「任务下发同时播报任务已完成」= 外部会话监工误报**（`codex_probe.rs`）：
+  旧 rollout 跌出 `seen` 回收表后，被任务台自己的 `codex exec resume` 追加写一笔
+  ⇒ mtime 变新、重新进入 24h 窗口 ⇒ 被当成"全新文件"**从偏移 0 整读** ⇒
+  18 个历史 `task_complete` 全变成新命中，`hits.first()` 播出 23 天前的一条。
+  修复：① 首见文件一律按 **EOF 登记、不读内容**（删 `primed` 分支差异）；
+  ② `run_probe` 在桌面任务执行中 + 跑完后 10 秒宽限内只消费偏移、不出声
+  （`last_desk_finish_ms`，CLI 退出到落盘之间有真实延迟）。
+- **BUG 2「只播一小段」= 音频保活截止时间单位错误**（`audio_out.rs`）：
+  `total_from_pcm` 返回**毫秒**却被当**样本数**套 `micros = ms*1e6/rate`，
+  48kHz 下时长缩 1/48 ⇒ >10.3s 的播报在 `0.02×时长+10s` 被 drop 流掐断
+  （实测：13.2s 播到 10.5s 断、35s 播到 10.96s 断）。
+  修复：保活截止改 `keepalive_deadline(duration_ms)`（毫秒进、毫秒出），
+  时长取**设备侧**精确值。**没有也不该有"播放时长"设置** —— 真旋钮是
+  `summary.max_chars`（该音色 ~6.6 字/s，252 字 ≈ 40s 过长，建议 80–120）。
+- **BUG 3「S2 完成静默进未读」= NoticeGate 全局一本账**（`notice.rs`）：
+  四槽共用"同类 kind 不重复播" ⇒ S1 完成（`last_kind=Completed`）后
+  S2 完成被吞，无播报行、无 TTS 请求，只有未读 +1；即使放行，`take_channel`
+  后到抢占也会剪断 S1 的长结论。修复即上述「按槽记账 + 终态排队」两项。
+
+### ⚠️ 未完成
+
+- 排队补播目前只在**终态类**上生效；进度类仍是被占用即丢（设计如此：进度可丢弃）。
+  队首等待期间的**实时进度**（"正在播第 2/3 条"）未做。
+- 合并提醒只报条数、不报"是哪几槽"：动态正文带槽位清单要先定"一句话说清四槽"的措辞。
+- 板子喇叭（固件 PCM 下行）仍未接通，本轮排队/播报机制跑在 PC 声卡上；
+  固件侧就绪后 `audio_out` 是唯一要替换的点。
+
+---
+
 ## [v0.41.15] — 2026-10-13
 
 > 署名：workbuddy/easyinput-prototype/锐

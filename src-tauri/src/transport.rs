@@ -54,7 +54,8 @@ pub fn chunk_reports(json: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(reports)
 }
 
-fn send_feature(handle: HANDLE, report: &[u8]) -> Result<(), String> {
+// crate内可见：status_query 的固件状态回读探针需按已打开的 HID 句柄下发 Feature Report
+pub(crate) fn send_feature(handle: HANDLE, report: &[u8]) -> Result<(), String> {
     let res = unsafe {
         HidD_SetFeature(handle, report.as_ptr() as *const core::ffi::c_void, report.len() as u32)
     };

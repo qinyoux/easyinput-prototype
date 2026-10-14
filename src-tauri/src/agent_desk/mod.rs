@@ -12,7 +12,7 @@
 //! | `unread` | 未读代际 + 播放租约（含持久化） | ✅ Phase 2 |
 //! | `driver` | 执行器校验 + Api/Cli 两种形态 + 世界门禁 | ✅ Phase 2 |
 //! | `state` | 运行时状态合成 + 变更检测 | ✅ Phase 2 |
-//! | `device_led` | 下行灯语：`0x16` 逐像素帧 + 心跳 | ✅ Phase 3（固件侧待烧） |
+//! | `device_led` | 下行灯语：`0x16` 逐像素帧 + 心跳 | ✅ Phase 3（0x16 已烧板，**v2 语义已实机验证通过** v0.43.2） |
 //! | `notice` / `notice_assets` / `audio_out` | 状态播报去抖、语料预合成缓存、PC 喇叭播放 | ✅ Phase 3（**板子喇叭未做**：固件没有"播任意 PCM"的通道） |
 //! | `router` | 能力路由（显式优先 → 自动兜底） | ⏳ Phase 4 |
 //!
@@ -59,8 +59,9 @@ pub use config::{DeskConfig, DeskConfigStore, DriverKind, SlotBinding};
 #[cfg(test)]
 use config::{Capability, DESK_CONFIG_FILE};
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,11 @@ pub struct DeskManager {
     /// 设备没插是常态；每 5 秒一条 warn 会把真正有用的日志淹掉。
     /// 初值 `true`（"还没失败过"），这样第一次失败一定会留下一条记录。
     led_ok: AtomicBool,
+    /// 最近一次按键的时刻，用于第 5 颗灯的短闪反馈。
+    ///
+    /// 存 `Option<KeypressFlash>` 而不存裸 `Instant`：需要区分"从没按过"和
+    /// "按过但已超时"——前者不该让灯语变成 active，后者只在 120ms 内有效。
+    led_keypress: Mutex<Option<device_led::KeypressFlash>>,
     /// 状态播报（Notice）的去抖器。
     ///
     /// 放在管理器上而不是散在执行路径里：因为**两条驱动源**
@@ -176,7 +182,44 @@ pub struct DeskManager {
     /// 这是**抢占规则**的落点：喇叭是物理单通道，所以"正在播什么"必须被显式记录，
     /// 否则无法回答"新来的这条该打断别人、还是该被丢弃"。
     playing: Mutex<Option<PlayingState>>,
+    /// 最近一次**桌面任务跑完**的时刻（unix 毫秒，0 = 本次运行还没跑完过任务）。
+    ///
+    /// 只为外部会话监工（C）的宽限静默服务：任务台自己用 `codex exec resume`
+    /// 往 rollout 追加内容，此刻外部会话的"完成"既可能是误报，也会与任务台
+    /// 自己的播报抢喇叭。跑完后仍要静默几秒 —— CLI 子进程退出到它把最后一行
+    /// 写进 rollout 之间有真实延迟，不收这一截就会补一句迟到的外部播报。
+    last_desk_finish_ms: AtomicU64,
+    /// 终态播报的**排队队列**（喇叭被占用时不丢，等当前播放结束后补播）。
+    ///
+    /// v0.41.15 之前终态播报被占用即丢：S1 的长结论还在播，S2 的"任务已完成"
+    /// 连日志行都没有就消失了 —— 用户只看到未读 +1，没有任何语音。
+    /// 排队不打断任何人，只是把"该说的"留到能说的时候。
+    notice_queue: Mutex<VecDeque<QueuedNotice>>,
+    /// 排水（补播队列）的单飞标志。两个播放线程同时排水会互相抢话。
+    notice_draining: AtomicBool,
+    /// 排队期间因**溢出**被丢弃的最旧条数。队列排空后补一条合并短通知，
+    /// 让用户知道"还有几条没念"—— 丢掉可以，但不许静默地丢。
+    notice_dropped: AtomicUsize,
 }
+
+/// 排队等补播的终态播报。
+///
+/// ⚠️ `text` 存的是**已定稿**的正文：排队期间绝不再跑一次 LLM 总结 ——
+/// 那既会让队首的等待无限拉长，也可能念出与字幕不同的版本。
+#[derive(Clone, Debug)]
+struct QueuedNotice {
+    kind: NoticeKind,
+    slot: Option<usize>,
+    /// 已定稿正文；`None` = 用固定语料。
+    text: Option<String>,
+}
+
+/// 终态播报排队上限。
+///
+/// 3 条的依据：四槽并行时极端情况是 4 条同时完成，留 3 条已覆盖"绝大多数
+/// 同时完成"；更多的让位给合并提醒（还有 N 条没念）—— 喇叭不是日志文件，
+/// 补播 10 分钟旧闻比丢几条更不人道。丢的是**最旧**的：用户刚听完了更新的状态。
+const NOTICE_QUEUE_CAP: usize = 3;
 
 /// 槽位会话的落盘文件名（在 `agent_desk_out/` 下）。
 const SESSIONS_FILE: &str = "slot_sessions.json";
@@ -249,6 +292,7 @@ impl DeskManager {
             cancel_tokens: Mutex::new((0..SLOT_COUNT).map(|_| None).collect()),
             led_active: AtomicBool::new(false),
             led_ok: AtomicBool::new(true),
+            led_keypress: Mutex::new(None),
             notice_gate: Mutex::new(NoticeGate::new()),
             probe: Mutex::new(CodexProbe::new()),
             probe_gate: Mutex::new(NoticeGate::new()),
@@ -256,6 +300,10 @@ impl DeskManager {
             pending_results: Mutex::new((0..SLOT_COUNT).map(|_| None).collect()),
             history: Mutex::new(Vec::new()),
             playing: Mutex::new(None),
+            last_desk_finish_ms: AtomicU64::new(0),
+            notice_queue: Mutex::new(VecDeque::new()),
+            notice_draining: AtomicBool::new(false),
+            notice_dropped: AtomicUsize::new(0),
         }
     }
 
@@ -983,15 +1031,29 @@ fn lease_error_code(e: &unread::LeaseError) -> ErrorCode {
 ///
 /// 规则（方案 §2.6.1，两条通道优先级不同）：
 ///
-/// - **结果正在播 ⇒ Notice 一律丢弃**。绝不打断"有结果等你听" ——
+/// - **结果正在播 ⇒ Notice 一律等待或丢弃**。绝不打断"有结果等你听" ——
 ///   这是灯的承诺，比"知道它还在跑"重要一个数量级。
 /// - **结果可以接管任何东西**（包括另一条结果）：用户新按的键就是最新意图。
-/// - **Notice 之间后到者接管**：都是低优先级、可丢弃的信息，排队没有价值。
-fn may_start_playing(mgr: &DeskManager, slot: Option<usize>) -> bool {
+/// - **进度类 Notice 之间后到者接管**：都是低优先级、可丢弃的信息，排队没有价值。
+/// - **终态 Notice 绝不抢占**：它要么排队等（见 `notice_queue`），要么被丢。
+///   抢占另一句"任务已完成"去说"任务已完成"，结果是两句都只听了个开头 ——
+///   v0.41.15 实录里那句"0 样本被抢占"的日志，一半来自这里。
+///
+/// `incoming_terminal` = 来电是终态播报（带结论正文的那类）。
+fn may_start_playing(mgr: &DeskManager, slot: Option<usize>, incoming_terminal: bool) -> bool {
     let playing = mgr.playing.lock().unwrap_or_else(|e| e.into_inner());
     match playing.as_ref() {
         None => true,
-        Some(current) => !(slot.is_none() && current.slot.is_some()),
+        Some(current) => {
+            if slot.is_some() {
+                return true; // 结果播报：用户新按的键就是最新意图
+            }
+            if current.slot.is_some() {
+                return false; // 不打断"有结果等你听"
+            }
+            // 来电是 Notice，当前也是 Notice：进度类后到接管，终态类排队。
+            !incoming_terminal
+        }
     }
 }
 
@@ -1198,10 +1260,15 @@ async fn speak_notice(
     voice_text: Option<&str>,
 ) -> Result<NoticePlayReport, NoticeSpeakError> {
     // ---- 抢占检查（在锁内做，只读一眼）----
-    if !may_start_playing(mgr, None) {
-        return Err(NoticeSpeakError::Busy(
-            "结果正在播放 —— 状态播报被丢弃（不打断「有结果等你听」）".to_string(),
-        ));
+    //
+    // 终态播报带 `incoming_terminal = true`：它不抢占任何人，被占用即由
+    // 调用方排队（见 `emit_notice_with` 的 Busy 分支）。
+    if !may_start_playing(mgr, None, kind.is_terminal()) {
+        return Err(NoticeSpeakError::Busy(if kind.is_terminal() {
+            "喇叭正忙 —— 终态播报不打断当前播放，已转入排队".to_string()
+        } else {
+            "结果正在播放 —— 进度播报被丢弃（不打断「有结果等你听」）".to_string()
+        }));
     }
 
     // ---- 取音频：优先念**动态正文**，失败退回预合成语料 ----
@@ -1240,10 +1307,13 @@ async fn speak_notice(
 
     let waiter = control.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        // 上限 = 音频时长 + 5 秒，避免设备异常时永远等下去。
-        let timeout = std::time::Duration::from_millis(
-            waiter.total_samples() as u64 * 1000 / 48_000 + 5_000,
-        );
+        // 上限 = 设备侧音频时长 + 5 秒，避免设备异常时永远等下去。
+        //
+        // ⚠️ 必须用 `duration_ms()`（设备侧精确值，已含重采样与声道展开）。
+        // v0.41.15 此处拿 `total_samples / 48_000` 估时长，既不除声道数（2 倍偏长），
+        // 也把已展开样本当帧数；更糟的是同一份 PCM 在 `audio_out` 里还犯过
+        // "毫秒当样本数"的错（48kHz 下缩 1/48）。两处都改成读设备侧真值。
+        let timeout = std::time::Duration::from_millis(waiter.duration_ms() + 5_000);
         waiter.wait_finished(timeout)
     })
     .await;
@@ -1325,10 +1395,11 @@ pub fn desk_reset_session(mgr: State<'_, DeskManager>, slot: usize) -> ApiEnvelo
 /// 播一条状态语料（**不涉及未读**）—— 给设置页「试听」用。
 #[tauri::command]
 pub async fn desk_play_notice(
+    app: tauri::AppHandle,
     mgr: State<'_, DeskManager>,
     kind: NoticeKind,
 ) -> Result<ApiEnvelope<NoticePlayReport>, String> {
-    match speak_notice(&mgr, kind, None).await {
+    let outcome = match speak_notice(&mgr, kind, None).await {
         Ok(report) => Ok(ApiEnvelope::ok(report)),
         Err(e) => Ok(ApiEnvelope::err(
             match &e {
@@ -1338,7 +1409,10 @@ pub async fn desk_play_notice(
             },
             e.message().to_string(),
         )),
-    }
+    };
+    // 试听也占喇叭：播完后同样要排水，别让排队的终态播报卡在试听后面。
+    tauri::async_runtime::spawn(drain_notice_queue(app));
+    outcome
 }
 
 /// 播报某槽的**未读结果**：取租约 → 合成 → 播放 → **只有完整播完才消费未读**。
@@ -1446,9 +1520,13 @@ pub async fn desk_render_result(
 
     let waiter = control.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        let timeout = std::time::Duration::from_millis(
-            audio_ms_upper_bound(waiter.total_samples()) + 5_000,
-        );
+        // 上限 = 设备侧音频时长 + 5 秒。
+        //
+        // ⚠️ 必须用 `duration_ms()`。v0.41.15 此处用 `total_samples / 48_000`
+        // 估算，而 `total_samples` 是**已按声道展开**的样本数、设备采样率也
+        // 不一定是 48k —— 双声道 48k 下估算偏长 2 倍，重采样后偏差更大。
+        // 设备侧精确值由 `audio_out` 建流时算好带回来，没有理由再估。
+        let timeout = std::time::Duration::from_millis(waiter.duration_ms() + 5_000);
         waiter.wait_finished(timeout)
     })
     .await;
@@ -1456,6 +1534,8 @@ pub async fn desk_render_result(
     // ⚠️ 顺序要紧：**先**判定"是否完整播完"，**再**清场。
     let completed = control.completed_fully();
     clear_channel_if_mine(&mgr, id);
+    // 结果播完了（或被抢占）⇒ 排水：排队中的终态播报该补播了。
+    tauri::async_runtime::spawn(drain_notice_queue(app.clone()));
 
     // ---- 5. 只有**完整播完**才消费未读 ----
     let mut consumed = false;
@@ -1513,11 +1593,6 @@ pub async fn desk_render_result(
         unread_left,
         duration_ms: now_ms().saturating_sub(started),
     }))
-}
-
-/// 按 48 kHz 估算播放时长的上限（毫秒）。
-fn audio_ms_upper_bound(samples: usize) -> u64 {
-    (samples as u64) * 1000 / 48_000
 }
 
 /// 组装总览快照。
@@ -1752,6 +1827,11 @@ pub fn handle_reserved_uuid(app: &tauri::AppHandle, uuid: &str) -> bool {
         return false;
     };
 
+    // 按键反馈（第 5 颗灯闪一下）放在**所有校验之前**：
+    // 它表达的是"设备收到了你这一按"，而不是"这一按被采纳了"。
+    // 放在校验之后的话，被拒的按键会完全没有反馈，用户会以为没按到。
+    record_keypress(app.clone());
+
     let session = app.state::<crate::session::SessionManager>();
     let origin = crate::session::PttOrigin::DeskSlot(slot);
 
@@ -1880,16 +1960,22 @@ pub fn dispatch_task(
 
     // 入队成功 → 拉泵（它自己会判断该槽是否已有泵在跑）。
     ensure_pump(app, slot);
-    emit_state_if_changed(app);
 
     // 起点播报（**事件驱动**，且只在"真的开始跑"时才发）。
     //
     // ⚠️ 排队时**不发**"任务已开始"：那一刻这句话是假的 —— 它还在等前面的任务。
     // 播报假状态比不播更糟：用户会以为可以走了，实际它还没动。
     // 而"还在排队"这件事该由灯来说（灯是状态信道，喇叭是事件信道）。
+    //
+    // ⚠️ **必须排在 `emit_state_if_changed` 之前**：状态事件会顺手触发进度类
+    // 「正在推进」，而起点类先记账时，进度类正好被最小间隔挡住 ——
+    // 两条同拍通知只会互相剪断（v0.41.15 实录：每次派发都有一条"0 样本被抢占"）。
+    // 反序的话，两条都过了去抖，谁抢到通道全看调度运气。
     if matches!(&outcome, DispatchOutcome::Started { .. }) {
         emit_notice(app, Some(slot), NoticeKind::TaskStarted, now_ms());
     }
+    emit_state_if_changed(app);
+
     Ok(outcome)
 }
 
@@ -2068,6 +2154,17 @@ async fn pump_slot(app: tauri::AppHandle, slot: usize) {
             if let Some(cell) = toks.get_mut(slot) {
                 *cell = None;
             }
+        }
+
+        // ---- 4.5 记下"桌面任务刚刚跑完"的时刻 ----
+        //
+        // 外部会话监工（C）据此进入宽限静默：任务台自己用 `codex exec resume`
+        // 往 rollout 追加内容，此刻外部会话的"完成"既可能是误报（读到的历史
+        // 事件），也会与任务台自己的终态播报抢同一个喇叭。
+        {
+            let mgr = app.state::<DeskManager>();
+            mgr.last_desk_finish_ms
+                .store(now_ms(), Ordering::Relaxed);
         }
 
         // ---- 5. 收终态（清运行位 + 按规则产生未读）----
@@ -2767,7 +2864,9 @@ fn emit_notice_with(
             GateId::Slot => mgr.notice_gate.lock().unwrap_or_else(|e| e.into_inner()),
             GateId::Probe => mgr.probe_gate.lock().unwrap_or_else(|e| e.into_inner()),
         };
-        if !gate.should_emit(kind, now) {
+        // ⚠️ 按 `(槽位, kind)` 记账：S1 的完成不许吞掉 S2 的完成
+        // （v0.41.15 实锤：全局一本账时 S2 连播报行都没有）。
+        if !gate.should_emit_for(kind, slot, now) {
             (false, false)
         } else {
             let assets = NoticeAssets::new(&mgr.output_dir());
@@ -2856,21 +2955,137 @@ fn emit_notice_with(
                     r.duration_ms
                 )),
                 Err(e) => match &e {
-                    // 语料缺失已在上面那行日志标注过；被未读播放挡下是**刻意的行为**。
+                    // 语料缺失已在上面那行日志标注过；进度类被占用是**刻意的行为**。
                     // 只有真故障才用 warn —— 否则日志会被正常的抢占刷满，
                     // warn 也就不再是"值得看一眼"的信号了。
-                    NoticeSpeakError::NoAsset(_) | NoticeSpeakError::Busy(_) => {
+                    NoticeSpeakError::NoAsset(_) => {
                         log_buffer::info(format!("任务台播报未出声：{}", e.message()))
                     }
                     NoticeSpeakError::Failed(_) => {
                         log_buffer::warn(format!("任务台播报出声失败：{}", e.message()))
                     }
+                    NoticeSpeakError::Busy(_) => {
+                        if kind.is_terminal() {
+                            // 终态播报**不许静默丢失**：排队，等当前播放结束后补播。
+                            // v0.41.15 这里直接丢弃 ⇒ S2 的"任务已完成"连日志行都没有，
+                            // 用户只看到未读 +1（实锤见 2026-10-13 诊断记录）。
+                            enqueue_terminal_notice(&app2, kind, slot, text);
+                        } else {
+                            log_buffer::info(format!("任务台播报未出声：{}", e.message()))
+                        }
+                    }
                 },
             }
+            // 播放结束（或终态入队）⇒ 尝试排水：队列里可能有排队中的终态播报。
+            // 单飞标志保证并发安全；这次若抢不到排水权，持旗者会在自己那轮
+            // 循环里看到新入队的条目（它每一轮都重新读队列）。
+            tauri::async_runtime::spawn(drain_notice_queue(app2.clone()));
         });
     }
 
     true
+}
+
+/// 把一条播不出来的终态通知**排队**，等喇叭空出来后补播。
+///
+/// # 为什么终态要排队，而进度类直接丢
+///
+/// 进度类是"现在怎么样"（可丢弃：下一秒的状态快照还说得清）；终态是
+/// "事情办完了"（不可丢：错过这一句，用户只能靠未读灯猜到"有东西"，
+/// 却不知道是什么、从哪来）。排队**不打断任何人**，只是把该说的留到能说的时候。
+///
+/// 溢出时丢**最旧**的一条并计数：用户刚听完了更新的状态，最旧的那条价值最低；
+/// 计数不为零时，队列排空后会补一条合并短通知（见 `drain_notice_queue`）——
+/// 丢可以，但不许静默地丢。
+fn enqueue_terminal_notice(
+    app: &tauri::AppHandle,
+    kind: NoticeKind,
+    slot: Option<usize>,
+    text: Option<String>,
+) {
+    use tauri::Manager as _;
+    let mgr = app.state::<DeskManager>();
+    let mut queue = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() >= NOTICE_QUEUE_CAP {
+        if queue.pop_front().is_some() {
+            mgr.notice_dropped.fetch_add(1, Ordering::AcqRel);
+        }
+        log_buffer::warn(format!(
+            "任务台播报队列已满（{} 条）⇒ 丢弃最旧一条（用户刚听过更新的状态）；\
+             本条「{}」仍在队尾，排空后会补一条合并提醒",
+            NOTICE_QUEUE_CAP,
+            kind.text()
+        ));
+    }
+    let position = queue.len() + 1;
+    queue.push_back(QueuedNotice { kind, slot, text });
+    log_buffer::info(format!(
+        "任务台终态播报「{}」已排队（第 {position} 条）—— 当前播放结束后补播，不打断任何人",
+        kind.text()
+    ));
+}
+
+/// 补播排队中的终态通知。**任何播放结束后都应触发一次**。
+///
+/// # 三个必须做对的点
+///
+/// 1. **单飞**（`notice_draining`）：两个播放线程同时排水会互相抢话，
+///    而"排队"的全部意义就是不抢话。
+/// 2. **又被占用 ⇒ 放回队首**：排水途中用户按下「播报未读」是最高优先级，
+///    结果播报可以接管一切；这条终态通知回队列等下一次，不被丢。
+/// 3. **排空后补合并提醒**：排水期间丢过最旧的 ⇒ 用 `ResultsWaiting`
+///    说一句"还有 N 条结果未播报"。没有计数就不说 —— 不制造噪音。
+async fn drain_notice_queue(app: tauri::AppHandle) {
+    use tauri::Manager as _;
+    let mgr = app.state::<DeskManager>();
+    if mgr.notice_draining.swap(true, Ordering::AcqRel) {
+        return; // 已有排水在跑（它每轮都重读队列，新条目漏不掉）
+    }
+
+    loop {
+        let next = {
+            let mut queue = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.pop_front()
+        };
+        let Some(item) = next else {
+            // 队列排空：这轮排水期间丢过最旧的 ⇒ 补一条合并短通知。
+            let dropped = mgr.notice_dropped.swap(0, Ordering::AcqRel);
+            if dropped > 0 {
+                let now = now_ms();
+                let detail = format!("还有 {dropped} 条任务结果未播报，请点击查看。");
+                emit_notice_with(
+                    &app,
+                    GateId::Slot,
+                    None,
+                    NoticeKind::ResultsWaiting,
+                    now,
+                    Some(&detail),
+                    VoiceSpec::Text(detail.clone()),
+                );
+            }
+            break;
+        };
+        match speak_notice(&mgr, item.kind, item.text.as_deref()).await {
+            Ok(_) => {}
+            Err(NoticeSpeakError::Busy(_)) => {
+                // 又被新的播放占了（多半是用户按了「播报未读」）⇒ 放回队首等下一次。
+                let mut queue = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+                queue.push_front(item);
+                break;
+            }
+            Err(e) => {
+                // 真故障（合成失败 / 设备错）：跳过这条。一条念不动不该堵住整队，
+                // 但必须留痕 —— 否则"队列后面怎么不响了"会变成无从查起的谜。
+                log_buffer::warn(format!(
+                    "任务台排队播报跳过「{}」：{}",
+                    item.kind.text(),
+                    e.message()
+                ));
+            }
+        }
+    }
+
+    mgr.notice_draining.store(false, Ordering::Release);
 }
 
 /// 进度类播报：由运行时快照推导，没有任何独立的"进度事件"。
@@ -2899,21 +3114,36 @@ fn emit_progress_notice(app: &tauri::AppHandle, snap: &RuntimeSnapshot, now: u64
 ///
 /// # 什么时候发、什么时候不发
 ///
-/// - **有未读 或 有任务在跑** ⇒ 发 active 帧（之后由 [`start_led_pump`] 每 5 秒续期）；
-/// - **全空闲** ⇒ 只发**一次** clear，把灯让回固件既有的 idle 灯效，之后不再发。
+/// - **有未读 或 有任务在跑 or 刚按过键** ⇒ 发 active 帧（之后由 [`start_led_pump`]
+///   每 5 秒续期）；
+/// - **全空闲且无按键** ⇒ 只发**一次** clear，把灯让回固件既有的 idle 灯效，之后不再发。
 ///
 /// 「全空闲也常亮第 5 颗绿」这个文档原案被**刻意放弃**：那会永久占用 5 颗灯去表达
-/// "什么都没发生"，而且覆盖掉用户已经习惯的既有 idle 灯效。第 5 颗灯的"0 → 绿"
-/// 仍然会在**有未读但没在跑**时出现（那才是它真正有信息量的时刻）。
+/// "什么都没发生"，而且覆盖掉用户已经习惯的既有 idle 灯效。第 5 颗灯现在只在
+/// **按下按键后的 120ms 内**亮一下，作为输入确认（见 [`device_led::KEYPRESS_FLASH_MS`]）。
+///
+/// 心跳续期**不重复传闪烁时刻**：闪烁只在"按下那一瞬"有信息量，5 秒后再亮一次
+/// 是假信号。`led_keypress` 的值会被 `record_keypress` 覆盖成 `None`。
 fn push_led_if_needed(app: &tauri::AppHandle, snap: &RuntimeSnapshot) {
     use tauri::Manager as _;
-    let want_active = snap.any_unread || snap.queue.running_count > 0;
+    // 取一次、按住不放：既避免每 5 秒重复造 `Instant`，也让下面两处看到同一个值。
+    let keypress = {
+        let mgr = app.state::<DeskManager>();
+        let mut guard = match mgr.led_keypress.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    };
+    let flashing = keypress.is_some();
+    // 有闪烁时必须发帧，即使队列与未读都空——否则第 5 颗灯永远不会亮。
+    let want_active = snap.any_unread || snap.queue.running_count > 0 || flashing;
 
     let outcome = {
         let mgr = app.state::<DeskManager>();
         let was_active = mgr.led_active.swap(want_active, Ordering::Relaxed);
         if want_active {
-            device_led::push_snapshot(snap)
+            device_led::push_snapshot(snap, keypress.as_ref())
         } else if was_active {
             device_led::push_clear()
         } else {
@@ -2938,6 +3168,54 @@ fn push_led_if_needed(app: &tauri::AppHandle, snap: &RuntimeSnapshot) {
             }
         }
     }
+}
+
+/// 记录一次按键，并立刻让第 5 颗灯闪一下（输入确认）。
+///
+/// # 为什么必须在这里另起线程，不能只置个标志等心跳
+///
+/// 心跳周期是 5 秒，而闪烁只持续 [`device_led::KEYPRESS_FLASH_MS`] = 120ms。
+/// 如果只把时刻存起来、等下一次心跳再发帧，闪烁永远发不出去——
+/// 心跳醒来时那次按键**早就超时**了。所以按下时必须**当场**下发一帧。
+///
+/// 用后台线程 + `sleep` 而不是 `spawn_blocking`：Tauri 的运行时线程池不该被一个
+/// 120ms 的睡眠占住；这里也刻意**不进 `push_led_if_needed`**，因为那条路径会
+/// `take()` 掉闪烁标记再按"队列状态"决定发不发——按下的瞬间队列可能完全空闲，
+/// 会被判成"没事可做"而把这次闪烁吞掉。
+pub fn record_keypress(app: tauri::AppHandle) {
+    {
+        use tauri::Manager as _;
+        let mgr = app.state::<DeskManager>();
+        let mut guard = match mgr.led_keypress.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(device_led::KeypressFlash::now());
+    }
+
+    std::thread::spawn(move || {
+        let flash = device_led::KeypressFlash::now();
+        let snap = {
+            use tauri::Manager as _;
+            app.state::<DeskManager>().runtime_snapshot()
+        };
+        // 发不出去也**不阻塞**按键响应：灯语是锦上添花，失败只记日志。
+        if let Err(e) = device_led::push_snapshot(&snap, Some(&flash)) {
+            eprintln!("[desk] 按键灯光反馈下发失败：{e}");
+        }
+        // 120ms 后补一帧，把第 5 颗灯灭回去。
+        // 不补这一帧的话，闪烁会一直亮到 ttl(15s) 到期才回落——那不是"闪"是"常亮"。
+        std::thread::sleep(std::time::Duration::from_millis(
+            device_led::KEYPRESS_FLASH_MS + 60,
+        ));
+        let snap = {
+            use tauri::Manager as _;
+            app.state::<DeskManager>().runtime_snapshot()
+        };
+        if let Err(e) = device_led::push_snapshot(&snap, None) {
+            eprintln!("[desk] 按键灯光复位下发失败：{e}");
+        }
+    });
 }
 
 /// 启动灯语心跳泵。
@@ -3005,6 +3283,18 @@ fn run_probe(app: &tauri::AppHandle) {
     if hits.is_empty() {
         return;
     }
+    // 桌面任务正在跑（或刚跑完还在宽限里）⇒ 只消费偏移、不出声。
+    //
+    // 扫描照常推进（上面已经跑完），所以抑制**不会**丢事件：宽限过后若同一
+    // 文件的同一段内容又被扫到……并不会 —— 偏移已经消费掉了。这里丢的只是
+    // "当次播报"，而那是故意的：任务台此刻在忙，外部会话插嘴只会互相剪断。
+    if probe_suppressed(app, now) {
+        log_buffer::info(format!(
+            "外部会话：本次扫到 {} 个完成 ⇒ 桌面任务进行中/宽限内，只登记不播报",
+            hits.len()
+        ));
+        return;
+    }
     if hits.len() > 1 {
         // 不静默：去抖会让第二次及以后**不出声**。若不写日志，
         // "我明明跑了 3 个怎么只播了一次"会变成无从查起的谜。
@@ -3030,6 +3320,32 @@ fn run_probe(app: &tauri::AppHandle) {
         );
     }
 }
+
+/// 桌面任务正在执行、或跑完还没走出宽限 ⇒ 外部会话监工不出声。
+///
+/// 宽限时长见 [`PROBE_GRACE_MS`]。两条理由都来自实录：
+/// 1. **防误报**：任务台自己 `codex exec resume` 追加写 rollout，此刻扫到的
+///    "完成"可能带历史事件（EOF 登记已挡住文件级误读，这一层挡运行中新建文件）。
+/// 2. **防抢话**：任务台正在播自己的终态，外部会话插一句只会互相剪断。
+fn probe_suppressed(app: &tauri::AppHandle, now: u64) -> bool {
+    use tauri::Manager as _;
+    let mgr = app.state::<DeskManager>();
+    let running = {
+        let rt = mgr.runtime();
+        rt.queue().running_count()
+    };
+    if running > 0 {
+        return true;
+    }
+    let last = mgr.last_desk_finish_ms.load(Ordering::Relaxed);
+    last != 0 && now.saturating_sub(last) < PROBE_GRACE_MS
+}
+
+/// 桌面任务跑完后，外部会话监工继续静默多久。
+///
+/// 10 秒是给"CLI 子进程退出 → 最后一行写进 rollout"这段真实延迟留的余量：
+/// 不收这一截，用户就会在任务台话音刚落时听到一句迟到的外部播报。
+const PROBE_GRACE_MS: u64 = 10_000;
 
 /// "取不到 rollout 根目录"这条提示只记**一次**。
 ///
@@ -3265,6 +3581,62 @@ pub fn desk_release_playback(
         Ok(()) => {
             emit_state_if_changed(&app);
             ApiEnvelope::ok_empty()
+        }
+        Err(e) => ApiEnvelope::err(ErrorCode::Conflict, describe_lease_error(&e)),
+    }
+}
+
+/// 丢弃未读：明确「放弃收听」，把未读直接清零。`slot = None` 清全部。
+///
+/// # 为什么需要一个"不那么体面"的出口
+///
+/// 未读的语义是"有一个结果你还没听过"。正规消费路径只有一条：取租约 → 真的出声
+/// → 播完回执 → 减一条。这条路径**刻意做得很重**（必须真的播完），是为了让灯可信。
+///
+/// 但它有个副作用：**你不想听的那些内容会一直挂在灯上**。调试时尤其明显 ——
+/// 反复派发测试任务，未读攒到上限（每槽 9 条），灯一直亮着，"灯亮 = 有事等你"
+/// 这个信号就被自己制造的噪音淹没了。于是需要一个人工的、显式的泄压阀。
+///
+/// # 语义边界（界面上必须说清）
+///
+/// - [`desk_ack_playback`] = 听完了 ⇒ 未读减一，是"已读"。
+/// - 本命令 = 放弃了 ⇒ 未读清零，是"删掉"。**两者不可混用**，所以它不会自动触发，
+///   也不会被任何流程顺手调用。
+///
+/// 若被丢弃的槽正持有播放租约（正在播），租约一并作废 —— 内容已被放弃，
+/// 那个正在进行的播放不该再有消费未读的资格。
+#[tauri::command]
+pub fn desk_discard_unread(
+    app: tauri::AppHandle,
+    mgr: State<'_, DeskManager>,
+    slot: Option<u8>,
+) -> ApiEnvelope<u32> {
+    let r = {
+        let mut rt = mgr.runtime();
+        match slot {
+            Some(s) => rt.unread_mut().discard(s as usize),
+            None => Ok(rt.unread_mut().discard_all()),
+        }
+    };
+    match r {
+        Ok(n) => {
+            if n > 0 {
+                // 记 warn 而不是 info：这条日志读起来"像故障"，而它确实是一次
+                // 数据销毁（那些结果以后不会再被念出来）。降级成 info 会让它被淹没。
+                match slot {
+                    Some(s) => log_buffer::warn(format!(
+                        "任务台丢弃 S{} 的未读 {n} 条（用户明确放弃收听，不是「已读」）",
+                        s + 1
+                    )),
+                    None => log_buffer::warn(format!(
+                        "任务台丢弃全部未读 {n} 条（用户明确放弃收听，不是「已读」）"
+                    )),
+                }
+            }
+            // 必须落盘，否则重启后这些未读会"复活"（账本是持久化的）。
+            mgr.save_unread();
+            emit_state_if_changed(&app);
+            ApiEnvelope::ok(n)
         }
         Err(e) => ApiEnvelope::err(ErrorCode::Conflict, describe_lease_error(&e)),
     }
