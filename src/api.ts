@@ -1,10 +1,34 @@
 // 与后端 Tauri 命令的封装层。前端仅通过这里的函数与 Rust 交互。
 import { invoke } from "@tauri-apps/api/core";
-import type { AppEntry, ConfigAck, LogEntry, Profile, SystemApp, Vocabulary, LlmConfig, EditPhase, UsageEntry, DailyCount, VocabWord, DeskConfig, DeskSnapshot, DriverProbe, TtsConfig, TtsTestReport, RuntimeSnapshot, DispatchOutcome, Lease, ConsumeOutcome, ApiEnvelope, NoticeKind, NoticeStatusReport, NoticePrepareReport, NoticePlayReport, RenderResultReport, PasteStyle, SessionView, CliTerminalConfig } from "./types";
+import type { AppEntry, ConfigAck, DeviceFirmwareStatus, LicenseInfo, LogEntry, Profile, SystemApp, Vocabulary, LlmConfig, EditPhase, UsageEntry, DailyCount, VocabWord, DeskConfig, DeskSnapshot, DriverProbe, TtsConfig, TtsTestReport, RuntimeSnapshot, DispatchOutcome, Lease, ConsumeOutcome, ApiEnvelope, NoticeKind, NoticeStatusReport, NoticePrepareReport, NoticePlayReport, RenderResultReport, PasteStyle, SessionView, CliTerminalConfig } from "./types";
 
 /** 检测开发板 HID 是否在线。 */
 export function deviceStatus(): Promise<string> {
   return invoke<string>("device_status");
+}
+
+/**
+ * 读开发板固件版本（USB Feature Report `0x13` → `0x11` / kind `0x04` 分块响应）。
+ *
+ * ⚠ 与 `deviceStatus()` 是**两件事**，别合并：那条是"枚举即返回"的在线检测（会被轮询），
+ * 这条要走一次完整的状态回读（实机约 100 ms）。失败时抛出的是**具体原因**
+ * （没插 USB / 载荷被固件拒 / 分块 CRC 不过），不是一句笼统的"读取失败"。
+ */
+export function deviceFirmwareStatus(): Promise<DeviceFirmwareStatus> {
+  return invoke<DeviceFirmwareStatus>("device_firmware_status");
+}
+
+/**
+ * 读取当前授权（注册）状态：从本地配置加载已保存的激活码并重新校验。
+ * 返回统一信封——`ok` 字段判断成败，`data` 拿 `LicenseInfo`。
+ */
+export function licenseStatus(): Promise<ApiEnvelope<LicenseInfo>> {
+  return invoke<ApiEnvelope<LicenseInfo>>("license_status");
+}
+
+/** 激活（注册）一个本地授权码：后端校验签名通过后持久化。 */
+export function activateLicense(code: string): Promise<ApiEnvelope<LicenseInfo>> {
+  return invoke<ApiEnvelope<LicenseInfo>>("activate_license", { code });
 }
 
 /** 下发一个完整方案到开发板。 */
@@ -388,6 +412,17 @@ export function deskAckPlayback(slot: number, token: number): Promise<ApiEnvelop
 /** 归还租约，不消费未读（用户抢占 / 播放流程放弃）。 */
 export function deskReleasePlayback(slot: number, token: number): Promise<ApiEnvelope<null>> {
   return invoke<ApiEnvelope<null>>("desk_release_playback", { slot, token });
+}
+
+/**
+ * 丢弃未读：明确「放弃收听」，把未读清零。`slot` 省略 = 清全部。
+ *
+ * ⚠️ 与 `deskAckPlayback` 不是一回事：那个是"听完了"（已读），这个是"放弃了"（删掉）。
+ * 返回值是被丢掉的条数。
+ */
+export function deskDiscardUnread(slot?: number): Promise<ApiEnvelope<number>> {
+  // `Option<u8>` 侧省略参数要显式传 null，不能传 undefined（会被当成缺参报错）。
+  return invoke<ApiEnvelope<number>>("desk_discard_unread", { slot: slot ?? null });
 }
 
 // ---------------------------------------------------------------------------

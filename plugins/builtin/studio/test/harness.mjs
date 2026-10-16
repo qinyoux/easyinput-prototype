@@ -334,7 +334,7 @@ async function main() {
 
   // ── 3. 阶段流转与门禁 ───────────────────────────────────────────────
   // 门禁语义 = 「该阶段的输入是否就绪」：进 intel 不需前置（灵感本身即输入），
-  // 进 body 需要情报卡够 3 条，进 humanized/figures/exported 需要正文。
+  // 进 body 需要情报卡够 3 条，进 humanized/exported 需要正文。（figures 阶段已移除）
   console.log("\n③ 阶段流转 / 门禁");
   {
     const store = {
@@ -468,36 +468,36 @@ async function main() {
     check("调了 eo.chat", calls.some((c) => c[0] === "chat"));
   }
 
-  // ── 4c. 一条龙（studio.gen.all）────────────────────────────────────
-  console.log("\n④c 一条龙（studio.gen.all）");
+  // ── 4c. 一键执行（studio.gen.all）────────────────────────────────────
+  console.log("\n④c 一键执行（studio.gen.all）");
   {
     const INTEL_REPLY = JSON.stringify({
       angle: ["角度一", "角度二"], fact: ["事实一"], quote: ["金句一"], risk: [],
     });
     const { commands, store, calls } = await bootstrap({
-      store: { topics: [{ id: "t1", title: "一条龙测试", stage: "inspiration", intel: { angle: [], fact: [], quote: [], risk: [] } }] },
+      store: { topics: [{ id: "t1", title: "一键执行测试", stage: "inspiration", intel: { angle: [], fact: [], quote: [], risk: [] } }] },
       chatReplies: [
         INTEL_REPLY,                                    // gen.intel
         "标题一\n标题二\n标题三",                         // gen.title
         "这是正文内容，足够长的正文用于测试。".repeat(20),  // gen.body
-        "这是去AI味后的正文。".repeat(20),                 // gen.humanize
+        "这是内容优化后的正文。".repeat(20),                 // gen.humanize
       ],
     });
     const r = await commands["studio.gen.all"]({ id: "t1" });
-    check("一条龙成功", r.ok, JSON.stringify(r));
+    check("一键执行成功", r.ok, JSON.stringify(r));
     check("走了 4 步", r.data.steps.length === 4, JSON.stringify(r.data.steps));
     check("情报卡已生成", store.topics[0].intel.angle.length === 2);
     check("标题已生成", store.topics[0].titles.length === 3);
     check("正文已生成", !!(store.topics[0].body || "").trim());
-    check("去AI味已生成", !!(store.topics[0].humanized || "").trim());
+    check("内容优化已生成", !!(store.topics[0].humanized || "").trim());
     check("调了 4 次 eo.chat", calls.filter((c) => c[0] === "chat").length === 4);
   }
 
-  // ── 5. 导出（eo.run）─────────────────────────────────────────────────
-  console.log("\n⑤ 导出：组稿 → pub.py check → pack xhs（eo.run）");
+  // ── 5. 导出（eo.run）：组稿 → pub.py check（不再打任何投放包）─────────
+  console.log("\n⑤ 导出：组稿 → pub.py check（eo.run）");
   {
     const store = {
-      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（去过 AI 味）" }],
+      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（内容优化后）" }],
       meta: { currentId: "t1" },
     };
     const { commands, calls } = await bootstrap({
@@ -505,46 +505,23 @@ async function main() {
       runReplies: [
         { match: "studio_io.py", exitCode: 0, stdout: "POST=D:\\drafts\\标题A.md\n字数（去空白）：12\n" },
         { match: "pub.py check", exitCode: 0, stdout: "check ok" },
-        { match: "pub.py pack", exitCode: 0, stdout: "pack ok" },
       ],
     });
-    const r = await commands["studio.export"]({ packXhs: true });
+    const r = await commands["studio.export"]();
     check("导出成功", r.ok === true, JSON.stringify(r));
     check("解析出稿件路径", r.data.postPath === "D:\\drafts\\标题A.md", r.data.postPath);
     check("check 通过", r.data.checkOk === true);
-    check("pack 通过", r.data.packOk === true);
-    check("提示「导出≠已发布」", /手动上传/.test(r.message || ""), r.message);
     check("稿件路径已落库", store.topics[0].postPath === "D:\\drafts\\标题A.md");
 
     const runCalls = calls.filter((c) => c[0] === "run");
-    check("三次 eo.run", runCalls.length === 3, `实际 ${runCalls.length}`);
+    check("两次 eo.run（组稿+check）", runCalls.length === 2, `实际 ${runCalls.length}`);
     const argv = (i) => runCalls[i][2].join(" ");
     check("第一条是自带脚本 compose", argv(0).includes("studio_io.py") && argv(0).includes("compose"), argv(0));
     check("compose 传了 topic-id", argv(0).includes("--topic-id") && argv(0).includes("t1"), argv(0));
     check("第二条是 pub.py check", argv(1).includes("pub.py") && /(^|\s)check(\s|$)/.test(argv(1)), argv(1));
-    check("第三条是 pub.py pack xhs", argv(2).includes("pub.py") && argv(2).includes("pack xhs"), argv(2));
+    check("导出不再打任何投放包", !runCalls.some((c) => c[2].join(" ").includes("pack")), "pack 应已移除");
     check("run 都带 cwd", runCalls.every((c) => !!c[3] && !!c[3].cwd));
     check("run 都带超时", runCalls.every((c) => !!c[3] && typeof c[3].timeoutSecs === "number"));
-  }
-  {
-    // 小红书缺配图：pub.py 真机退出码 3 —— 必须如实上报，不能报"已导出"了事
-    const store = {
-      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: [], body: "正文", humanized: "正文" }],
-      meta: { currentId: "t1" },
-    };
-    const { commands } = await bootstrap({
-      store,
-      runReplies: [
-        { match: "studio_io.py", exitCode: 0, stdout: "POST=D:\\drafts\\A.md\n" },
-        { match: "pub.py check", exitCode: 0, stdout: "ok" },
-        { match: "pub.py pack", exitCode: 3, stdout: "!! 没有可用配图。小红书必须至少 1 张图" },
-      ],
-    });
-    const r = await commands["studio.export"]({ packXhs: true });
-    check("组稿成功时仍算导出成功", r.ok === true, JSON.stringify(r));
-    check("投放包失败被标出 packOk=false", r.data.packOk === false, JSON.stringify(r.data));
-    check("消息里带上退出码 3", /exit=3/.test(r.message || ""), r.message);
-    check("消息里说明未生成", /未生成/.test(r.message || ""), r.message);
   }
   {
     // 组稿失败 → IO_FAILED，且不谎报成功
@@ -581,58 +558,110 @@ async function main() {
     check("无 pluginDir → NOT_READY 且提示原因", r.ok === false && r.code === "NOT_READY", JSON.stringify(r));
   }
 
-  // ── 5b. 公众号导出：登录态有效走 publish，失效降级 HTML 投放包 ──────
-  console.log("\n⑤b 公众号导出（publishWechat 分支）");
+  // ── 5b. 平台发布：排版 skill → 只落一个 HTML 文件 ──────────────────
+  console.log("\n⑤b 平台发布（studio.publish.html：只产一个 HTML）");
   {
-    // 登录态有效 → pub.py publish wechat --save-draft
     const store = {
-      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（去过 AI 味）" }],
-      meta: { currentId: "t1" },
-    };
-    const { commands, calls } = await bootstrap({
-      store,
-      chatReply: "<p>排版片段</p>",
-      runReplies: [
-        { match: "studio_io.py", exitCode: 0, stdout: "POST=D:\\drafts\\标题A.md\n" },
-        { match: "pub.py check", exitCode: 0, stdout: "ok" },
-        { match: "pub.py status", exitCode: 0, stdout: "  微信公众号    已登录 ✓\n  小红书      已登录 ✓\n" },
-        { match: "publish wechat", exitCode: 0, stdout: "草稿已保存" },
-      ],
-    });
-    const r = await commands["studio.export"]({ publishWechat: true });
-    check("公众号有效→导出成功", r.ok === true, JSON.stringify(r));
-    check("公众号走 auto 模式", r.data.wechatMode === "auto", JSON.stringify(r.data));
-    check("公众号自动填草稿成功", r.data.wechatOk === true, JSON.stringify(r.data));
-    const runCalls = calls.filter((c) => c[0] === "run");
-    check("调了 publish wechat --save-draft", runCalls.some((c) => c[2].join(" ").includes("publish") && c[2].join(" ").includes("wechat") && c[2].join(" ").includes("--save-draft")));
-  }
-  {
-    // 登录态失效 → 降级生成本地 HTML 投放包（eo.chat 排版 + write-html）
-    const store = {
-      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（去过 AI 味）" }],
+      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（内容优化后）" }],
       meta: { currentId: "t1" },
     };
     const { commands, calls } = await bootstrap({
       store,
       chatReply: '<p style="font-size:15px">排版后 HTML 片段</p>',
       runReplies: [
-        { match: "studio_io.py", exitCode: 0, stdout: "POST=D:\\drafts\\标题A.md\n" },
-        { match: "pub.py check", exitCode: 0, stdout: "ok" },
-        { match: "pub.py status", exitCode: 1, stdout: "  微信公众号    登录态已失效 ✗\n  小红书      已登录 ✓\n" },
-        { match: "write-html", exitCode: 0, stdout: "HTML=D:\\drafts\\标题A-wechat投放包\\正文.html\n" },
+        { match: "write-html-file", exitCode: 0, stdout: "HTML=D:\\drafts\\标题A.html\n" },
       ],
     });
-    const r = await commands["studio.export"]({ publishWechat: true });
-    check("公众号失效→导出仍成功", r.ok === true, JSON.stringify(r));
-    check("公众号走 html 降级模式", r.data.wechatMode === "html", JSON.stringify(r.data));
-    check("HTML 投放包生成成功", r.data.wechatOk === true, JSON.stringify(r.data));
+    const r = await commands["studio.publish.html"]();
+    check("平台发布成功", r.ok === true, JSON.stringify(r));
+    check("返回 HTML 路径", r.data.htmlPath === "D:\\drafts\\标题A.html", r.data.htmlPath);
+    check("htmlPath 已落库", store.topics[0].htmlPath === "D:\\drafts\\标题A.html");
+
     const runCalls = calls.filter((c) => c[0] === "run");
-    check("调了 status 预检", runCalls.some((c) => c[2].join(" ").includes("status")));
-    check("调了 write-html", runCalls.some((c) => c[2].join(" ").includes("write-html")));
-    check("没调 publish wechat", !runCalls.some((c) => c[2].join(" ").includes("publish wechat")));
+    check("只调一次 eo.run（写 HTML）", runCalls.length === 1, `实际 ${runCalls.length}`);
+    check("调的是 write-html-file", runCalls[0][2].join(" ").includes("write-html-file"), runCalls[0][2].join(" "));
+    check("不再组稿 .md", !runCalls.some((c) => c[2].join(" ").includes("compose")));
+    check("不再调 pub.py", !runCalls.some((c) => c[2].join(" ").includes("pub.py")));
     const chatCalls = calls.filter((c) => c[0] === "chat");
     check("调了 eo.chat 排版", chatCalls.some((c) => c[2] && c[2].system && /排版/.test(c[2].system)));
-    check("消息提示手动粘贴", /手动粘贴/.test(r.message || ""), r.message);
+    check("消息提示可复制粘贴", /复制/.test(r.message || ""), r.message);
+  }
+  {
+    // LLM 排版失败 → 本地转换器兜底，仍出一个可用 HTML（degraded）
+    const store = {
+      topics: [{ id: "t1", title: "T", chosenTitle: "标题A", stage: "humanized", intel: intel(), titles: ["标题A"], body: "正文", humanized: "正文（内容优化后）" }],
+      meta: { currentId: "t1" },
+    };
+    const { commands, calls } = await bootstrap({
+      store,
+      chatThrows: "LLM 请求失败",
+      runReplies: [
+        { match: "markdown-to-html", exitCode: 0, stdout: "<!DOCTYPE html><html><body><p>本地兜底排版</p></body></html>\n" },
+        { match: "write-html-file", exitCode: 0, stdout: "HTML=D:\\drafts\\标题A.html\n" },
+      ],
+    });
+    const r = await commands["studio.publish.html"]();
+    check("LLM 挂掉仍出 HTML（degraded）", r.ok === true && r.data.degraded === true, JSON.stringify(r));
+    check("降级说明带原因", /本地转换器兜底/.test(r.data.note || ""), r.data.note);
+    const runCalls = calls.filter((c) => c[0] === "run");
+    check("降级时走了 markdown-to-html", runCalls.some((c) => c[2].join(" ").includes("markdown-to-html")));
+  }
+  {
+    // 无正文 → 直接挡
+    const store = { topics: [{ id: "t1", title: "T", stage: "inspiration", intel: intel(), titles: [], body: "", humanized: "" }], meta: { currentId: "t1" } };
+    const { commands } = await bootstrap({ store });
+    const r = await commands["studio.publish.html"]();
+    check("无正文平台发布被挡", r.ok === false && r.code === "STAGE_GUARD", JSON.stringify(r));
+  }
+
+  // ── 5c. 打开目录：explorer 参数形状回归防线 ─────────────────────────
+  console.log("\n⑤c 打开目录（explorer /select 参数形状）");
+  {
+    // 真机 bug 回归：曾写成单个字符串 ['/select,"C:\\path"']，runner 的 argv 转义
+    // 把含空格串二次包引号 → explorer 解析失败 → 打开「此电脑」。
+    // 正确形状（与 easyop 核心 open_containing_folder 一致）：
+    // 两个独立参数 ['/select,', '<反斜杠路径>']，路径本身不带引号。
+    const store = {
+      topics: [{
+        id: "t1", title: "T", stage: "exported", intel: intel(), titles: [], body: "正文", humanized: "正文",
+        postPath: "D:\\drafts\\A.md",
+        htmlPath: "D:\\drafts\\正文.html",
+      }],
+      meta: { currentId: "t1" },
+    };
+    const { commands, calls } = await bootstrap({ store });
+    const r = await commands["studio.open.dir"]();
+    check("打开目录成功", r.ok === true, JSON.stringify(r));
+    const runCalls = calls.filter((c) => c[0] === "run" && String(c[1]).includes("explorer"));
+    check("调了一次 explorer", runCalls.length === 1, JSON.stringify(runCalls.map((c) => c[2])));
+    const argv = runCalls[0][2];
+    check("参数是两个独立元素", argv.length === 2, JSON.stringify(argv));
+    check("第一个元素是 /select,", argv[0] === "/select,", argv[0]);
+    check("路径不带引号（防 argv 二次转义）", !argv[1].includes('"'), argv[1]);
+    check("路径是反斜杠（explorer 只认反斜杠）", argv[1].includes("\\") && !argv[1].includes("/"), argv[1]);
+    check("htmlPath 优先于 postPath", argv[1] === "D:\\drafts\\正文.html", argv[1]);
+    check("返回的 dir 是文件所在目录", r.data.dir === "D:\\drafts", r.data.dir);
+
+    // 只有 postPath（未平台发布）也能打开
+    const store2 = {
+      topics: [{ id: "t1", title: "T", stage: "exported", intel: intel(), titles: [], body: "正文", humanized: "正文", postPath: "D:\\drafts\\A.md" }],
+      meta: { currentId: "t1" },
+    };
+    const { commands: cmds2, calls: calls2 } = await bootstrap({ store: store2 });
+    const r2 = await cmds2["studio.open.dir"]();
+    check("仅 postPath 时也可打开", r2.ok === true, JSON.stringify(r2));
+    const argv2 = calls2.filter((c) => c[0] === "run" && String(c[1]).includes("explorer"))[0][2];
+    check("仅 postPath 时定位 postPath", argv2[1] === "D:\\drafts\\A.md", argv2[1]);
+
+    // 两个路径都没有 → 明确报错，不擅自打开「此电脑」
+    const store3 = {
+      topics: [{ id: "t1", title: "T", stage: "body", intel: intel(), titles: [], body: "正文", humanized: "" }],
+      meta: { currentId: "t1" },
+    };
+    const { commands: cmds3, calls: calls3 } = await bootstrap({ store: store3 });
+    const r3 = await cmds3["studio.open.dir"]();
+    check("无产物时明确报 NOT_READY", r3.ok === false && r3.code === "NOT_READY", JSON.stringify(r3));
+    check("无产物时不调 explorer", !calls3.some((c) => c[0] === "run" && String(c[1]).includes("explorer")));
   }
 
   // ── 6. 页签渲染边界 ───────────────────────────────────────────────

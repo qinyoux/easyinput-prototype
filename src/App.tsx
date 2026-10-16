@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import * as api from "./api";
-import type { ActionSpec, AppEntry, ConfigAck, Profile, Prompt, Vocabulary } from "./types";
+import type { ActionSpec, AppEntry, ConfigAck, DeviceFirmwareStatus, LicenseInfo, Profile, Prompt, Vocabulary } from "./types";
 import Sidebar from "./components/Sidebar";
 import type { Tab, PluginPageInfo } from "./components/Sidebar";
 import ProfileSwitcher from "./components/ProfileSwitcher";
@@ -61,6 +61,19 @@ export default function App() {
   const [lastEvent, setLastEvent] = useState<string | null>(null);
   const [deviceText, setDeviceText] = useState<string>("检测中…");
   const [deviceOnline, setDeviceOnline] = useState<boolean>(false);
+  // 固件版本：`null` = 还没读到（离线 or 尚未查），`error` 里放**具体原因**。
+  // 两者分开是因为"没有版本号"和"读失败"在界面上必须看起来不一样 ——
+  // 前者是还没问，后者是问了没答上来。
+  const [firmware, setFirmware] = useState<DeviceFirmwareStatus | null>(null);
+  const [firmwareError, setFirmwareError] = useState<string | null>(null);
+  const [firmwareLoading, setFirmwareLoading] = useState(false);
+  // 授权（注册）状态：null = 还没查；否则拿 LicenseInfo。
+  const [license, setLicense] = useState<LicenseInfo | null>(null);
+  const [licenseLoading, setLicenseLoading] = useState(false);
+  const [licenseModalOpen, setLicenseModalOpen] = useState(false);
+  const [licenseInput, setLicenseInput] = useState("");
+  const [licenseMsg, setLicenseMsg] = useState<string | null>(null);
+  const [licenseBusy, setLicenseBusy] = useState(false);
   const [listenerRunning, setListenerRunning] = useState(false);
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [pushing, setPushing] = useState(false);
@@ -97,16 +110,67 @@ export default function App() {
     flashTimer.current = setTimeout(() => setFlash(null), FLASH_MS);
   }, []);
 
+  /**
+   * 读开发板固件版本（USB Feature Report `0x13` → `0x11`/kind `0x04`）。
+   *
+   * 这是一次**完整的状态回读**（实机约 100 ms、约 10 个分块），不是枚举式探测，
+   * 所以它**不进 10 秒轮询**：只在上线跃迁、应用启动、以及用户手动点击时触发。
+   * 放进轮询会每 10 秒打扰一次板子，还会和按键监听器抢同一个 HID 读句柄。
+   */
+  const refreshFirmware = useCallback(async () => {
+    setFirmwareLoading(true);
+    try {
+      setFirmware(await api.deviceFirmwareStatus());
+      setFirmwareError(null);
+    } catch (e) {
+      // 失败就把上一次的版本号也清掉：留着它等于宣称"板上是那一版"，
+      // 而这次我们恰恰没能证明这一点。
+      setFirmware(null);
+      setFirmwareError(String(e));
+    } finally {
+      setFirmwareLoading(false);
+    }
+  }, []);
+
+  /** 读授权状态：从本地配置加载已保存的激活码并重新校验。 */
+  const refreshLicense = useCallback(async () => {
+    setLicenseLoading(true);
+    try {
+      const res = await api.licenseStatus();
+      if (res.ok && res.data) setLicense(res.data);
+      else setLicense(null);
+    } catch {
+      setLicense(null);
+    } finally {
+      setLicenseLoading(false);
+    }
+  }, []);
+
+  /** 上一次的在线状态，用来识别"离线 → 在线"那次跃迁。 */
+  const deviceOnlineRef = useRef(false);
+
   const refreshDevice = useCallback(async () => {
     try {
       const msg = await api.deviceStatus();
       setDeviceText(msg);
       setDeviceOnline(true);
+      // 只在**离线 → 在线**这一次跃迁上顺手读一次固件版本。
+      if (!deviceOnlineRef.current) {
+        deviceOnlineRef.current = true;
+        void refreshFirmware();
+      }
     } catch (e) {
       setDeviceText(String(e));
       setDeviceOnline(false);
+      // 板子不在了，之前读到的版本号就不再是"当前"的事实 —— 一并清掉，
+      // 否则界面会一直挂着一个可能已经过时的版本串。
+      if (deviceOnlineRef.current) {
+        deviceOnlineRef.current = false;
+        setFirmware(null);
+        setFirmwareError(null);
+      }
     }
-  }, []);
+  }, [refreshFirmware]);
 
   const refreshListener = useCallback(async () => {
     try {
@@ -175,6 +239,7 @@ export default function App() {
   useEffect(() => {
     loadAll();
     refreshDevice();
+    void refreshLicense();
     invoke<PluginPageInfo[]>("plugin_pages").then(setPluginPages).catch(() => {});
     const deviceTimer = setInterval(refreshDevice, 10000);
     refreshWorkbench();
@@ -271,9 +336,13 @@ export default function App() {
     // 旋钮按下 → 后端 emit studio-action → 前端调 studio 插件命令执行。
     let unlistenStudioFocus: UnlistenFn | undefined;
     let unlistenStudioAction: UnlistenFn | undefined;
-    listen<{ index: number; label: string }>("studio-focus", (ev) => {
-      const { label } = ev.payload;
+    listen<{ index: number; label: string }>("studio-focus", async (ev) => {
+      const { index, label } = ev.payload;
       notify("ok", `内容台 → ${label}`);
+      try {
+        await ensurePluginActivated("studio");
+        await invokePluginCommand("studio", "studio.set_focus", { index });
+      } catch (_) {}
     }).then((fn) => {
       unlistenStudioFocus = fn;
     });
@@ -286,6 +355,8 @@ export default function App() {
         if (r && typeof r === "object" && "ok" in r) {
           const result = r as { ok: boolean; message?: string; code?: string };
           notify(result.ok ? "ok" : "err", result.ok ? `✔ ${result.message || label}` : `✘ ${result.code || "ERROR"}：${result.message || "未知错误"}`);
+        } else {
+          notify("err", `内容台命令未就绪：插件未激活或命令 studio.quick_action 未注册。请先打开侧边栏「内容台」页签激活插件。`);
         }
       } catch (e) {
         notify("err", `内容台执行失败：${String(e)}`);
@@ -555,6 +626,55 @@ export default function App() {
             {deviceText}
           </span>
         </div>
+        {/*
+          固件版本徽标，紧跟「开发板检测」：两者回答的是同一类问题 ——
+          「板子在不在」与「板上跑的是哪一版」。版本串由**板子自己报出**
+          （0x13 状态请求 → 0x11/kind 0x04），不是本地文件里的记录，
+          所以它也是"固件到底烧没烧进去"唯一可信的回答。
+          读不到时如实写"读取失败"并允许点击重试，绝不显示一个可能过期的版本号。
+        */}
+        <button
+          type="button"
+          className={`fw-badge${firmware ? " ok" : firmwareError ? " bad" : ""}`}
+          onClick={() => void refreshFirmware()}
+          disabled={!deviceOnline || firmwareLoading}
+          title={
+            firmware
+              ? `固件 ${firmware.firmware}\n状态协议 ${firmware.schema}` +
+                (firmware.battery_mv != null
+                  ? `\n电池 ${firmware.battery_mv} mV / ${firmware.battery_percent ?? "?"}%`
+                  : "")
+              : firmwareError
+                ? `${firmwareError}\n\n点击重试`
+                : "板子不在线时不读固件版本。插上 USB（或等它重连）会自动读一次，也可以点击重试。"
+          }
+        >
+          {firmwareLoading
+            ? "固件版本读取中…"
+            : firmware
+              ? `固件 ${firmware.firmware}`
+              : firmwareError
+                ? "固件版本读取失败 · 点击重试"
+                : "固件版本 —"}
+        </button>
+        <button
+          type="button"
+          className={`license-badge${license?.valid ? " ok" : license?.valid === false ? " bad" : ""}`}
+          onClick={() => {
+            setLicenseInput("");
+            setLicenseMsg(license?.message ?? null);
+            setLicenseModalOpen(true);
+          }}
+          title={license?.valid ? `已注册（${license.edition}）` : "点击输入激活码"}
+        >
+          {licenseLoading
+            ? "注册状态读取中…"
+            : license?.valid
+              ? `已注册 · ${license.edition}`
+              : license?.valid === false
+                ? "未注册（试用）"
+                : "注册 / 激活"}
+        </button>
         {editing && (
           <EncoderStatus profile={editing} apps={apps} flash={flash} lastEvent={lastEvent} />
         )}
@@ -689,6 +809,57 @@ export default function App() {
               <button className="btn primary" onClick={() => chooseExit("minimize")}>最小化到托盘</button>
               <button className="btn ghost" onClick={() => setExitDialog(false)}>取消</button>
               <button className="btn danger" onClick={() => chooseExit("quit")}>退出</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {licenseModalOpen && (
+        <div className="modal-backdrop" onClick={() => setLicenseModalOpen(false)}>
+          <div className="modal license-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">激活 easyop</h3>
+            <p className="modal-desc">
+              输入由作者发放的激活码（本地校验，无需联网）。未激活时使用试用版，功能完整。
+            </p>
+            <textarea
+              className="license-input"
+              value={licenseInput}
+              placeholder="在此粘贴激活码"
+              onChange={(e) => setLicenseInput(e.target.value)}
+              rows={3}
+            />
+            {licenseMsg && (
+              <p className={`license-msg${license?.valid ? " ok" : " bad"}`}>{licenseMsg}</p>
+            )}
+            <div className="modal-actions">
+              <button
+                className="btn primary"
+                disabled={licenseBusy || licenseInput.trim().length === 0}
+                onClick={async () => {
+                  setLicenseBusy(true);
+                  setLicenseMsg(null);
+                  try {
+                    const res = await api.activateLicense(licenseInput.trim());
+                    if (res.ok && res.data) {
+                      setLicense(res.data);
+                      setLicenseMsg(res.data.message || "激活成功");
+                      notify("ok", `激活成功：${res.data.edition}`);
+                      setTimeout(() => setLicenseModalOpen(false), 1200);
+                    } else {
+                      setLicenseMsg(res.message || "激活失败");
+                      notify("err", res.message || "激活失败");
+                    }
+                  } catch (e) {
+                    setLicenseMsg(String(e));
+                    notify("err", String(e));
+                  } finally {
+                    setLicenseBusy(false);
+                  }
+                }}
+              >
+                {licenseBusy ? "校验中…" : "激活"}
+              </button>
+              <button className="btn ghost" onClick={() => setLicenseModalOpen(false)}>关闭</button>
             </div>
           </div>
         </div>

@@ -1,6 +1,6 @@
 // 动作标签与分组：把 ActionSpec 翻译成界面可读的名称与类型分组。
 // 磁贴工作台、侧栏筛选、⌘SS 命令面板都从这里取标签，避免各处重复一份映射。
-import { ACTION_KIND_LABELS, DESK_SLOT_OPTIONS, NAMED_ACTION_LABELS, WORKBENCH_ACTIONS, SS_PALETTE_ACTIONS, CLI_TERMINAL_ACTIONS, STUDIO_ACTIONS, KEY_UI } from "./constants";
+import { ACTION_KIND_LABELS, DESK_SLOT_OPTIONS, NAMED_ACTION_LABELS, WORKBENCH_ACTIONS, SS_PALETTE_ACTIONS, CLI_TERMINAL_ACTIONS, STUDIO_ACTIONS, STUDIO_KIND_OPTIONS, KEY_UI } from "./constants";
 import type { ActionSpec, AppEntry, Profile } from "./types";
 
 /** 侧栏的动作类型筛选维度。「all」是聚合视图，其余各自对应一种动作类型。 */
@@ -53,6 +53,8 @@ export function groupOf(action: ActionSpec): ActionGroup {
       return "app";
     case "task_desk":
       return "desk";
+    case "studio":
+      return "studio";
     case "disabled":
       return "disabled";
   }
@@ -98,6 +100,8 @@ export function actionSummary(action: ActionSpec, apps: AppEntry[]): string {
     }
     case "task_desk":
       return deskSlotLabel(action.value);
+    case "studio":
+      return STUDIO_KIND_OPTIONS.find((o) => o.value === action.value)?.label ?? `内容台 · ${action.value}`;
   }
 }
 
@@ -131,6 +135,8 @@ export function actionDetail(action: ActionSpec, apps: AppEntry[]): string {
     }
     case "task_desk":
       return `Agent 任务台 · ${deskSlotLabel(action.value)}（由 easyop 处理）`;
+    case "studio":
+      return `内容台旋钮 · ${STUDIO_KIND_OPTIONS.find((o) => o.value === action.value)?.label ?? action.value}（由 easyop 处理）`;
   }
 }
 

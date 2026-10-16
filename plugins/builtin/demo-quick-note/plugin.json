@@ -13,16 +13,34 @@
       {
         "id": "demo.quick_note",
         "title": "记一条灵感",
-        "keywords": ["灵感", "速记", "note", "inbox", "linggan", "sj"]
+        "keywords": [
+          "灵感",
+          "速记",
+          "note",
+          "inbox",
+          "linggan",
+          "sj"
+        ]
       }
     ],
     "tools": [
       {
         "command": "demo.quick_note",
         "subtitle": "记下一句话，稍后整理",
-        "keywords": ["灵感", "速记", "note", "inbox", "linggan"]
+        "keywords": [
+          "灵感",
+          "速记",
+          "note",
+          "inbox",
+          "linggan"
+        ]
       }
     ]
   },
-  "capabilities": ["storage", "selected-text", "log"]
+  "capabilities": [
+    "storage",
+    "selected-text",
+    "log"
+  ],
+  "hidden": true
 }

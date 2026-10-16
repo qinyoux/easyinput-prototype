@@ -159,6 +159,10 @@ export function validateAction(
       return DESK_SLOT_OPTIONS.some((o) => o.value === action.value)
         ? null
         : `任务台槽位非法：${action.value || "（空）"}（应为 1–4，即 S1–S4）`;
+    case "studio":
+      return ["prev", "next", "confirm"].includes(action.value)
+        ? null
+        : `内容台动作非法：${action.value || "（空）"}（应为 prev / next / confirm）`;
     default:
       return "未知动作类型";
   }

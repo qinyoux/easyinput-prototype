@@ -15,15 +15,40 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-use crate::model::{AppEntry, ConfigAck, Profile, Prompt};
+use std::collections::{HashMap, HashSet};
+
+use crate::capability::{ApiEnvelope, ErrorCode};
+use crate::license::LicenseInfo;
+use crate::model::{AppEntry, ConfigAck, DeviceStatus, Profile, Prompt};
 use crate::state::{self, AppState};
 use crate::system_apps::SystemApp;
-use crate::{device, host_action, validate, workbench};
+use crate::{device, host_action, license, status_query, validate, workbench};
+
+/// 一组可绑定到按键的「具名动作」，前端以**独立下拉菜单**呈现（按插件归类）。
+///
+/// 分组真源：每个声明了 `commands` 的**可见**插件 => 一个顶层菜单
+/// （`id` = 插件 id，`label` = 插件名）；隐藏插件（如 demo）不入列。
+/// 主机内置功能动作单独走 `Vocabulary.core_actions`，不与插件混排。
+/// 这样「实时翻译」「内容台」「风格调色盘」等插件各自成顶层菜单。
+#[derive(Serialize)]
+pub struct ActionGroup {
+    /// 分组 id：插件 id（如 `live-translate`）。
+    pub id: String,
+    /// 分组展示名（下拉菜单标题），如「实时翻译」「内容台」「风格调色盘」。
+    pub label: String,
+    /// 该分组下的动作 id 列表（顺序即下拉顺序）。
+    pub actions: Vec<String>,
+}
 
 /// 词表 / 常量（供前端渲染下拉框与做前端预校验）。
 #[derive(Serialize)]
 pub struct Vocabulary {
-    pub named_actions: Vec<&'static str>,
+    pub named_actions: Vec<String>,
+    pub action_labels: HashMap<String, String>,
+    /// 按插件归类的动作分组（每个声明了命令的可见插件 => 一个顶层菜单）。
+    pub action_groups: Vec<ActionGroup>,
+    /// 主机内置功能动作（「功能动作」菜单用，不含插件命令）。
+    pub core_actions: Vec<String>,
     pub modifiers: Vec<&'static str>,
     pub named_keys: Vec<&'static str>,
     pub text_max_utf8_bytes: usize,
@@ -59,6 +84,95 @@ pub(crate) fn device_status() -> Result<String, String> {
     }
     WAS_ONLINE.store(now_online, std::sync::atomic::Ordering::Relaxed);
     result
+}
+
+/// 读开发板固件状态（`0x13` 状态请求 → `0x11` / kind `0x04` 分块响应）。
+///
+/// 返回固件版本串（如 `0.4.53-idf-v2-ble-store-v1`）—— 这是"板子上到底跑着哪一版"
+/// 唯一可信的回答：它由板子自己报出，不依赖任何本地文件、也不依赖"我记得烧过"。
+///
+/// # 为什么单独立一条命令，不并进 `device_status`
+///
+/// `device_status` 是**枚举即返回**（打开句柄看一眼 VID/PID 就完），前端挂载后按秒轮询；
+/// 这条则要走完整的一次"发请求 → 收齐约 10 块 → 校验 CRC"，实测约 100 ms。
+/// 合并会让每次在线检测都白多花这 100 ms，而在线检测是高频路径。
+///
+/// # 失败不静默
+///
+/// "板子不在 USB 上"、"载荷不被固件接受"、"分块 CRC 不过"三种情况各返回**各自的**
+/// 错误文案，前端原样显示。档位只有"读到版本"与"读不到并说明原因"两种 ——
+/// 不存在"显示一个可能过期的版本号"。
+#[tauri::command]
+pub(crate) fn device_firmware_status() -> Result<DeviceStatus, String> {
+    let result = status_query::query_device_status();
+    // 只在**版本发生变化**时写日志：这条命令会被反复调用（挂载、手动重试、下发成功后），
+    // 每次都打一行会把日志刷成流水，反而盖掉真正要看的东西。
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    match &result {
+        Ok(s) if last.as_deref() != Some(s.firmware.as_str()) => {
+            crate::log_buffer::info(format!("开发板固件版本：{}", s.firmware));
+            *last = Some(s.firmware.clone());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // 读不到时不打日志（前端已经在界面上如实显示，日志里再刷没有新信息）；
+            // 但"上一轮还读得到、这一轮读不到了"是一次真实的状态变化，必须留痕。
+            if last.is_some() {
+                crate::log_buffer::warn(format!("开发板固件版本读取失败：{e}"));
+                *last = None;
+            }
+        }
+    }
+    result
+}
+
+/// 激活（注册）一个本地授权码：校验签名 → 通过后持久化到配置目录 `license.json`。
+///
+/// 校验失败返回 `InvalidInput` 错误信封，**不**写入；已存在的激活码不会被无效码覆盖。
+#[tauri::command]
+pub(crate) fn activate_license(app: AppHandle, code: String) -> ApiEnvelope<LicenseInfo> {
+    let dir = match config_dir(&app) {
+        Ok(d) => d,
+        Err(e) => return ApiEnvelope::err(ErrorCode::Internal, e),
+    };
+    let mid = license::machine_id();
+    match license::verify_license(&code, &mid) {
+        Ok(info) => match state::save_license(&dir, &code) {
+            Ok(()) => {
+                crate::log_buffer::info(format!(
+                    "激活成功：版次={} 备注={}",
+                    info.edition, info.note
+                ));
+                ApiEnvelope::ok(info)
+            }
+            Err(e) => {
+                ApiEnvelope::err(ErrorCode::Internal, format!("激活码有效，但保存失败：{e}"))
+            }
+        },
+        Err(e) => ApiEnvelope::err(ErrorCode::InvalidInput, e),
+    }
+}
+
+/// 读取当前注册状态：从配置目录加载已保存的激活码并重新校验（过期/篡改都会如实反映）。
+///
+/// 从未激活过返回"未注册（试用版）"；激活过但当前无效（过期/机器不符）返回具体原因。
+#[tauri::command]
+pub(crate) fn license_status(app: AppHandle) -> ApiEnvelope<LicenseInfo> {
+    let dir = match config_dir(&app) {
+        Ok(d) => d,
+        Err(e) => return ApiEnvelope::err(ErrorCode::Internal, e),
+    };
+    match state::load_license(&dir) {
+        Some(code) => {
+            let mid = license::machine_id();
+            match license::verify_license(&code, &mid) {
+                Ok(info) => ApiEnvelope::ok(info),
+                Err(e) => ApiEnvelope::ok(LicenseInfo::invalid(e)),
+            }
+        }
+        None => ApiEnvelope::ok(LicenseInfo::unregistered()),
+    }
 }
 
 /// 下发一个完整方案：本地校验 → 构造固件 JSON → 分块经 0x10 下发 → 读取 0x11 kind 0x03 回执。
@@ -100,8 +214,64 @@ pub(crate) fn push_config(
 /// 返回词表与常量，供前端一次性拉取。
 #[tauri::command]
 pub(crate) fn get_vocabulary() -> Vocabulary {
+    // 隐藏的插件（如 demo）不进按键菜单与校验词表。
+    let hidden_ids: Vec<String> = crate::plugin_registry::list()
+        .iter()
+        .filter(|p| p.hidden)
+        .map(|p| p.id.clone())
+        .collect();
+    let is_hidden = |id: &str| -> bool {
+        let pid = id.split('.').next().unwrap_or("");
+        hidden_ids.iter().any(|h| h == pid)
+    };
+
+    let mut named_actions: Vec<String> = crate::constants::NAMED_ACTIONS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    named_actions.extend(
+        crate::plugin_registry::action_uuids()
+            .keys()
+            .filter(|k| !is_hidden(k))
+            .cloned(),
+    );
+
+    // 按插件分组：仅可见插件；每个声明了命令的插件 => 一个顶层菜单。
+    let mut groups: Vec<ActionGroup> = Vec::new();
+    for p in crate::plugin_registry::list() {
+        if p.hidden || p.commands.is_empty() {
+            continue;
+        }
+        let actions: Vec<String> = p.commands.iter().map(|c| c.id.clone()).collect();
+        groups.push(ActionGroup {
+            id: p.id.clone(),
+            label: p.name.clone(),
+            actions,
+        });
+    }
+    // 未被任何插件认领的主机内置动作 => 「功能动作」核心菜单（独立项）。
+    let placed: HashSet<String> = groups
+        .iter()
+        .flat_map(|g| g.actions.iter().cloned())
+        .collect();
+    let core: Vec<String> = crate::constants::NAMED_ACTIONS
+        .iter()
+        .filter(|a| {
+            let s: &str = *a;
+            !placed.iter().any(|p| p.as_str() == s)
+        })
+        .map(|s| s.to_string())
+        .collect();
+
+    // 动作标签：去掉隐藏插件，避免菜单里残留。
+    let mut action_labels = crate::plugin_registry::action_labels();
+    action_labels.retain(|k, _| !is_hidden(k));
+
     Vocabulary {
-        named_actions: crate::constants::NAMED_ACTIONS.to_vec(),
+        named_actions,
+        action_labels,
+        action_groups: groups,
+        core_actions: core,
         modifiers: crate::constants::HOTKEY_MODIFIER_TOKENS.to_vec(),
         named_keys: crate::constants::HOTKEY_NAMED_KEYS.to_vec(),
         text_max_utf8_bytes: crate::constants::FIXED_TEXT_MAX_UTF8_BYTES,

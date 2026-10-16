@@ -13,11 +13,12 @@
 //! 因此清单里的 `capabilities` 字段**当前只是文档承诺，无法强制隔离**。详见
 //! 《easyop 扩展机制规范》§六。这里不做"假装有沙箱"的设计，避免给出错误的安全感。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::log_buffer;
 
@@ -122,6 +123,9 @@ pub struct PluginManifest {
     /// 一句话说明。
     #[serde(default)]
     pub description: Option<String>,
+    /// 标记为内部 / 示范插件：不进入按键菜单等用户面向列表（如 demo 示范插件）。
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// 已加载插件（清单 + 磁盘位置 + 来源）。
@@ -142,6 +146,8 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub dir: String,
     pub builtin: bool,
+    /// 是否对用户隐藏（demo 等示范插件）。
+    pub hidden: bool,
     pub commands: Vec<CommandDecl>,
     pub tools: Vec<ToolDecl>,
     pub capabilities: Vec<String>,
@@ -199,6 +205,7 @@ pub fn rescan() -> usize {
     if let Ok(mut guard) = store().lock() {
         *guard = loaded;
     }
+    register_action_uuids();
     n
 }
 
@@ -301,6 +308,95 @@ fn validate(m: &PluginManifest) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// 插件命令 → 硬件按键动作（保留 UUID）注册
+// ---------------------------------------------------------------------------
+
+/// 插件动作命名空间（uuid v5 的 name 空间），与系统其它 v5 命名空间隔离。
+const ACTION_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x9b, 0x1c, 0x4e, 0x2a, 0x7f, 0x33, 0x51, 0xe0, 0x8c, 0x12, 0x44, 0x9a, 0xb7, 0x66,
+    0x0d, 0x5f,
+]);
+
+/// 插件命令 → 保留 UUID（供硬件按键触发）。value 为 `&'static str`（启动时一次性 leak）。
+static ACTION_UUIDS: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+/// UUID → (plugin_id, command_id) 逆映射。
+static UUID_TO_ACTION: OnceLock<Mutex<HashMap<String, (&'static str, &'static str)>>> =
+    OnceLock::new();
+
+/// 为每个插件命令生成确定性保留 UUID 并写入双向映射表。
+///
+/// 在 `rescan()` 之后调用，保证「清单已加载」与「UUID 表」同源。
+/// uuid v5 由 action_id 派生，跨会话稳定——已烧录固件在下次重新下发前一致。
+fn register_action_uuids() {
+    let mut fwd: HashMap<String, &'static str> = HashMap::new();
+    let mut rev: HashMap<String, (&'static str, &'static str)> = HashMap::new();
+    if let Ok(guard) = store().lock() {
+        for p in guard.iter() {
+            if p.manifest.hidden {
+                continue;
+            }
+            for c in &p.manifest.contributes.commands {
+                let uuid = Uuid::new_v5(&ACTION_NAMESPACE, c.id.as_bytes()).to_string();
+                let uuid_s: &'static str = Box::leak(uuid.into_boxed_str());
+                let pid: &'static str = Box::leak(p.manifest.id.clone().into_boxed_str());
+                let cid: &'static str = Box::leak(c.id.clone().into_boxed_str());
+                fwd.insert(c.id.clone(), uuid_s);
+                rev.insert(uuid_s.to_string(), (pid, cid));
+            }
+        }
+    }
+    let count = rev.len();
+    if let Ok(mut g) = ACTION_UUIDS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        *g = fwd;
+    }
+    if let Ok(mut g) = UUID_TO_ACTION.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        *g = rev;
+    }
+    log_buffer::info(format!("插件动作 UUID 注册：{} 条", count));
+}
+
+/// 取插件动作的保留 UUID（供 `payload::reserved_uuid_for_named` 下发固件）。
+pub fn plugin_action_uuid(action_id: &str) -> Option<&'static str> {
+    ACTION_UUIDS.get()?.lock().ok()?.get(action_id).copied()
+}
+
+/// 由保留 UUID 反查 `(plugin_id, command_id)`（供 `handle_host_action` 路由）。
+pub fn resolve_action_uuid(uuid: &str) -> Option<(&'static str, &'static str)> {
+    UUID_TO_ACTION.get()?.lock().ok()?.get(uuid).copied()
+}
+
+/// 所有插件动作 id（供 `get_vocabulary` 合并进 `named_actions`）。
+pub fn action_uuids() -> HashMap<String, &'static str> {
+    ACTION_UUIDS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// 动作 id → 中文标签（供 `get_vocabulary` 的 `action_labels`）。
+pub fn action_labels() -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Ok(g) = store().lock() {
+        for p in g.iter() {
+            for c in &p.manifest.contributes.commands {
+                out.insert(c.id.clone(), c.title.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 该具名动作是否是插件声明的动作（供 `validate_action` 放行）。
+pub fn is_plugin_action(name: &str) -> bool {
+    ACTION_UUIDS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.contains_key(name))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // 查询
 // ---------------------------------------------------------------------------
 
@@ -320,6 +416,7 @@ fn to_info(p: &LoadedPlugin) -> PluginInfo {
         description: p.manifest.description.clone(),
         dir: p.dir.to_string_lossy().to_string(),
         builtin: p.builtin,
+        hidden: p.manifest.hidden,
         commands: p.manifest.contributes.commands.clone(),
         tools: p.manifest.contributes.tools.clone(),
         capabilities: p.manifest.capabilities.clone(),
@@ -457,6 +554,7 @@ mod tests {
 
     fn manifest_with(commands: &[(&str, &str)], tools: &[&str]) -> PluginManifest {
         PluginManifest {
+            hidden: false,
             id: "p1".to_string(),
             name: "测试插件".to_string(),
             version: None,
@@ -581,6 +679,7 @@ mod tests {
     #[test]
     fn search_hits_by_keyword_and_title() {        let plugin = LoadedPlugin {
             manifest: PluginManifest {
+                hidden: false,
                 id: "demo".to_string(),
                 name: "演示".to_string(),
                 version: None,
@@ -619,6 +718,7 @@ mod tests {
     fn search_hits_empty_tools_no_search() {
         let plugin = LoadedPlugin {
             manifest: PluginManifest {
+                hidden: false,
                 id: "solo".to_string(),
                 name: "独立".to_string(),
                 version: None,

@@ -1,0 +1,164 @@
+{
+  "id": "stylecam",
+  "name": "风格调色盘",
+  "version": "0.5.3",
+  "description": "easyop 的风格调色盘：素材 → 风格 → 强度 → 生图 → 结果 → 创意显示 → 作品集。生图经插件自带 Python 脚本调用（默认走 EasySU 中转，provider 可在 tools/stylecam_io.env 切换）。随 easyop 发布的内置插件。",
+  "main": "index.js",
+  "activationEvents": [
+    "onPage:stylecam.board",
+    "onCommand:stylecam.doctor",
+    "onCommand:stylecam.state",
+    "onCommand:stylecam.gallery.list"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "stylecam.state",
+        "title": "风格调色盘状态",
+        "keywords": ["状态", "state", "zt", "zhuangtai"]
+      },
+      {
+        "id": "stylecam.image.add",
+        "title": "添加素材",
+        "keywords": ["素材", "添加", "图片", "sucai", "sc", "tianjia", "tj"]
+      },
+      {
+        "id": "stylecam.image.remove",
+        "title": "删除单张素材",
+        "keywords": ["素材", "删除", "shanchu", "sc", "sucai"]
+      },
+      {
+        "id": "stylecam.image.clear",
+        "title": "清空素材",
+        "keywords": ["素材", "清空", "qingkong", "qk", "sucai"]
+      },
+      {
+        "id": "stylecam.style.pick",
+        "title": "选择风格",
+        "keywords": ["风格", "选择", "fengge", "fg", "style"]
+      },
+      {
+        "id": "stylecam.strength.set",
+        "title": "设置强度",
+        "keywords": ["强度", "设置", "qiangu", "qd", "strength"]
+      },
+      {
+        "id": "stylecam.generate",
+        "title": "生成图片",
+        "keywords": ["生成", "生图", "出图", "shengcheng", "sc", "generate"]
+      },
+      {
+        "id": "stylecam.result.save",
+        "title": "存入作品集",
+        "keywords": ["作品集", "保存", "baocun", "bc", "zuopinji", "zpj"]
+      },
+      {
+        "id": "stylecam.result.export",
+        "title": "导出到磁盘",
+        "keywords": ["导出", "磁盘", "daochu", "dc", "export"]
+      },
+      {
+        "id": "stylecam.creative.render",
+        "title": "创意显示",
+        "keywords": ["创意", "显示", "chuangyi", "cy", "creative"]
+      },
+      {
+        "id": "stylecam.gallery.list",
+        "title": "作品集列表",
+        "keywords": ["作品集", "列表", "zuopinji", "zpj", "gallery"]
+      },
+      {
+        "id": "stylecam.gallery.remove",
+        "title": "删除作品集条目",
+        "keywords": ["作品集", "删除", "shanchu", "sc", "zuopinji"]
+      },
+      {
+        "id": "stylecam.config.get",
+        "title": "读取配置",
+        "keywords": ["配置", "读取", "config", "get"]
+      },
+      {
+        "id": "stylecam.config.set",
+        "title": "配置设置",
+        "keywords": ["配置", "设置", "peizhi", "pz", "config"]
+      },
+      {
+        "id": "stylecam.config.validate",
+        "title": "验证配置",
+        "keywords": ["配置", "验证", "validate"]
+      },
+      {
+        "id": "stylecam.config.reset",
+        "title": "重置配置",
+        "keywords": ["配置", "重置", "reset"]
+      },
+      {
+        "id": "stylecam.provider.list",
+        "title": "生图服务列表",
+        "keywords": ["provider", "服务", "能力"]
+      },
+      {
+        "id": "stylecam.key.status",
+        "title": "API Key 状态",
+        "keywords": ["Key", "状态", "key status"]
+      },
+      {
+        "id": "stylecam.key.set",
+        "title": "保存 API Key",
+        "keywords": ["Key", "保存", "key set"]
+      },
+      {
+        "id": "stylecam.doctor",
+        "title": "风格调色盘自检",
+        "keywords": ["自检", "环境", "doctor", "zijian", "zj", "key"]
+      },
+      {
+        "id": "stylecam.hardware",
+        "title": "硬件/按键输入",
+        "keywords": ["硬件", "按键", "旋钮", "yingjian", "yj", "hardware"]
+      }
+    ],
+    "tools": [
+      {
+        "command": "stylecam.doctor",
+        "subtitle": "检查 Python / API Key / 模型 / 输出目录",
+        "keywords": ["自检", "doctor", "key", "模型", "方舟"]
+      },
+      {
+        "command": "stylecam.state",
+        "subtitle": "查看素材 / 当前风格 / 作品集条数",
+        "keywords": ["状态", "state", "作品集", "风格"]
+      },
+      {
+        "command": "stylecam.gallery.list",
+        "subtitle": "一句话摘要列出最近作品",
+        "keywords": ["作品集", "gallery", "列表", "历史"]
+      },
+      {
+        "command": "stylecam.config.get",
+        "subtitle": "读取脱敏后的生效配置",
+        "keywords": ["配置", "config", "读取"]
+      },
+      {
+        "command": "stylecam.provider.list",
+        "subtitle": "查看生图服务能力",
+        "keywords": ["provider", "服务", "能力"]
+      },
+      {
+        "command": "stylecam.key.status",
+        "subtitle": "查看脱敏 API Key 状态",
+        "keywords": ["key", "状态", "脱敏"]
+      }
+    ],
+    "pages": [
+      {
+        "id": "stylecam.board",
+        "title": "风格调色盘",
+        "icon": "spark",
+        "order": 51,
+        "keywords": ["风格", "调色盘", "生图", "stylecam", "fengge", "fg"]
+      }
+    ]
+  },
+  "capabilities": ["storage", "runner", "log", "clipboard"]
+}

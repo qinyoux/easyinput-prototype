@@ -378,7 +378,7 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_desk::config::{Capability, CompletionSignal, DriverKind};
+    use crate::agent_desk::config::{Capability, CompletionSignal, DeskConfig, DriverKind};
     use crate::agent_desk::driver::CollectSink;
 
     /// 造一个用 `cmd /C echo` 当"Agent"的 driver —— 真实子进程、离线可测。
@@ -703,6 +703,37 @@ mod tests {
                 "exec",
                 "--json",
                 "--skip-git-repo-check",
+                "resume",
+                "abc123",
+                "打开微信",
+            ]
+        );
+    }
+
+    /// v0.42.1：拿**真实预置参数**（含 `--sandbox danger-full-access`）叠续接，
+    /// 验证子命令 `resume` 仍落在所有全局选项之后。
+    ///
+    /// 上面那条用的是手写 args；这条钉的是预置本体 —— 将来谁再往预置里加全局旗标，
+    /// 如果把它插到了 `{prompt}` 之后，这条会红。
+    #[test]
+    fn the_real_preset_keeps_resume_after_every_global_flag() {
+        let codex = DeskConfig::default()
+            .driver("codex-cli")
+            .expect("预置必须有 codex-cli")
+            .clone();
+        let cont = codex
+            .continuation
+            .as_ref()
+            .expect("codex 预置必须配续接");
+        let args = build_args(&codex, "打开微信", Some(cont), Some("abc123"));
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "danger-full-access",
                 "resume",
                 "abc123",
                 "打开微信",

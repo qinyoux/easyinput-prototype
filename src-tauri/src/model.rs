@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 /// {"kind": "text", "value": "你好"}          // 固定文本，≤ 960 字节
 /// {"kind": "host_action", "value": "host_action:<uuid>"}
 /// {"kind": "task_desk", "value": "1"}        // Agent 任务台槽位 1
+/// {"kind": "studio", "value": "prev"}        // 内容台旋钮 · 上一项
 /// ```
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -41,6 +42,12 @@ pub enum ActionSpec {
     /// 一旦用户的某个应用 UUID 恰好撞上保留段就会静默开错东西。
     /// 类型分开，分流就是**互斥**的，不依赖查表顺序。
     TaskDesk(String),
+    /// **内容台旋钮导航**。`value` 是 `"prev"` / `"next"` / `"confirm"`。
+    ///
+    /// 与 `TaskDesk` 同理：对固件而言等价于 `host_action:<保留 UUID>`，
+    /// 分开 kind 是为了在主机侧 UI 上独立成"内容台"选项，
+    /// 不与普通功能动作（copy / paste 等）混在下拉里。
+    Studio(String),
 }
 
 impl ActionSpec {
@@ -167,4 +174,24 @@ pub struct ConfigAck {
     pub phase: u8,
     pub bytes: u16,
     pub crc16: u16,
+}
+
+/// 开发板固件状态（0x13 状态请求 → 0x11 / kind 0x04 分块响应）的摘要。
+///
+/// 只摘取界面上真正要看的几项。**不**做全字段结构体反序列化：固件的状态 JSON
+/// 会随版本增删字段（`capabilities` 那一段就一直在长），用固定 struct 接会在
+/// 固件升级时整条解析失败 —— 那时连 `firmware` 都读不出来了。
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// 固件版本串，如 `0.4.53-idf-v2-ble-store-v1`（固件 `kFirmwareVersion`）。
+    ///
+    /// 串里带 `idf-v2-…` 这种构建标记，能直接看出板子上跑的是哪一支构建 ——
+    /// 这正是"烧没烧进去"这个问题唯一可信的回答。
+    pub firmware: String,
+    /// 状态 JSON 的 schema，如 `ai_keyboard.config_status.v1`（判断协议代际）。
+    pub schema: String,
+    /// 电池电压（mV）；固件没报就是 `None`。
+    pub battery_mv: Option<u16>,
+    /// 电池电量（%）；固件没报就是 `None`。
+    pub battery_percent: Option<u8>,
 }

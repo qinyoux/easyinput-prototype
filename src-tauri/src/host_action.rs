@@ -313,6 +313,16 @@ fn handle_host_action(
         return;
     }
 
+    // 3.9. 插件声明的命令（`<plugin>.<command>`）：emit `plugin-action` 给前端执行。
+    if let Some((plugin_id, command_id)) = crate::plugin_registry::resolve_action_uuid(&uuid) {
+        log_buffer::info(format!("插件动作触发：{plugin_id}.{command_id}"));
+        let _ = app.emit(
+            "plugin-action",
+            serde_json::json!({ "pluginId": plugin_id, "commandId": command_id }),
+        );
+        return;
+    }
+
     // 4. 普通 UUID：在应用库中解析并打开。
     let result = {
         let guard = apps.read().unwrap();

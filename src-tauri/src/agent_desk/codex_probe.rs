@@ -18,8 +18,12 @@
 //!
 //! # 三个必须做对的点（都曾是想错的）
 //!
-//! 1. **首轮只登记偏移、不产事件**。否则用户重启一次 easyop，就会把历史上
+//! 1. **首见一律按 EOF 登记、不读内容**。否则用户重启一次 easyop，就会把历史上
 //!    几十个 rollout 文件里的 `task_complete` 全部当成"刚刚完成"，喇叭连播几十句。
+//!    更毒的是**文件复活**：一个 23 天前写完的旧 rollout 跌出 `seen` 回收表后，
+//!    被任务台自己的 `codex exec resume` 追加写一笔 → mtime 变新 → 重新进入窗口 →
+//!    被当成"全新文件"从偏移 0 整读 → 18 个历史 `task_complete` 全变成新命中，
+//!    任务**刚开始**就播"任务已完成"（v0.41.15 实锤误报）。
 //!    代价是"开 easyop 之前 1 秒跑完的那个"会被漏掉 —— 漏掉远比误报好。
 //! 2. **偏移只推进到最后一个完整行的末尾**。rollout 是被 codex **持续追加**的，
 //!    扫到的最后一行常常只写了一半。若把半行也计进偏移，那个事件就永远读不到了。
@@ -68,8 +72,6 @@ pub struct ProbeHit {
 pub struct CodexProbe {
     /// `文件路径 → 已读到的字节偏移`。
     seen: HashMap<PathBuf, u64>,
-    /// 是否已完成首轮（首轮只登记偏移，见模块文档第 1 点）。
-    primed: bool,
 }
 
 impl CodexProbe {
@@ -100,15 +102,11 @@ impl CodexProbe {
                     }
                 }
                 None => {
-                    if self.primed {
-                        // 已经过了首轮才出现 ⇒ 这是一个**新的**会话，从 0 开始读。
-                        let (found, consumed) = read_since(path, 0, now_ms);
-                        hits.extend(found);
-                        self.seen.insert(path.clone(), consumed);
-                    } else {
-                        // 首轮：只登记当前长度，**不读内容**（见模块文档第 1 点）。
-                        self.seen.insert(path.clone(), *len);
-                    }
+                    // 首见一律按 EOF 登记、**不读内容**（见模块文档第 1 点）：
+                    // 不管它是重启前的历史文件、窗口外复活的旧 rollout、还是
+                    // 用户新开的会话，它"被我们看到之前"写的内容都不是新事件。
+                    // 登记之后追加的内容仍会正常命中 —— 怕误报不等于把耳朵堵了。
+                    self.seen.insert(path.clone(), *len);
                 }
             }
         }
@@ -118,7 +116,6 @@ impl CodexProbe {
         let live: std::collections::HashSet<&PathBuf> = files.iter().map(|(p, _)| p).collect();
         self.seen.retain(|p, _| live.contains(p));
 
-        self.primed = true;
         hits
     }
 }
@@ -302,33 +299,45 @@ mod tests {
 
     #[test]
     fn first_pass_registers_offset_without_emitting() {
-        // 这是本模块最重要的一条：首轮**绝不能**把历史文件当成新事件。
+        // 这是本模块最重要的一条：首见**绝不能**把历史内容当成新事件。
         let dir = root("first_pass");
         let f = dir.join("rollout-a.jsonl");
         write(&f, &[complete_line("t1", "历史任务"), noise_line()]);
 
         let mut p = CodexProbe::new();
         let hits = p.scan(&dir, 1_000);
-        assert!(hits.is_empty(), "首轮必须静默：历史文件不是新事件");
-        assert!(p.primed);
+        assert!(hits.is_empty(), "首见必须静默：历史文件不是新事件");
         assert_eq!(p.seen.len(), 1);
     }
 
     #[test]
-    fn a_new_file_after_priming_is_read_from_the_start() {
-        let dir = root("new_file");
-        write(&dir.join("rollout-a.jsonl"), &[noise_line()]);
+    fn a_file_first_seen_is_registered_at_eof_and_history_is_ignored() {
+        // v0.41.15 实锤误报的场景：任务台 `codex exec resume` 追加写一个 23 天前的
+        // 旧 rollout，文件复活后被当成"全新文件"从 0 整读，18 个历史 task_complete
+        // 全变成新命中，任务刚开始就播"任务已完成"。
+        // 新语义：首见一律按 EOF 登记；登记之后追加的事件仍然要能听到。
+        let dir = root("first_seen_eof");
+        let f = dir.join("rollout-a.jsonl");
+        write(
+            &f,
+            &[
+                complete_line("t1", "二十三天的旧结论"),
+                complete_line("t2", "又一条旧结论"),
+                noise_line(),
+            ],
+        );
 
         let mut p = CodexProbe::new();
-        assert!(p.scan(&dir, 1_000).is_empty());
+        assert!(p.scan(&dir, 1_000).is_empty(), "首见不得回放历史");
 
-        write(
-            &dir.join("rollout-b.jsonl"),
-            &[complete_line("t2", "新会话的结论")],
-        );
+        let mut s = fs::read_to_string(&f).unwrap();
+        s.push_str(&complete_line("t3", "这次的结论"));
+        s.push('\n');
+        fs::write(&f, s).unwrap();
+
         let hits = p.scan(&dir, 2_000);
-        assert_eq!(hits.len(), 1, "首轮之后出现的新文件应当从 0 读起");
-        assert!(hits[0].summary.contains("新会话的结论"));
+        assert_eq!(hits.len(), 1, "登记 EOF 之后追加的事件必须能听到");
+        assert!(hits[0].summary.contains("这次的结论"));
     }
 
     #[test]

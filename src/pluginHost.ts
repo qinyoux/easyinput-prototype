@@ -116,7 +116,12 @@ async function runPlugin(
   // 已激活则直接执行命令
   const existing = activatedPlugins.get(pluginId);
   if (existing) {
-    await execCommand(pluginId, existing, commandId);
+    // 与冷启动路径（下方 `commandId !== "__page__"`）保持一致：
+    // `__page__` 是「仅激活页签」哨兵，不是插件命令，幂等分支同样要跳过 execCommand，
+    // 否则按键触发 / 侧栏点页签等已激活场景会刷「命令未注册：__page__」。
+    if (commandId !== "__page__") {
+      await execCommand(pluginId, existing, commandId);
+    }
     return;
   }
 
@@ -149,6 +154,22 @@ async function runPlugin(
       timed(pluginId, "run", () =>
         invoke<unknown>("eo_run", { program, args: args ?? [], opts: opts ?? {} }),
       ),
+    /**
+     * 监听 Tauri 事件（插件实时刷新用，如 live-translate 的 `lt-*` 事件流）。
+     *
+     * 返回 `UnlistenFn`：插件**必须**在 `dispose()` 里调用它解除订阅 ——
+     * 否则页签切走/重建后旧监听仍在跑，会对着已卸载的 DOM 更新。
+     */
+    listen: (event: string, handler: (payload: unknown) => void): Promise<UnlistenFn> =>
+      listen<unknown>(event, (ev) => handler(ev.payload)),
+    /**
+     * 调用任意已注册的 Tauri 命令（插件的自定义后端命令入口）。
+     *
+     * 插件代码是 blob import 的 ES module，无法直接 `import @tauri-apps/api`，
+     * 因此自定义命令（如 `lt_start` / `lt_stop` / `lt_export`）经此转发。
+     */
+    invoke: <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
+      timed(pluginId, `invoke:${cmd}`, () => invoke<T>(cmd, args ?? {})),
   };
 
   // ── 命令注册表 + context ──
@@ -189,6 +210,8 @@ async function runPlugin(
       });
     } else {
       await invoke<void>("eo_log_error", { msg: "插件入口未导出 activate 函数" });
+      pendingActivations.get(pluginId)?.();
+      pendingActivations.delete(pluginId);
       return;
     }
   } catch (e) {
@@ -198,6 +221,10 @@ async function runPlugin(
     } catch {
       // ignore
     }
+    // ⚠️ 必须 resolve pendingActivations，否则 ensurePluginActivated 永久挂起。
+    // 激活虽失败，但等待者需要拿到控制权去报错，而不是无限 await。
+    pendingActivations.get(pluginId)?.();
+    pendingActivations.delete(pluginId);
     return;
   }
 
@@ -278,3 +305,11 @@ export async function invokePluginCommand(
   if (!fn) return undefined;
   return fn(args);
 }
+
+// 硬件按键触发的插件动作（Rust `host_action` 路由而来）。
+// 先确保插件已激活（命令在 activate() 时注册），再执行对应命令。
+listen<{ pluginId: string; commandId: string }>("plugin-action", async (e) => {
+  const { pluginId, commandId } = e.payload;
+  await invoke("plugin_trigger_activate", { pluginId }).catch(() => {});
+  invokePluginCommand(pluginId, commandId);
+});

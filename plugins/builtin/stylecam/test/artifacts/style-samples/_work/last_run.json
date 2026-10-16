@@ -1,0 +1,27 @@
+{
+  "cyber-neon": {
+    "ok": true,
+    "path": "E:\\MY_AI\\trae\\ESP32_S3_BOT\\easyinput-prototype\\plugins\\builtin\\stylecam\\test\\artifacts\\style-samples\\20261013-001844_cyber-neon.png",
+    "secs": 38
+  },
+  "ink-china": {
+    "ok": true,
+    "path": "E:\\MY_AI\\trae\\ESP32_S3_BOT\\easyinput-prototype\\plugins\\builtin\\stylecam\\test\\artifacts\\style-samples\\20261013-001916_ink-china.png",
+    "secs": 29
+  },
+  "vaporwave": {
+    "ok": true,
+    "path": "E:\\MY_AI\\trae\\ESP32_S3_BOT\\easyinput-prototype\\plugins\\builtin\\stylecam\\test\\artifacts\\style-samples\\20261013-002011_vaporwave.png",
+    "secs": 53
+  },
+  "pop-art": {
+    "ok": true,
+    "path": "E:\\MY_AI\\trae\\ESP32_S3_BOT\\easyinput-prototype\\plugins\\builtin\\stylecam\\test\\artifacts\\style-samples\\20261013-002051_pop-art.png",
+    "secs": 37
+  },
+  "clay-3d": {
+    "ok": true,
+    "path": "E:\\MY_AI\\trae\\ESP32_S3_BOT\\easyinput-prototype\\plugins\\builtin\\stylecam\\test\\artifacts\\style-samples\\20261013-002127_clay-3d.png",
+    "secs": 33
+  }
+}

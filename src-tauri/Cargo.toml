@@ -1,6 +1,6 @@
 [package]
 name = "easyop"
-version = "0.43.2"
+version = "0.45.0"
 description = "easyop：按住说话/连续通话 → 云端流式识别 → 松手上屏 + EasyInput 开发板三通道通信（HID/Wi-Fi/蓝牙）"
 authors = ["easyop"]
 edition = "2021"
@@ -68,6 +68,7 @@ serde_json = "1"
 # 所以这一行不新增任何下载与编译。手写 base64 反而要多维护"填充缺失/空白字符"
 # 这些边界，得不偿失。
 base64 = "0.22"
+ed25519-dalek = "2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",

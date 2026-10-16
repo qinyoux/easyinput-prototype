@@ -1,0 +1,66 @@
+{
+  "id": "live-translate",
+  "name": "实时翻译",
+  "version": "0.2.0",
+  "description": "英文会议/对话实时识别多人语音、按说话人分离、同步翻译为中文并上屏。语音与翻译均走云端（豆包 ASR + LLM），复用全局模型配置。",
+  "main": "index.js",
+  "activationEvents": [
+    "onPage:live-translate.board"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "live-translate.start",
+        "title": "开始实时翻译",
+        "keywords": [
+          "翻译",
+          "开始",
+          "fanyi",
+          "fy",
+          "translate"
+        ]
+      },
+      {
+        "id": "live-translate.stop",
+        "title": "停止实时翻译",
+        "keywords": [
+          "翻译",
+          "停止",
+          "tingzhi",
+          "tz"
+        ]
+      },
+      {
+        "id": "live-translate.export",
+        "title": "导出翻译记录",
+        "keywords": [
+          "翻译",
+          "导出",
+          "daochu",
+          "dc"
+        ]
+      }
+    ],
+    "tools": [],
+    "pages": [
+      {
+        "id": "live-translate.board",
+        "title": "实时翻译",
+        "icon": "translate",
+        "order": 60,
+        "keywords": [
+          "翻译",
+          "实时",
+          "会议",
+          "fanyi",
+          "translate",
+          "fy"
+        ]
+      }
+    ]
+  },
+  "capabilities": [
+    "storage",
+    "log"
+  ]
+}

@@ -127,6 +127,21 @@ pub fn save_apps(config_dir: &PathBuf, apps: &[AppEntry]) -> Result<(), String> 
     save_json(config_dir, apps_path(config_dir), apps)
 }
 
+/// 激活码（授权码）文件路径。
+pub fn license_path(config_dir: &PathBuf) -> PathBuf {
+    config_dir.join("license.json")
+}
+
+/// 从磁盘加载已保存的激活码（原始字符串）；不存在时返回 None。
+pub fn load_license(config_dir: &PathBuf) -> Option<String> {
+    load_json(config_dir, license_path(config_dir))
+}
+
+/// 持久化激活码（原始字符串写入 JSON 文件）。
+pub fn save_license(config_dir: &PathBuf, code: &str) -> Result<(), String> {
+    save_json(config_dir, license_path(config_dir), code)
+}
+
 fn save_json<T: Serialize + ?Sized>(config_dir: &PathBuf, path: PathBuf, value: &T) -> Result<(), String> {
     fs::create_dir_all(config_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
     let json = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;

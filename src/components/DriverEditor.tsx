@@ -60,7 +60,12 @@ const COMPLETION_LABELS: Record<string, string> = {
   http_stream_end: "HTTP 流结束",
   log_pattern: "日志权威串",
   process_exit_zero: "进程退出码 0",
-  async_task_poll: "异步任务轮询（尚未实现）",
+  async_task_poll: "异步任务轮询（不可用 · 未实现）",
+};
+
+/** ⛔ 尚不可选的完成判定方式（后端没有对应实现，选了会判不出完成）。 */
+const COMPLETION_UNAVAILABLE: Record<string, string> = {
+  async_task_poll: "异步任务轮询未实现，选它永远判不出完成",
 };
 
 /** CLI 执行器的环境变量里是否声明了 HOME 系变量。规则与后端 `declares_home` 对齐。 */
@@ -143,20 +148,25 @@ export default function DriverEditor({
     const isPreset = PRESET_DRIVER_IDS.has(d.id);
     const configured = isConfigured(d);
     const homes = boundSlots(d.id);
+    /** 能否被调度：配置齐 + 已启用。这两个条件缺一，槽位派发就会报错。 */
+    const schedulable = configured && d.enabled;
 
     return (
-      <div key={d.id} className="desk-driver-row">
+      <div key={d.id} className={`desk-driver-row${schedulable ? "" : " off"}`}>
         <div className="desk-driver-row-head">
           <button className="btn-ghost" onClick={() => setOpen(isOpen ? null : d.id)}>
             {isOpen ? "▾" : "▸"} {d.label || d.id}
           </button>
           {isPreset && <span className="desk-tag">预置</span>}
-          <span className={`desk-tag ${configured ? "ok" : "warn"}`}>
+          <span className={`desk-tag ${configured ? "ok" : "off"}`}>
             {configured ? "已配置" : "待配置"}
           </span>
-          <span className={`desk-tag ${d.enabled ? "ok" : "warn"}`}>
+          <span className={`desk-tag ${d.enabled ? "ok" : "off"}`}>
             {d.enabled ? "已启用" : "未启用"}
           </span>
+          {!schedulable && (
+            <span className="desk-tag off">不可调度</span>
+          )}
           <button
             className={`switch${d.enabled ? " on" : ""}`}
             onClick={() => onPatch(d.id, { enabled: !d.enabled })}
@@ -175,7 +185,7 @@ export default function DriverEditor({
             {probing === d.id ? "探测中…" : "探测"}
           </button>
           {isPreset ? (
-            <span className="desk-tag" title="预置执行器只能停用；删除后会在下次启动时被补回">
+            <span className="desk-tag off" title="预置执行器只能停用；删除后会在下次启动时被补回">
               不可删
             </span>
           ) : confirming === d.id ? (
@@ -215,10 +225,8 @@ export default function DriverEditor({
           <p className="hint bad" style={{ padding: "0 12px 8px" }}>
             删除<strong>不可撤销</strong>。
             {homes.length > 0
-              ? ` ⚠️ 槽位 S${homes.join("、S")} 正绑着它，保存后这些槽位会被清空 —— 
-                 不会自动改绑到别的执行器（猜错就是把任务发给了错的 Agent）。`
+              ? ` ⚠️ 槽位 S${homes.join("、S")} 正绑着它，保存后会被清空（不会自动改绑）。`
               : " 当前没有槽位绑定它。"}
-            <br />
             记得点下面的「保存」才算落盘。
           </p>
         )}
@@ -309,9 +317,7 @@ export default function DriverEditor({
                     />
                   </div>
                   <p className="hint">
-                    ⚠️ Windows 上 npm 全局包装的是 <code>.cmd</code> shim，
-                    <strong>裸名通常起不来</strong>（CreateProcess 只自动补 <code>.exe</code>）——
-                    找不到时写全路径。
+                    ⚠️ Windows 上 npm 全局包装的是 <code>.cmd</code> shim，<strong>裸名起不来</strong>（只自动补 <code>.exe</code>）—— 找不到就写全路径。
                   </p>
                 </div>
                 <div className="field">
@@ -331,8 +337,7 @@ export default function DriverEditor({
                     />
                   </div>
                   <p className="hint">
-                    <code>{"{prompt}"}</code> 会被替换成任务文本。没有它 ⇒ 文本传不进去，
-                    表现为"CLI 正常退出、什么都没做"（后端会直接拒绝调度）。
+                    <code>{"{prompt}"}</code> 会被替换成任务文本。缺它 ⇒ 文本传不进去，表现为"正常退出、什么都没做"。
                   </p>
                 </div>
                 <div className="field">
@@ -399,11 +404,8 @@ export default function DriverEditor({
                     />
                   </div>
                   <p className="hint">
-                    留空或填 0 = 用默认的 <strong>{DEFAULT_TIMEOUT_MS / 1000} 秒</strong>
-                    （那个默认值是照"一次 HTTP 调用"定的）。CLI Agent 跑真实任务动辄几分钟到几十分钟
-                    —— 拿默认值卡它，结果是每个任务都在 3 分钟处被判超时。
-                    <br />⚠️ <strong>没有"不超时"这个选项</strong>：没有回收点的执行器一旦卡死，
-                    槽位会被永久占住。
+                    留空或 0 = 默认 <strong>{DEFAULT_TIMEOUT_MS / 1000} 秒</strong>（照"一次 HTTP 调用"定的，卡 CLI Agent 会每单都误超时）。
+                    <br />⚠️ <strong>没有"不超时"</strong>：卡死的执行器会永久占住槽位。
                   </p>
                 </div>
 
@@ -459,6 +461,14 @@ export default function DriverEditor({
                           </option>
                         ))}
                       </select>
+                      {COMPLETION_UNAVAILABLE[d.completion.kind] && (
+                        <span className="desk-opt off">
+                          不可用
+                          <span className="desk-opt-reason bad">
+                            {COMPLETION_UNAVAILABLE[d.completion.kind]}
+                          </span>
+                        </span>
+                      )}
                       {d.completion.kind === "log_pattern" && (
                         <input
                           value={d.completion.pattern}
@@ -474,10 +484,7 @@ export default function DriverEditor({
                       )}
                     </div>
                     <p className="hint">
-                      <strong>进程退出码只证明「进程结束了」，不证明「事情做成了」</strong> ——
-                      所以它单独出现时可信度只有「未校验」，界面与播报都会这样标。
-                      选<strong>日志权威串</strong>并填对（如 codex 的{" "}
-                      <code>turn.completed</code>）才是高置信度。
+                      <strong>退出码只证明"进程结束了"，不证明"事做成了"</strong> ⇒ 单独用只有「未校验」；填对日志权威串（如 codex 的 <code>turn.completed</code>）才是高置信度。
                     </p>
                   </div>
                 )}
@@ -497,8 +504,7 @@ export default function DriverEditor({
                     />
                   </div>
                   <p className="hint">
-                    填了就升级为<strong>已校验</strong>：跑测试 / 查文件 / 看产物，
-                    由外部证据决定完成，而不是上游自己的说法。
+                    填了就升级为<strong>已校验</strong>：由外部证据（跑测试 / 查文件）决定完成，而不是上游自己说法。
                   </p>
                 </div>
 
@@ -522,9 +528,7 @@ export default function DriverEditor({
                       </div>
                       {!declaresHome(d.env) && (
                         <p className="hint bad">
-                          ⚠️ 没显式给 <code>HOME</code> / <code>USERPROFILE</code>：
-                          本机 <code>~</code> 可能被其他软件（如 Cadence）改写，
-                          CLI 会去错误的位置找自己的配置，表现为<strong>鉴权莫名失败</strong>。
+                          ⚠️ 没给 <code>HOME</code> / <code>USERPROFILE</code>：本机 <code>~</code> 可能被其他软件（如 Cadence）改写 ⇒ CLI 找错配置位置，表现为<strong>鉴权莫名失败</strong>。
                         </p>
                       )}
                     </div>
@@ -540,11 +544,8 @@ export default function DriverEditor({
                         />
                       </div>
                       <p className="hint">
-                        任务跑完后，系统在<strong>工作目录</strong>里按
-                        「文件改动时间 ≥ 任务开始时刻」找出产物；这一项是在那批文件里
-                        再按名字筛一层。<strong>相对工作目录</strong>匹配：
-                        <code>*.md</code> 只命中根下，<code>**/*.md</code> 才跨目录。
-                        没填工作目录就<strong>不会扫盘</strong>。
+                        先按「mtime ≥ 任务开始」扫<strong>工作目录</strong>，这一项在那批文件里再按名字筛一层。
+                        <strong>相对工作目录</strong>匹配：<code>*.md</code> 只命中根下，<code>**/*.md</code> 才跨目录。没填工作目录就<strong>不会扫盘</strong>。
                       </p>
                     </div>
 
@@ -558,14 +559,12 @@ export default function DriverEditor({
                         />
                         <span className="desk-hint-inline">
                           {d.artifact_open
-                            ? "开：任务成功且扫到产物时，1 个就直接打开它，多个就打开所在文件夹并选中最新的。"
-                            : "关：只在任务历史里列出产物路径，不弹任何窗口。"}
+                            ? "开：成功且扫到产物就打开（多个则打开所在文件夹）。"
+                            : "关：只在任务历史里列出路径，不弹窗口。"}
                         </span>
                       </div>
                       <p className="hint">
-                        它会<strong>抢走你的焦点</strong>，所以只在
-                        <strong>任务成功</strong>且<strong>确实扫到文件</strong>时才动作；
-                        失败 / 超时 / 取消的任务一律不打开（那时目录里留下的是半成品）。
+                        它会<strong>抢焦点</strong> ⇒ 只在任务成功且确实扫到文件时动作；失败 / 超时 / 取消一律不打开。
                       </p>
                     </div>
 
@@ -632,8 +631,7 @@ export default function DriverEditor({
                         </>
                       )}
                       <p className="hint">
-                        三个格子回答一件事：<strong>会话 id 在哪一行输出里</strong>、
-                        <strong>那一行的哪个键</strong>、<strong>怎么把它带回去</strong>。
+                        三个格子 = 会话 id 在哪一行、哪一键、怎么带回去。
                       </p>
                     </div>
                   </>
@@ -653,9 +651,7 @@ export default function DriverEditor({
       <div className="driver-group">
         <div className="driver-group-head">
           <h4>直连模型（API）</h4>
-          <span className="hint">
-            一次 HTTP 往返：<strong>端点 + 模型 + Key</strong> 填齐就能用，不占本机资源。
-          </span>
+          <span className="hint">一次 HTTP 往返：<strong>端点 + 模型 + Key</strong> 填齐即可用，不占本机资源。</span>
           <button className="btn-ghost" onClick={() => onAdd("api")}>
             + 添加模型
           </button>
@@ -672,10 +668,7 @@ export default function DriverEditor({
       <div className="driver-group">
         <div className="driver-group-head">
           <h4>CLI 执行器</h4>
-          <span className="hint">
-            本地 Agent 进程：<strong>能改你的磁盘</strong>，所以还要配「完成判定」——
-            否则"退出码 0"会被当成"做完了"。
-          </span>
+          <span className="hint">本地 Agent 进程，<strong>能改你的磁盘</strong> ⇒ 必须配「完成判定」，否则"退出码 0"会被当成"做完了"。</span>
           <button className="btn-ghost" onClick={() => onAdd("cli")}>
             + 添加 CLI 执行器
           </button>

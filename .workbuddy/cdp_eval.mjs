@@ -58,6 +58,9 @@ function pick(list, filter) {
   const exact = pages.filter((t) => base(t.url) === filter);
   if (exact.length) return exact[0];
 
+  const exactUrl = pages.filter((t) => (t.url || "") === filter);
+  if (exactUrl.length) return exactUrl[0];
+
   const hit = pages.filter((t) => (t.url || "").includes(filter));
   if (!hit.length) {
     throw new Error(

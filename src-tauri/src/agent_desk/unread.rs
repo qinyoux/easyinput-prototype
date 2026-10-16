@@ -215,6 +215,46 @@ impl UnreadLedger {
     }
 
     // -----------------------------------------------------------------------
+    // 丢弃未读（明确放弃收听）
+    // -----------------------------------------------------------------------
+
+    /// 丢弃某槽的全部未读，返回被丢弃的条数。
+    ///
+    /// # 与 [`UnreadLedger::consume`] 的区别是**故意**的，不是省略
+    ///
+    /// `consume` 表示"用户听完了" —— 它必须精确匹配一个租约，且一次只减一条。
+    /// `discard` 表示"用户**放弃**收听这些内容" —— 它是唯一能让未读**凭空减少**的
+    /// 入口，因此必须是一个**显式动作**，由用户主动发起，不允许任何"顺手清一下"。
+    ///
+    /// 不做任何播放意义的校验：没东西可播也能调（那就是清 0 条）。若该槽正持有租约
+    /// （正在播），租约一并作废 —— 内容已被放弃，那个正在进行的播放不该再有消费资格。
+    ///
+    /// `generation` **不回退**：它是历史计数，不是显示值。
+    pub fn discard(&mut self, slot: usize) -> Result<u32, LeaseError> {
+        self.check_slot(slot)?;
+        let dropped = self.slots[slot].pending;
+        self.slots[slot].pending = 0;
+        if self.active.map(|l| l.slot == slot).unwrap_or(false) {
+            self.active = None;
+        }
+        Ok(dropped)
+    }
+
+    /// 丢弃全部槽位的未读，返回被丢弃的条数；同时释放活跃租约（喇叭通道随之空闲）。
+    ///
+    /// ⚠️ 这是**唯一**能让未读凭空归零的调用。任何"因为别处状态变了所以顺手清一下"
+    /// 的想法都必须挡在门外：`灯亮 = 有结果你还没听` 这条承诺一旦被自动流程破坏，
+    /// 用户就再也无法从灯上读出任何信息了。
+    pub fn discard_all(&mut self) -> u32 {
+        let dropped = self.total_pending();
+        for s in &mut self.slots {
+            s.pending = 0;
+        }
+        self.active = None;
+        dropped
+    }
+
+    // -----------------------------------------------------------------------
     // 播放租约
     // -----------------------------------------------------------------------
 
@@ -583,6 +623,82 @@ mod tests {
         );
         // 槽 0 的租约没有被影响。
         assert_eq!(l.active_lease().map(|x| x.slot), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // 丢弃未读（显式放弃收听）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discard_clears_pending_but_keeps_generation() {
+        let mut l = led();
+        l.push_result(0).unwrap();
+        l.push_result(0).unwrap();
+
+        assert_eq!(l.discard(0).unwrap(), 2);
+        assert_eq!(l.pending(0).unwrap(), 0);
+        // 代际是历史计数，不因丢弃而回退（否则"第几代"这个诊断量会说谎）。
+        assert_eq!(l.snapshot().slots[0].generation, 2);
+        // 清完就没得播了，且这个状态被明确说出来。
+        assert_eq!(
+            l.grant(0, 1_000).unwrap_err(),
+            LeaseError::NothingToPlay { slot: 0 }
+        );
+    }
+
+    #[test]
+    fn discard_only_touches_the_named_slot() {
+        let mut l = led();
+        l.push_result(0).unwrap();
+        l.push_result(1).unwrap();
+
+        assert_eq!(l.discard(0).unwrap(), 1);
+        assert_eq!(l.pending(0).unwrap(), 0);
+        assert_eq!(l.pending(1).unwrap(), 1, "别的槽的未读不该被牵连");
+    }
+
+    #[test]
+    fn discard_revokes_the_active_lease_of_that_slot() {
+        let mut l = led();
+        l.push_result(1).unwrap();
+        let lease = l.grant(1, 1_000).unwrap();
+        assert!(l.is_playing(1));
+
+        l.discard(1).unwrap();
+
+        // 内容已被放弃 ⇒ 那个正在进行的播放不再有消费资格。
+        assert_eq!(l.active_lease(), None);
+        // 它的迟到回执被拒，且**不会把未读清成负数**。
+        assert!(matches!(
+            l.consume(lease, 2_000),
+            Err(LeaseError::StaleLease { .. })
+        ));
+        assert_eq!(l.pending(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn discard_all_clears_every_slot_and_frees_the_channel() {
+        let mut l = led();
+        for s in 0..4 {
+            l.push_result(s).unwrap();
+        }
+        l.push_result(2).unwrap();
+        let _lease = l.grant(3, 1_000).unwrap();
+
+        assert_eq!(l.discard_all(), 5);
+        assert_eq!(l.total_pending(), 0);
+        assert_eq!(l.active_lease(), None, "通道必须一并腾出来");
+        // 腾出来的通道立刻可用（若租约没清，这里会是 ChannelBusy）。
+        l.push_result(0).unwrap();
+        assert!(l.grant(0, 2_000).is_ok());
+    }
+
+    #[test]
+    fn discard_on_empty_slot_is_a_noop_not_an_error() {
+        let l0 = led();
+        let mut l = l0.clone_for_test();
+        assert_eq!(l.discard(2).unwrap(), 0);
+        assert_eq!(l.discard_all(), 0);
     }
 
     // -----------------------------------------------------------------------

@@ -1,8 +1,8 @@
 {
   "id": "studio",
   "name": "内容台",
-  "version": "0.4.0",
-  "description": "easyop 的内容生产工作台：选题台账 → AI 生成（标题/正文/去AI味）→ 导出成品包。随 easyop 发布的内置插件。",
+  "version": "0.4.3",
+  "description": "easyop 的内容生产工作台：选题台账 → AI 生成（标题/正文/内容优化）→ 导出稿件 / 平台发布（单个排版 HTML）。随 easyop 发布的内置插件。",
   "main": "index.js",
   "activationEvents": [
     "onPage:studio.board"
@@ -46,8 +46,8 @@
       },
       {
         "id": "studio.gen.humanize",
-        "title": "去 AI 味",
-        "keywords": ["去ai味", "humanize", "润色", "runse", "rs"]
+        "title": "内容优化",
+        "keywords": ["内容优化", "去ai味", "humanize", "润色", "runse", "rs"]
       },
       {
         "id": "studio.gen.intel",
@@ -56,13 +56,23 @@
       },
       {
         "id": "studio.gen.all",
-        "title": "一条龙生成",
-        "keywords": ["一条龙", "全自动", "yitiaolong", "yt"]
+        "title": "一键执行",
+        "keywords": ["一键执行", "全自动", "yijianzhixing", "yjzx"]
       },
       {
         "id": "studio.export",
-        "title": "导出成品包",
-        "keywords": ["导出", "export", "daochu", "dc", "排版", "公众号", "wechat"]
+        "title": "导出稿件",
+        "keywords": ["导出", "export", "daochu", "dc"]
+      },
+      {
+        "id": "studio.publish.html",
+        "title": "平台发布（生成公众号 HTML）",
+        "keywords": ["平台发布", "公众号", "排版", "html", "wechat", "fabu", "fb"]
+      },
+      {
+        "id": "studio.open.dir",
+        "title": "打开产物目录",
+        "keywords": ["打开目录", "目录", "open", "mulu", "ml"]
       },
       {
         "id": "studio.doctor",
@@ -73,6 +83,11 @@
         "id": "studio.quick_action",
         "title": "快捷动作（旋钮确认）",
         "keywords": ["快捷", "旋钮", "quick", "kuaijie", "kj"]
+      },
+      {
+        "id": "studio.set_focus",
+        "title": "设置旋钮焦点",
+        "keywords": ["焦点", "focus", "jiaodian", "jd"]
       }
     ],
     "tools": [],

@@ -35,11 +35,28 @@
 //! | **终态 / 起点** | 已完成、失败、失联、任务已开始 | **事件驱动**：`complete_task` / `dispatch_into` 处直接发 | 终态是**瞬时事件**，"刚完成"这个事实在状态快照里根本看不到（快照只描述"现在是什么样"） |
 //! | **进度档位** | 正在推进、已运行 1 分钟、已运行 5 分钟 | **状态驱动**：扫 `RuntimeSnapshot` 推 `DeskPulse` | 进度是**持续状态的函数**，没有独立的"事件"可言 |
 //!
-//! 两条路都收敛到同一个 [`NoticeGate::should_emit`]，由它统一执行去抖与跃迁判定。
+//! 两条路都收敛到同一个 [`NoticeGate::should_emit_for`]，由它统一执行去抖与跃迁判定
+//! （事件类按 `(槽位, kind)` 记账，进度类走全局账本 —— 理由见 [`NoticeGate`] 的文档）。
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::state::RuntimeSnapshot;
+
+/// 同一 `(槽位, kind)` 的事件类通知，间隔多短才算"重复送达"。
+///
+/// # 为什么事件类也有一个 guard
+///
+/// 防的是**同一件事被说两遍**：派发那一刻「任务已开始」（事件源）与
+/// 「正在推进」（状态源）会同拍触发，旧版只靠"后到抢占"兜底，
+/// 结果是两条都只播了个开头。3 秒足够覆盖这种同拍双送达，
+/// 又不足以吞掉真实场景 —— 而即使真吞了，未读灯与历史仍然如实记录，丢的只是一句话。
+///
+/// ⚠️ 它**不是**"同类不重复播"：旧版用全局 `last_kind` 做后者，
+/// 把 S2 的完成播报整个吞掉（v0.41.15 实锤）。两件事的代价完全不同：
+/// 重复播一句话是噪音，吞掉一条终态是失信。
+pub const EVENT_REPEAT_GUARD_MS: u64 = 3_000;
 
 /// 同类 Notice 最小间隔的**出厂默认**（毫秒）。
 ///
@@ -71,7 +88,10 @@ pub const DEFAULT_PROGRESS_MARKS_MS: [u64; 3] = [60_000, 300_000, 900_000];
 ///
 /// `code()` 即枚举序号，直接用作缓存文件名 —— 因此**顺序是契约的一部分，
 /// 只能在末尾追加，不能重排**（重排会让旧缓存张冠李戴地读到另一句音频）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ⚠️ `Hash` 不是摆设：`NoticeGate` 的事件类账本以 `(槽位, NoticeKind)` 为
+/// HashMap 的键（见 [`NoticeGate`]）。删掉它编译不过，那是故意的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeKind {
     /// 任务已进入队列（`dispatch_into` 成功）。
@@ -100,11 +120,18 @@ pub enum NoticeKind {
     /// 文件名的一部分，插在中间会把磁盘上已有的缓存**整体错位**（读到另一句音频，
     /// 而且不报错）。顺序是契约，只能追加。
     Running15Min = 10,
+    /// 合并提醒：排队期间被丢弃的终态播报，凑成一句短的。
+    ///
+    /// 它是** meta 通知**——不描述任何单个任务的终态，只说"还有几条没念"。
+    /// 因此它**不是**终态（`is_terminal() = false`）：它不决定任何任务的结束，
+    /// 排队机制也刻意不把它自己排进队（否则"提醒还有提醒"会无穷尽）。
+    /// 同样**追加在末尾**（`code()` 契约，见 `Running15Min` 的说明）。
+    ResultsWaiting = 11,
 }
 
 impl NoticeKind {
     /// 全部取值，**按 `code()` 顺序**。预合成层靠它遍历整个闭集。
-    pub const ALL: [NoticeKind; 11] = [
+    pub const ALL: [NoticeKind; 12] = [
         NoticeKind::TaskStarted,             // 0
         NoticeKind::Progressing,             // 1
         NoticeKind::Running1Min,             // 2
@@ -116,6 +143,7 @@ impl NoticeKind {
         NoticeKind::TimedOut,                // 8
         NoticeKind::LostContact,             // 9
         NoticeKind::Running15Min,            // 10 —— 追加，见变体上的注释
+        NoticeKind::ResultsWaiting,          // 11 —— 追加，见变体上的注释
     ];
 
     /// 进度档位对应的语料，**按档位从低到高**。
@@ -152,6 +180,7 @@ impl NoticeKind {
             NoticeKind::TimedOut => "timed_out",
             NoticeKind::LostContact => "lost_contact",
             NoticeKind::Running15Min => "running_15min",
+            NoticeKind::ResultsWaiting => "results_waiting",
         }
     }
 
@@ -172,6 +201,9 @@ impl NoticeKind {
             NoticeKind::TimedOut => "已超时",
             NoticeKind::LostContact => "任务失联",
             NoticeKind::Running15Min => "已运行十五分钟",
+            // 合并提醒的**固定语料**不带条数（静态函数给不出动态值）；
+            // 实际出声用动态正文（"还有 N 条…"），这条只是离线兜底与字幕。
+            NoticeKind::ResultsWaiting => "还有任务结果未播报",
         }
     }
 
@@ -406,31 +438,43 @@ impl NoticePolicy {
             | NoticeKind::NeedsConfirmation
             | NoticeKind::TimedOut
             | NoticeKind::LostContact => self.on_fail,
+            // 合并提醒归**完成组**：它说的是"还有几条完成的结果没念"。
+            NoticeKind::ResultsWaiting => self.on_complete,
         }
     }
 }
 
 /// 播报去抖器。
 ///
-/// # 三条规则，刻意不同
+/// # 两套账本，刻意分开
 ///
-/// 0. **分类开关**：[`NoticePolicy::allows`]。关掉的组**不记账**（与"被间隔拦下"同理）——
-///    用户后来把开关打开时，当前状态该说的那句话还应该说得出来。
-/// 1. **跃迁才播**：与上一条相同的 `kind` 一律沉默。这条同时承担了"轮询不会刷屏"
-///    与"档位恰好各播一次"两个职责 —— 因为它看的是 `kind`，而档位跃迁本身就是
-///    `kind` 变化。
-/// 2. **最小间隔只管进度类**：见 [`NoticeKind::is_debounceable`]。
+/// | 类别 | 账本 | 规则 |
+/// |---|---|---|
+/// | **进度类**（`is_debounceable`） | 全局一本（`last_kind` + `last_spoken_at_ms`） | 跃迁才播 + 最小间隔 |
+/// | **事件类**（起点 / 终态） | **按 `(slot, kind)` 一本** | 3 秒内重复送达才沉默 |
 ///
-/// # 被拦下时**不**更新 `last_kind`（这是刻意的）
+/// # 为什么事件类必须按槽记账（v0.41.15 实锤的 BUG）
 ///
-/// `last_kind` 只在**真的出声**时才推进。这样"因间隔被拦下的进度跃迁"会在下一次
-/// 轮询时重新尝试 —— 进度通知迟到几秒无所谓，但**状态记录要诚实**：一旦把被拦的
-/// 状态记成"已播"，那条跃迁就永远不会再有机会出声了。
+/// 旧版两段共用全局 `last_kind`："S1 完成 ⇒ last_kind = Completed"，
+/// 于是 **S2 完成被判定为"与上一条相同"而吞掉** —— 日志里连播报行都没有，
+/// 用户只看到未读 +1，没有任何语音。四槽并行时，"哪一槽发生了什么"
+/// **必须能分别说出来**：S1 完成与 S2 完成是两件事，不是一件事说了两遍。
 ///
-/// 反过来，如果同一条 `kind` 被重复送达（正常轮询），第一条之后全部沉默，
-/// 且不刷新 `last_spoken_at_ms` —— 否则持续运行的轮询会把时间戳一直往前推，
-/// 让下一条**真正的**通知永远等不到间隔。这正是"连续 10 次轮询只产生 ≤1 次播报"
-/// 能成立的原因。
+/// 3 秒重复 guard 保留的是它真正该防的东西：**同一件事被同拍双重送达**
+/// （派发那一刻「任务已开始」与「正在推进」两个通知源同时触发，见 `dispatch_task`）。
+/// 同一槽同一 kind 在 3 秒后再出现，允许再播 —— 那更可能是两条真实任务。
+///
+/// # 进度类为什么保持全局
+///
+/// 进度本身就是**全局量**：`DeskPulse` 取"最老的那个任务"驱动档位，
+/// 没有"这一槽的进度"可言。全局跃迁同时承担"轮询不刷屏"与"档位恰好各播一次"。
+///
+/// # 被拦下时**不**更新账本（两类都是刻意的）
+///
+/// - 进度类被间隔拦下 ⇒ 不更新 `last_kind`：下次轮询还会再试（进度迟到几秒无所谓，
+///   但状态记录要诚实）。
+/// - 事件类被 3 秒 guard 拦下 ⇒ 不刷新时间戳：否则持续重复送达会把守卫一直续期，
+///   让真正的新事件永远等不到头。
 #[derive(Clone, Debug, Default)]
 pub struct NoticeGate {
     /// 生效策略。默认 = 出厂默认（见 [`NoticePolicy::default`]）。
@@ -439,6 +483,10 @@ pub struct NoticeGate {
     last_kind: Option<NoticeKind>,
     /// 上一条真的出声的时刻（unix 毫秒）。0 = 从未出声（不是"1970 年"）。
     last_spoken_at_ms: u64,
+    /// 事件类的去重账本：`(槽位, kind) → 上次出声时刻`。
+    ///
+    /// `None` 槽位 = 无主通知（外部会话监工、合并提醒）。
+    last_event: HashMap<(Option<usize>, NoticeKind), u64>,
 }
 
 impl NoticeGate {
@@ -460,15 +508,51 @@ impl NoticeGate {
         &self.policy
     }
 
-    /// 判定这条通知现在该不该出声。
+    /// 判定这条通知现在该不该出声。**无槽通知**（监工 / 合并提醒）走这支。
+    ///
+    /// 等价于 `should_emit_for(kind, None, now_ms)`，保留它是为了让不关心槽位的
+    /// 调用方（探针、试听）不必每次传一个没有信息的 `None`。
+    pub fn should_emit(&mut self, kind: NoticeKind, now_ms: u64) -> bool {
+        self.should_emit_for(kind, None, now_ms)
+    }
+
+    /// 判定这条通知现在该不该出声，**按槽位分开记账**。
     ///
     /// 返回 `true` 即表示"已经记账，调用方应当把它播出去"。
-    pub fn should_emit(&mut self, kind: NoticeKind, now_ms: u64) -> bool {
-        // 规则 0：分类开关（含总开关）。
+    ///
+    /// `slot` 只对**事件类**（起点 / 终态）有意义：进度类是全局量（见结构体文档），
+    /// 传什么都会被忽略。
+    pub fn should_emit_for(&mut self, kind: NoticeKind, slot: Option<usize>, now_ms: u64) -> bool {
+        // 规则 0：分类开关（含总开关）。关掉的组**不记账**（与"被间隔拦下"同理）——
+        // 用户后来把开关打开时，当前状态该说的那句话还应该说得出来。
         if !self.policy.allows(kind) {
             return false;
         }
 
+        if kind.is_debounceable() {
+            return self.emit_debounceable(kind, now_ms);
+        }
+
+        // ---- 事件类：按 (slot, kind) 记账 ----
+        //
+        // 3 秒 guard 只挡"同一件事被同拍双重送达"（派发那一刻两个通知源同时触发）。
+        // 它**不**承担"同类不重复播"——那是旧版全局账本做的事，也正是它吞掉了
+        // S2 的完成播报。同一槽同一 kind 隔 3 秒再来，允许再播。
+        let key = (slot, kind);
+        if let Some(&at) = self.last_event.get(&key) {
+            if now_ms.saturating_sub(at) < EVENT_REPEAT_GUARD_MS {
+                return false;
+            }
+        }
+        self.last_event.insert(key, now_ms);
+        // 全局账本照记：进度类的最小间隔要参考"上一条真的出声"。
+        self.last_kind = Some(kind);
+        self.last_spoken_at_ms = now_ms;
+        true
+    }
+
+    /// 进度类：全局跃迁 + 最小间隔（旧 `should_emit` 的主体，原样搬来）。
+    fn emit_debounceable(&mut self, kind: NoticeKind, now_ms: u64) -> bool {
         // 规则 1：跃迁才播。
         if self.last_kind == Some(kind) {
             return false;
@@ -476,7 +560,7 @@ impl NoticeGate {
 
         // 规则 2：可去抖的那几条受最小间隔约束。间隔为 0 时 `elapsed < 0` 恒假 ⇒
         // 天然等于"不限"，不需要给 0 写特判分支。
-        if kind.is_debounceable() && self.last_spoken_at_ms != 0 {
+        if self.last_spoken_at_ms != 0 {
             let elapsed = now_ms.saturating_sub(self.last_spoken_at_ms);
             if elapsed < self.policy.min_interval_ms {
                 // 拦下这条，且**不更新 last_kind** ⇒ 下次轮询还会再试。
@@ -501,6 +585,7 @@ impl NoticeGate {
     pub fn reset(&mut self) {
         self.last_kind = None;
         self.last_spoken_at_ms = 0;
+        self.last_event.clear();
     }
 }
 
@@ -573,18 +658,20 @@ mod tests {
     #[test]
     fn terminal_and_progress_partition_the_closure() {
         for kind in NoticeKind::ALL {
-            let progress = matches!(
+            let non_terminal = matches!(
                 kind,
                 NoticeKind::TaskStarted
                     | NoticeKind::Progressing
                     | NoticeKind::Running1Min
                     | NoticeKind::Running5Min
                     | NoticeKind::Running15Min
+                    // 合并提醒是 meta 通知：不决定任何任务的结束，因此不是终态。
+                    | NoticeKind::ResultsWaiting
             );
             assert_eq!(
                 kind.is_terminal(),
-                !progress,
-                "{kind:?} 的终态分类与进度分类必须互补"
+                !non_terminal,
+                "{kind:?} 的终态分类与非终态分类必须互补"
             );
         }
     }
@@ -901,6 +988,88 @@ mod tests {
         assert_eq!(gate.last_kind(), Some(NoticeKind::Completed));
     }
 
+    // ---------- 事件类按 (槽位, kind) 记账（修「S2 完成被吞」的回归测试） ----------
+
+    #[test]
+    fn two_slots_completing_both_get_to_speak() {
+        // v0.41.15 实锤 BUG：S1 完成 ⇒ 全局 last_kind = Completed ⇒
+        // S2 完成被判"与上一条相同"吞掉，日志里连播报行都没有，用户只看到未读 +1。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Completed, Some(0), 1_000));
+        assert!(
+            gate.should_emit_for(NoticeKind::Completed, Some(1), 1_000),
+            "S1 说完不该堵住 S2 的嘴 —— 四槽并行时每槽的终态都必须能分别说出来"
+        );
+    }
+
+    #[test]
+    fn the_same_slot_repeating_within_the_guard_is_silent() {
+        // guard 防的是"同一件事被同拍双重送达"（派发那一刻两个通知源同时触发）。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::TaskStarted, Some(0), 1_000));
+        assert!(!gate.should_emit_for(NoticeKind::TaskStarted, Some(0), 1_500));
+        assert!(!gate.should_emit_for(NoticeKind::TaskStarted, Some(0), 1_000 + EVENT_REPEAT_GUARD_MS - 1));
+    }
+
+    #[test]
+    fn the_same_slot_speaks_again_after_the_guard() {
+        // guard 到期后允许再播：同一槽紧接着完成的第二条任务是真实事件，
+        // 未读与历史都记着，没道理连一句话都不给。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Completed, Some(0), 1_000));
+        assert!(gate.should_emit_for(
+            NoticeKind::Completed,
+            Some(0),
+            1_000 + EVENT_REPEAT_GUARD_MS
+        ));
+    }
+
+    #[test]
+    fn slotless_events_use_the_none_key() {
+        // 无主通知（外部会话监工）之间也按同一个 key 去重。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Completed, None, 1_000));
+        assert!(!gate.should_emit_for(NoticeKind::Completed, None, 1_500));
+        assert!(
+            gate.should_emit_for(NoticeKind::Completed, Some(0), 1_500),
+            "槽位通知与无主通知互不遮挡"
+        );
+    }
+
+    #[test]
+    fn progress_stays_on_the_global_ledger_regardless_of_slot() {
+        // 进度是全局量（由最老的任务驱动），没有"这一槽的进度"。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Progressing, Some(0), 1_000));
+        assert!(
+            !gate.should_emit_for(NoticeKind::Progressing, Some(1), 2_000),
+            "另一槽的进度不该让全局再播一次「正在推进」"
+        );
+    }
+
+    #[test]
+    fn reset_also_clears_the_per_slot_ledger() {
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Completed, Some(0), 1_000));
+        assert!(!gate.should_emit_for(NoticeKind::Completed, Some(0), 1_500));
+        gate.reset();
+        assert!(gate.should_emit_for(NoticeKind::Completed, Some(0), 1_600));
+    }
+
+    #[test]
+    fn a_terminal_still_updates_the_global_ledger_for_progress_spacing() {
+        // 事件类出声后，进度类仍要受最小间隔约束 ——
+        // 否则"刚说完完成"立刻又来一句"正在推进"（同一槽的下一个任务）。
+        let mut gate = NoticeGate::new();
+        assert!(gate.should_emit_for(NoticeKind::Completed, Some(0), 1_000));
+        assert!(!gate.should_emit_for(NoticeKind::Progressing, Some(0), 1_500));
+        assert!(gate.should_emit_for(
+            NoticeKind::Progressing,
+            Some(0),
+            1_000 + DEFAULT_MIN_INTERVAL_MS
+        ));
+    }
+
     #[test]
     fn debounceable_set_is_exactly_the_progress_kinds() {
         // "必须送达"就是"不可去抖"—— 两者是同一件事的两面，不是两套规则。
@@ -912,6 +1081,7 @@ mod tests {
                     | NoticeKind::Running1Min
                     | NoticeKind::Running5Min
                     | NoticeKind::Running15Min
+                    | NoticeKind::ResultsWaiting
             ));
         }
         assert!(NoticeKind::Progressing.is_debounceable());

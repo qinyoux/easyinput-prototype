@@ -54,6 +54,12 @@ pub struct PlaybackControl {
     played_samples: Arc<AtomicUsize>,
     /// 总样本数（同上口径）。
     total_samples: usize,
+    /// **设备侧**精确播放时长（毫秒，已含重采样与声道展开）。
+    ///
+    /// 调用方等"播完"时必须用它，不许自己拿 `total_samples` 除采样率估 ——
+    /// 那次估算把毫秒当样本数，酿成过 v0.41.15 的"长播报被掐断"（见
+    /// [`keepalive_deadline`] 的回归测试）。
+    duration_ms: u64,
 }
 
 impl PlaybackControl {
@@ -90,6 +96,11 @@ impl PlaybackControl {
     /// 总样本数（与 [`Self::played_samples`] 同口径）。
     pub fn total_samples(&self) -> usize {
         self.total_samples
+    }
+
+    /// **设备侧**精确播放时长（毫秒）。
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
     }
 
     /// 轮询等待播放结束，最多等 `timeout`。返回是否已结束。
@@ -152,12 +163,13 @@ pub fn play_pcm(pcm: Vec<i16>, sample_rate: u32) -> Result<PlaybackControl, Stri
     let played_samples = Arc::new(AtomicUsize::new(0));
 
     // 建流是同步的、且可能失败（没声卡 / 被独占）。用 channel 把结果——包括
-    // **设备侧的真实总样本数**——带回调用方。带上总数是为了让
-    // `played_samples / total_samples` 两个口径一致，否则进度读数会撒谎。
+    // **设备侧的真实总样本数与时长**——带回调用方。带上这两个数是为了让
+    // `played_samples / total_samples` 口径一致、让调用方的等待超时有精确值，
+    // 否则进度读数会撒谎、等待时长会拍脑袋。
     //
     // 「失败不静默」在这条链路上尤其重要：静默失败会让"未读怎么没被消费"
     // 变成一个查不出原因的谜。
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<usize, String>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<PlaybackReady, String>>();
 
     {
         let stop = stop.clone();
@@ -166,24 +178,24 @@ pub fn play_pcm(pcm: Vec<i16>, sample_rate: u32) -> Result<PlaybackControl, Stri
         std::thread::Builder::new()
             .name("easyop-desk-audio".into())
             .spawn(move || {
-                let stream = match build_stream(
+                let (stream, ready) = match build_stream(
                     &pcm,
                     sample_rate,
                     stop.clone(),
                     finished.clone(),
                     played_samples.clone(),
                 ) {
-                    Ok((stream, total_samples)) => {
-                        if let Err(e) = stream.play() {
+                    Ok(pair) => {
+                        if let Err(e) = pair.0.play() {
                             let _ = ready_tx.send(Err(format!("启动播放失败：{e}")));
                             return;
                         }
-                        // 只要开始播了，就必须让调用方知道总数。
-                        if ready_tx.send(Ok(total_samples)).is_err() {
+                        // 只要开始播了，就必须让调用方知道设备侧的真实读数。
+                        if ready_tx.send(Ok(pair.1)).is_err() {
                             // 调用方已经走了（超时返回），没必要继续保活。
                             return;
                         }
-                        stream
+                        pair
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -192,11 +204,13 @@ pub fn play_pcm(pcm: Vec<i16>, sample_rate: u32) -> Result<PlaybackControl, Stri
                 };
 
                 // ---- 保活直到播完 / 被中断 / 触到硬上限 ----
-                let audio_len = Duration::from_micros(
-                    (total_from_pcm(&pcm, sample_rate) as u64) * 1_000_000
-                        / sample_rate.max(1) as u64,
-                );
-                let deadline = Instant::now() + audio_len + PLAYBACK_HARD_LIMIT_MARGIN;
+                //
+                // ⚠️ 时长必须来自**设备侧**的 `ready.duration_ms`（已含重采样与
+                // 声道展开），不许拿源 PCM 现算 —— 那次现算在 v0.41.15 把毫秒
+                // 当样本数，48kHz 下音频时长被缩成 1/48，超过 10 秒的播报全部
+                // 在 ~10.2 秒处被这个截止时间 drop 流掐断（回归测试见
+                // `keepalive_deadline_covers_the_whole_audio`）。
+                let deadline = keepalive_deadline(ready.duration_ms);
                 while !finished.load(Ordering::Relaxed) && Instant::now() < deadline {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -208,15 +222,33 @@ pub fn play_pcm(pcm: Vec<i16>, sample_rate: u32) -> Result<PlaybackControl, Stri
     }
 
     match ready_rx.recv_timeout(STREAM_READY_TIMEOUT) {
-        Ok(Ok(total_samples)) => Ok(PlaybackControl {
+        Ok(Ok(ready)) => Ok(PlaybackControl {
             stop,
             finished,
             played_samples,
-            total_samples,
+            total_samples: ready.total_samples,
+            duration_ms: ready.duration_ms,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("音频设备在 5 秒内没有就绪（可能被其它程序独占）".to_string()),
     }
+}
+
+/// 建流成功时回传给调用方的**设备侧**读数。
+#[derive(Clone, Copy, Debug)]
+struct PlaybackReady {
+    total_samples: usize,
+    duration_ms: u64,
+}
+
+/// 保活截止时刻 = 音频时长 + 硬上限余量。
+///
+/// ⚠️ **单位必须在这里被钉死**：进来的是毫秒，出去的也必须是毫秒。
+/// v0.41.15 曾把 [`total_from_pcm`] 返回的毫秒当样本数，套
+/// `micros = ms * 1_000_000 / rate` ⇒ 48kHz 下时长缩到 1/48，
+/// 35 秒的音频只保活 10.7 秒，播到 10.96 秒就被 drop 流掐断。
+fn keepalive_deadline(duration_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(duration_ms) + PLAYBACK_HARD_LIMIT_MARGIN
 }
 
 /// 原始单声道 PCM 的时长（毫秒）。
@@ -227,14 +259,14 @@ fn total_from_pcm(pcm: &[i16], sample_rate: u32) -> u64 {
     (pcm.len() as u64) * 1000 / sample_rate as u64
 }
 
-/// 在当前线程建好输出流（尚未 `play()`），返回流与**设备侧总样本数**。
+/// 在当前线程建好输出流（尚未 `play()`），返回流与**设备侧读数**。
 fn build_stream(
     pcm: &[i16],
     sample_rate: u32,
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     played_samples: Arc<AtomicUsize>,
-) -> Result<(cpal::Stream, usize), String> {
+) -> Result<(cpal::Stream, PlaybackReady), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -269,6 +301,11 @@ fn build_stream(
 
     let samples = Arc::new(prepare_samples(pcm, sample_rate, device_rate, channels));
     let total = samples.len();
+    // 设备侧时长：样本数已按目标声道展开，先还原成"帧"再除采样率。
+    // 用设备侧值而不是源 PCM 估算：重采样比例不是整数时两者有毫秒级差异，
+    // 而等待超时要的是**精确值**（超一分钟的长播报，误差按秒算就不能接受）。
+    let frames = total / channels.max(1);
+    let duration_ms = (frames as u64) * 1000 / device_rate.max(1) as u64;
     let err_fn = |e: cpal::StreamError| {
         crate::log_buffer::warn(format!("音频输出流出错：{e}"));
     };
@@ -336,7 +373,13 @@ fn build_stream(
     }
     .map_err(|e| format!("创建输出流失败：{e}"))?;
 
-    Ok((stream, total))
+    Ok((
+        stream,
+        PlaybackReady {
+            total_samples: total,
+            duration_ms,
+        },
+    ))
 }
 
 /// 填充一个输出缓冲：推进游标、写样本、越过末尾填静音、播完置 finished、被中断则静音。
@@ -556,6 +599,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(finished)),
             played_samples: Arc::new(AtomicUsize::new(10)),
             total_samples: 100,
+            duration_ms: 100,
         };
 
         assert!(make(false, true).completed_fully());
@@ -573,6 +617,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             played_samples: Arc::new(AtomicUsize::new(0)),
             total_samples: 100,
+            duration_ms: 100,
         };
         let control = make();
         assert!(!control.stop_requested());
@@ -588,6 +633,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(true)),
             played_samples: Arc::new(AtomicUsize::new(0)),
             total_samples: 0,
+            duration_ms: 0,
         };
         assert!(control.wait_finished(Duration::from_millis(50)));
     }
@@ -599,6 +645,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             played_samples: Arc::new(AtomicUsize::new(0)),
             total_samples: 100,
+            duration_ms: 100,
         };
         let started = Instant::now();
         assert!(!control.wait_finished(Duration::from_millis(30)));
@@ -606,6 +653,20 @@ mod tests {
             started.elapsed() >= Duration::from_millis(25),
             "应当真的等满超时，而不是立刻返回"
         );
+    }
+
+    #[test]
+    fn keepalive_deadline_covers_the_whole_audio() {
+        // 回归 v0.41.15：保活截止把毫秒当样本数，48kHz 下时长缩 1/48。
+        // 实测伤害：13.2s 的播报播到 10.5s 断（78%），35s 的播报播到 10.96s 断（31%）。
+        // 现在：35 秒音频的保活期必须 > 35 秒（外加 10 秒硬上限余量）。
+        let deadline = keepalive_deadline(35_000);
+        assert!(
+            deadline > Instant::now() + Duration::from_millis(35_000),
+            "保活期必须长于音频本身，否则长播报会被 drop 流掐断"
+        );
+        // 0 时长也不能触发"立即过期"那种反向错误（余量仍在）。
+        assert!(keepalive_deadline(0) > Instant::now());
     }
 
     #[test]

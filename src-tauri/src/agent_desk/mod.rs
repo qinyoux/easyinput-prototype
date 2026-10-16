@@ -61,7 +61,7 @@ use config::{Capability, DESK_CONFIG_FILE};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -189,20 +189,44 @@ pub struct DeskManager {
     /// 自己的播报抢喇叭。跑完后仍要静默几秒 —— CLI 子进程退出到它把最后一行
     /// 写进 rollout 之间有真实延迟，不收这一截就会补一句迟到的外部播报。
     last_desk_finish_ms: AtomicU64,
-    /// 终态播报的**排队队列**（喇叭被占用时不丢，等当前播放结束后补播）。
+    /// 通知播报的**排队队列**（喇叭被占用时不丢，等当前播放结束后补播）。
     ///
     /// v0.41.15 之前终态播报被占用即丢：S1 的长结论还在播，S2 的"任务已完成"
     /// 连日志行都没有就消失了 —— 用户只看到未读 +1，没有任何语音。
     /// 排队不打断任何人，只是把"该说的"留到能说的时候。
+    ///
+    /// 队列里**两类混存**，但由 `enqueue_notice` 的准入规则保证形态：
+    /// 终态类（不可丢，见 `DroppedNotice`）与最多一条进度类（可过期，
+    /// 见 `enqueue_notice` 的文档）。绝不会出现"进度类压在终态前面"。
     notice_queue: Mutex<VecDeque<QueuedNotice>>,
     /// 排水（补播队列）的单飞标志。两个播放线程同时排水会互相抢话。
     notice_draining: AtomicBool,
-    /// 排队期间因**溢出**被丢弃的最旧条数。队列排空后补一条合并短通知，
-    /// 让用户知道"还有几条没念"—— 丢掉可以，但不许静默地丢。
-    notice_dropped: AtomicUsize,
+    /// 排队期间因**溢出**被丢弃的**终态**条目明细。
+    ///
+    /// v0.42.0 这里是个 `AtomicUsize` 纯计数，合并提醒只能说"还有 N 条"——
+    /// 用户仍然不知道是哪几个槽的事，还得自己挨个点开看（v0.43.4 实测反馈）。
+    /// 记明细才能把合并提醒说成"还有 2 条任务结果未播报（S1 任务已完成、S3 任务失败）"。
+    /// 进度类被丢**不记在这里**：过期的进度信息没有告知价值（见 `enqueue_notice`）。
+    notice_dropped: Mutex<Vec<DroppedNotice>>,
+    /// 上次发出的喇叭/队列状态（内容比对用，见 [`emit_channel_state`]）。
+    last_channel_state: Mutex<Option<(Option<PlayingView>, Vec<NoticeQueueItemView>)>>,
 }
 
-/// 排队等补播的终态播报。
+/// `agent-desk-channel` 事件载荷：现在在播什么 + 后面还排着谁。
+///
+/// 单独一个事件（而不是塞进 `agent-desk-state`）是因为**触发时机不同**：
+/// `agent-desk-state` 由任务状态驱动（派发/进度/完成），而喇叭的占用与排队
+/// 由**播放动作**驱动 —— 一次播完、一次抢占、一次入队，都可能发生在任务状态
+/// 完全没变的时刻。等任务状态再变时才通知，队列等待期就是一片死寂。
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelState {
+    /// 正在播的内容（`None` = 空闲）。
+    pub playing: Option<PlayingView>,
+    /// 排队等补播的通知，队首在前。
+    pub notice_queue: Vec<NoticeQueueItemView>,
+}
+
+/// 排队等补播的通知。
 ///
 /// ⚠️ `text` 存的是**已定稿**的正文：排队期间绝不再跑一次 LLM 总结 ——
 /// 那既会让队首的等待无限拉长，也可能念出与字幕不同的版本。
@@ -214,11 +238,22 @@ struct QueuedNotice {
     text: Option<String>,
 }
 
-/// 终态播报排队上限。
+/// 排队期间因**溢出**被丢弃的终态条目（合并提醒要报"哪些槽"，见
+/// [`DeskManager::notice_dropped`]）。
+#[derive(Clone, Debug)]
+struct DroppedNotice {
+    kind: NoticeKind,
+    slot: Option<usize>,
+}
+
+/// 通知播报排队上限。
 ///
 /// 3 条的依据：四槽并行时极端情况是 4 条同时完成，留 3 条已覆盖"绝大多数
 /// 同时完成"；更多的让位给合并提醒（还有 N 条没念）—— 喇叭不是日志文件，
 /// 补播 10 分钟旧闻比丢几条更不人道。丢的是**最旧**的：用户刚听完了更新的状态。
+///
+/// 进度类（`is_debounceable`）**不占这些位**：它由 `enqueue_notice` 单独收敛到
+/// "最多一条、且只活在空闲队列里"，满了丢的是过期状态而不是终态承诺。
 const NOTICE_QUEUE_CAP: usize = 3;
 
 /// 槽位会话的落盘文件名（在 `agent_desk_out/` 下）。
@@ -274,6 +309,11 @@ struct PlayingState {
     /// 它不碰未读账本，这是 §2.6.1 的 Gate。
     lease: Option<Lease>,
     control: audio_out::PlaybackControl,
+    /// Notice 播报的种类（`None` = 正在播结果播报）。
+    ///
+    /// 只服务于快照展示（`DeskSnapshot::playing`）：前端要能回答"现在喇叭上
+    /// 在念什么"，没有这个字段就只能显示"正在播报"四个字，排队等待依然不可见。
+    kind: Option<NoticeKind>,
 }
 
 impl Default for DeskManager {
@@ -303,7 +343,8 @@ impl DeskManager {
             last_desk_finish_ms: AtomicU64::new(0),
             notice_queue: Mutex::new(VecDeque::new()),
             notice_draining: AtomicBool::new(false),
-            notice_dropped: AtomicUsize::new(0),
+            notice_dropped: Mutex::new(Vec::new()),
+            last_channel_state: Mutex::new(None),
         }
     }
 
@@ -749,6 +790,44 @@ pub struct DeskSnapshot {
     pub output_dir: String,
     pub config_path: String,
     pub slots: Vec<SlotView>,
+    /// 喇叭上**正在播**的内容（`None` = 空闲）。
+    ///
+    /// v0.43.4 新增：没有它，前端只能显示"正在播报"四个字 —— 排队等待的
+    /// 不可见正是"S2 怎么没声音"这类反馈的温床（等待感来自不可见，不来自等待）。
+    pub playing: Option<PlayingView>,
+    /// **排队等补播**的通知（按即将播放的顺序，队首在前）。
+    ///
+    /// 与 `playing` 合起来回答用户的三个问题：现在在播什么、我还有几条没播、
+    /// 分别是什么。内容由 `notice_queue` 投影而来（同一把锁，快照与队列
+    /// 不会各说各话）。
+    pub notice_queue: Vec<NoticeQueueItemView>,
+}
+
+/// 当前喇叭上正在播的内容（快照投影）。
+///
+/// `PartialEq` 是 [`emit_channel_state`] 做"内容比对"的依据：只在真变了才推事件。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PlayingView {
+    /// `None` = 正在播某槽的**结果**（用户按下的）；`Some` = 正在播 Notice。
+    pub notice_kind: Option<NoticeKind>,
+    /// 展示文本：Notice 用 `kind.text()`，结果播报固定为"任务结果"。
+    pub text: String,
+    /// 槽位标签（"S1"…）；无槽位为 `None`。
+    pub slot_label: Option<String>,
+}
+
+/// 排队中的一条通知（快照投影）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NoticeQueueItemView {
+    /// 排队位置（1 起，1 = 下一个就轮到它）。
+    pub position: usize,
+    pub kind: NoticeKind,
+    /// 展示文本：有动态正文用正文，否则用固定语料。
+    pub text: String,
+    /// 槽位标签（"S1"…）；无槽位为 `None`。
+    pub slot_label: Option<String>,
+    /// 是否终态播报（前端可据此决定配色：终态=该听完的承诺，进度=状态更新）。
+    pub terminal: bool,
 }
 
 /// TTS 试合成报告。
@@ -1061,11 +1140,15 @@ fn may_start_playing(mgr: &DeskManager, slot: Option<usize>, incoming_terminal: 
 ///
 /// 刻意**不在这里释放**被抢占者的租约：释放要拿 `runtime` 锁，而这里正持有
 /// `playing` 锁 —— 两把锁交叉获取是死锁的经典配方。租约的处置交给调用方在锁外做。
+///
+/// `kind` = 来电是哪种 Notice 播报（`None` = 结果播报）。只为快照展示服务：
+/// 前端要回答"喇叭上正在念什么"，没有它只能显示干巴巴的"正在播报"。
 fn take_channel(
     mgr: &DeskManager,
     slot: Option<usize>,
     lease: Option<Lease>,
     control: audio_out::PlaybackControl,
+    kind: Option<NoticeKind>,
 ) -> (u64, Option<Lease>) {
     let id = CHANNEL_ID.fetch_add(1, Ordering::Relaxed);
     let mut playing = mgr.playing.lock().unwrap_or_else(|e| e.into_inner());
@@ -1083,6 +1166,7 @@ fn take_channel(
         lease,
         control,
         id,
+        kind,
     });
     (id, prev_lease)
 }
@@ -1099,6 +1183,86 @@ fn clear_channel_if_mine(mgr: &DeskManager, id: u64) {
     let mut playing = mgr.playing.lock().unwrap_or_else(|e| e.into_inner());
     if playing.as_ref().map(|p| p.id) == Some(id) {
         let _ = playing.take();
+    }
+}
+
+/// 喇叭占用 + 播报队列的**唯一投影**。
+///
+/// 快照（`desk_snapshot`，5 秒轮询）与实时事件（`agent-desk-channel`，状态一变就发）
+/// 都从这里取值。两处各算一遍是这类 UI 最典型的漂移源：用户会看到
+/// "喇叭响着 A，界面却写着在播 B"，而且越是排查时越难重现。
+///
+/// ⚠️ 两次读**刻意不做成原子联读**：`playing` 与 `notice_queue` 是两把不同的锁，
+/// 强行联合读只会把锁顺序问题引进来，而两次读之间毫秒级的变化对展示无实质影响。
+fn project_channel(mgr: &DeskManager) -> (Option<PlayingView>, Vec<NoticeQueueItemView>) {
+    let playing = {
+        let guard = mgr.playing.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|p| PlayingView {
+            notice_kind: p.kind,
+            text: match p.kind {
+                Some(k) => k.text().to_string(),
+                None => "任务结果".to_string(),
+            },
+            slot_label: p.slot.map(|s| format!("S{}", s + 1)),
+        })
+    };
+    let notice_queue = {
+        let guard = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .enumerate()
+            .map(|(i, q)| NoticeQueueItemView {
+                position: i + 1,
+                kind: q.kind,
+                text: q
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| q.kind.text().to_string()),
+                slot_label: q.slot.map(|s| format!("S{}", s + 1)),
+                terminal: q.kind.is_terminal(),
+            })
+            .collect()
+    };
+    (playing, notice_queue)
+}
+
+/// 喇叭/队列状态一变就推一条 `agent-desk-channel`（遗留项第 3 条的实现）。
+///
+/// # 为什么必须有这条事件
+///
+/// 快照 5 秒轮一次，而"队首等待"恰恰发生在那 5 秒里 —— 只靠轮询，用户看到的是
+/// **播完了、界面却还显示在排队**，于是以为坏了。等待感来自不可见，不来自等待：
+/// 让他看见"正在播 S1 的结论 · 队列里还有 2 条（S2 完成、S3 失败）"，
+/// 那段等待就变成了"哦，快好了"。
+///
+/// # 为什么"真变化才发"
+///
+/// 与 [`emit_state_if_changed`] 同一原则：播放/排队是高频动作，无条件发会把前端
+/// 刷屏，也让"这条事件代表状态变了"这个契约失效。用**内容比对**而不是版本号 ——
+/// 版本号在并发播放下必然错序（两个线程各 +1 谁先谁后不可知）。
+fn emit_channel_state(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager as _};
+    let mgr = app.state::<DeskManager>();
+    let (playing, notice_queue) = project_channel(&mgr);
+
+    let mut last = mgr
+        .last_channel_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.as_ref() == Some(&(playing.clone(), notice_queue.clone())) {
+        return;
+    }
+    *last = Some((playing.clone(), notice_queue.clone()));
+    drop(last);
+
+    if let Err(e) = app.emit(
+        "agent-desk-channel",
+        ChannelState {
+            playing,
+            notice_queue,
+        },
+    ) {
+        log_buffer::warn(format!("任务台喇叭状态事件发送失败: {e}"));
     }
 }
 
@@ -1254,7 +1418,12 @@ fn load_cached_asset(
 /// 若把出声交给前端（收到事件后自己放音频），那么任务台页面没打开、
 /// 或正处在切页的那一瞬间，这一句就**静默消失** —— 而丢的偏偏是他正在等的那句。
 /// 这正是方案里"播放必须在后端"那条铁律的实际含义：不是实现偏好，是承诺的可靠性。
+///
+/// ⚠️ `app` 是给"喇叭状态实时可见"用的（遗留项第 3 条）：播放的**开始与结束**
+/// 都发生在这个函数内部，调用方在外面拿不到准确的时刻。传进来才能在两处
+/// 各推一次 `agent-desk-channel` —— 用户于是看得见"正在播什么、还排着几条"。
 async fn speak_notice(
+    app: &tauri::AppHandle,
     mgr: &DeskManager,
     kind: NoticeKind,
     voice_text: Option<&str>,
@@ -1265,9 +1434,13 @@ async fn speak_notice(
     // 调用方排队（见 `emit_notice_with` 的 Busy 分支）。
     if !may_start_playing(mgr, None, kind.is_terminal()) {
         return Err(NoticeSpeakError::Busy(if kind.is_terminal() {
+            // 终态：调用方会排队（见 emit_notice_with 的 Busy 分支）。
             "喇叭正忙 —— 终态播报不打断当前播放，已转入排队".to_string()
+        } else if kind.is_debounceable() {
+            // 进度类：调用方会按收敛规则处理（留最新一条、不压终态）。
+            "喇叭正忙 —— 进度播报转入收敛排队（只留最新一条，不压终态）".to_string()
         } else {
-            "结果正在播放 —— 进度播报被丢弃（不打断「有结果等你听」）".to_string()
+            "结果正在播放 —— 事件播报不排队（前端灯与页面实时可见）".to_string()
         }));
     }
 
@@ -1298,12 +1471,14 @@ async fn speak_notice(
     let control = audio_out::play_pcm(pcm, rate).map_err(NoticeSpeakError::Failed)?;
 
     // ---- 占位 + 播完后清场 ----
-    let (id, preempted) = take_channel(mgr, None, None, control.clone());
+    let (id, preempted) = take_channel(mgr, None, None, control.clone(), Some(kind));
     if preempted.is_some() {
         // Notice 抢占别人的租约是不可能的（Notice 从不持有租约）。
         // 真出现了说明有 bug —— 但不能静默。
         log_buffer::err("任务台播报：Notice 竟持有租约，这是不应发生的状态".to_string());
     }
+    // 起播即刻推一次：队里等着的用户要看到"轮到这条了"，而不是等它播完才知道。
+    emit_channel_state(app);
 
     let waiter = control.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
@@ -1322,6 +1497,8 @@ async fn speak_notice(
     // 清场会动共享的播放句柄，反过来读它的状态就不可靠了。
     let completed = control.completed_fully();
     clear_channel_if_mine(mgr, id);
+    // 清场后推一次：喇叭回到空闲（或已被下一条接管），界面要立刻跟上。
+    emit_channel_state(app);
 
     let report = NoticePlayReport {
         kind,
@@ -1399,7 +1576,7 @@ pub async fn desk_play_notice(
     mgr: State<'_, DeskManager>,
     kind: NoticeKind,
 ) -> Result<ApiEnvelope<NoticePlayReport>, String> {
-    let outcome = match speak_notice(&mgr, kind, None).await {
+    let outcome = match speak_notice(&app, &mgr, kind, None).await {
         Ok(report) => Ok(ApiEnvelope::ok(report)),
         Err(e) => Ok(ApiEnvelope::err(
             match &e {
@@ -1508,7 +1685,7 @@ pub async fn desk_render_result(
         }
     };
 
-    let (id, preempted) = take_channel(&mgr, Some(slot), Some(lease), control.clone());
+    let (id, preempted) = take_channel(&mgr, Some(slot), Some(lease), control.clone(), None);
 
     // 被抢占者若是"另一次结果播报"，它也没听完 ⇒ 释放其租约（**不消费**）。
     if let Some(old) = preempted {
@@ -1517,6 +1694,9 @@ pub async fn desk_render_result(
             rt.unread_mut().release(old).ok();
         }
     }
+
+    // 结果播报接管了喇叭 ⇒ 队列里等着的 Notice 要立刻看到"前面换人了"。
+    emit_channel_state(&app);
 
     let waiter = control.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
@@ -1535,6 +1715,9 @@ pub async fn desk_render_result(
     let completed = control.completed_fully();
     clear_channel_if_mine(&mgr, id);
     // 结果播完了（或被抢占）⇒ 排水：排队中的终态播报该补播了。
+    // ⚠️ 先推状态再排水：排水里的那次 `speak_notice` 起播时会再推一次，
+    // 顺序反了会出现"界面先显示空闲、紧接着又显示在播"的闪烁。
+    emit_channel_state(&app);
     tauri::async_runtime::spawn(drain_notice_queue(app.clone()));
 
     // ---- 5. 只有**完整播完**才消费未读 ----
@@ -1736,6 +1919,10 @@ fn build_snapshot(mgr: &DeskManager) -> DeskSnapshot {
         })
         .collect();
 
+    // 喇叭占用与播报队列：走共享投影 `project_channel`，与实时事件同源 ——
+    // 两处各算一遍的话，早晚会出现"快照说在播 A、界面说在播 B"。
+    let (playing, notice_queue) = project_channel(&mgr);
+
     DeskSnapshot {
         enabled: cfg.enabled,
         ready: blockers.is_empty(),
@@ -1753,6 +1940,8 @@ fn build_snapshot(mgr: &DeskManager) -> DeskSnapshot {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "(未初始化)".into()),
         slots,
+        playing,
+        notice_queue,
     }
 }
 
@@ -2946,7 +3135,7 @@ fn emit_notice_with(
             // 放在这一层而不是调用方，是为了让那次调用发生在**槽位已经清空之后** ——
             // 排在后面的任务不必陪着等一句"润色"。
             let text = voice.resolve(&mgr).await;
-            match speak_notice(&mgr, kind, text.as_deref()).await {
+            match speak_notice(&app2, &mgr, kind, text.as_deref()).await {
                 Ok(r) => log_buffer::info(format!(
                     "任务台出声: 「{}」播放 {}/{} 样本，{}ms",
                     kind.text(),
@@ -2965,14 +3154,12 @@ fn emit_notice_with(
                         log_buffer::warn(format!("任务台播报出声失败：{}", e.message()))
                     }
                     NoticeSpeakError::Busy(_) => {
-                        if kind.is_terminal() {
-                            // 终态播报**不许静默丢失**：排队，等当前播放结束后补播。
-                            // v0.41.15 这里直接丢弃 ⇒ S2 的"任务已完成"连日志行都没有，
-                            // 用户只看到未读 +1（实锤见 2026-10-13 诊断记录）。
-                            enqueue_terminal_notice(&app2, kind, slot, text);
-                        } else {
-                            log_buffer::info(format!("任务台播报未出声：{}", e.message()))
-                        }
+                        // 播不出来的通知**不许静默丢失**：统一进 `enqueue_notice`，
+                        // 由它按三类分别处置 —— 终态排队等、进度类收敛成"最多一条
+                        // 最新且不压终态"、其余事件类丢弃（理由见其文档）。
+                        // v0.41.15 这里对终态也是直接丢 ⇒ S2 的"任务已完成"连日志行
+                        // 都没有，用户只看到未读 +1（实锤见 2026-10-13 诊断记录）。
+                        enqueue_notice(&app2, kind, slot, text);
                     }
                 },
             }
@@ -2986,18 +3173,25 @@ fn emit_notice_with(
     true
 }
 
-/// 把一条播不出来的终态通知**排队**，等喇叭空出来后补播。
+/// 一条通知播不出来（喇叭被占）时的处置入口：**终态排队，进度类收敛，其余丢弃**。
 ///
-/// # 为什么终态要排队，而进度类直接丢
+/// # 为什么三类通知的处置完全不同
 ///
-/// 进度类是"现在怎么样"（可丢弃：下一秒的状态快照还说得清）；终态是
-/// "事情办完了"（不可丢：错过这一句，用户只能靠未读灯猜到"有东西"，
-/// 却不知道是什么、从哪来）。排队**不打断任何人**，只是把该说的留到能说的时候。
+/// 第一性原理：喇叭是单路信道，排队位是稀缺资源；而三类信息的**价值随
+/// 时间的衰减曲线不同**——
 ///
-/// 溢出时丢**最旧**的一条并计数：用户刚听完了更新的状态，最旧的那条价值最低；
-/// 计数不为零时，队列排空后会补一条合并短通知（见 `drain_notice_queue`）——
-/// 丢可以，但不许静默地丢。
-fn enqueue_terminal_notice(
+/// - **终态**（"事情办完了"）价值**不衰减**：错过这一句，用户只能靠未读灯
+///   猜到"有东西"，却不知道是什么、从哪来 ⇒ 必须排队等（v0.42.0 立，
+///   v0.41.15 实录：S2 的完成连日志行都没有就消失了）。
+/// - **进度类**（"正在推进"/"已跑 N 分钟"）价值**随时间衰减**：喇叭空出来
+///   三分钟后补一句"正在推进"，说的是一个已经过去的时刻，是噪音不是信息。
+///   v0.42.0 的处置是"直接丢"，代价是用户对排队期间的进度完全无感；
+///   v0.43.4 收敛为"**最多留一条最新的，且绝不压在终态前面**"。
+/// - **其余事件类**（"任务已开始"）：任务状态在前端的灯与页面里实时可见，
+///   排队补播一条迟到的"已开始"只会和正在播的内容抢注意力 ⇒ 丢弃。
+///
+/// 排队**不打断任何人**，只是把该说的留到能说的时候。
+fn enqueue_notice(
     app: &tauri::AppHandle,
     kind: NoticeKind,
     slot: Option<usize>,
@@ -3005,10 +3199,59 @@ fn enqueue_terminal_notice(
 ) {
     use tauri::Manager as _;
     let mgr = app.state::<DeskManager>();
-    let mut queue = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
-    if queue.len() >= NOTICE_QUEUE_CAP {
-        if queue.pop_front().is_some() {
-            mgr.notice_dropped.fetch_add(1, Ordering::AcqRel);
+    let mut queued = false;
+    {
+        let mut queue = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+        match enqueue_decide(&queue, kind) {
+            EnqueueDecision::Drop { reason } => {
+                // 进度类被丢**不记** `notice_dropped`：过期的进度没有告知价值，
+                // 报进合并提醒反而是噪音（"还有 1 条进度更新"对用户毫无行动意义）。
+                log_buffer::info(format!("任务台播报「{}」未排队：{}", kind.text(), reason));
+            }
+            EnqueueDecision::Replace => {
+                // 只留最新：先移除队里的进度类，再走正常入队路径。
+                queue.retain(|q| !q.kind.is_debounceable());
+                push_queued_notice(&mut queue, kind, slot, text, &mgr);
+                queued = true;
+            }
+            EnqueueDecision::Append => {
+                push_queued_notice(&mut queue, kind, slot, text, &mgr);
+                queued = true;
+            }
+        }
+    }
+    // ⚠️ 必须在**释放 `notice_queue` 之后**推事件：`emit_channel_state` 内部
+    // 要重读同一把队列（非阻塞 `Mutex` 也会因同线程重入而死锁）。
+    // 这也是为什么这里要把决策结果先记成 `queued` 再出作用域。
+    if queued {
+        emit_channel_state(app);
+    }
+}
+
+/// 入队 + 记日志。**终态类满员时丢最旧并记明细**（带槽位，供合并提醒）。
+///
+/// 调用方必须已经通过 `enqueue_decide` 把关；本函数不再做决策，
+/// 只负责"满了怎么办"这一件事。
+fn push_queued_notice(
+    queue: &mut VecDeque<QueuedNotice>,
+    kind: NoticeKind,
+    slot: Option<usize>,
+    text: Option<String>,
+    mgr: &DeskManager,
+) {
+    // 进度类走不到溢出分支：它入队时队列里既无终态（规则 1）也无同类
+    // （规则 2 已 retain 掉），队列必为空。这里仍然分型写，是为了让
+    // "进度不占终态位"这件事在代码里可见，而不是依赖一个隐晦的不变量。
+    if !kind.is_debounceable() && queue.len() >= NOTICE_QUEUE_CAP {
+        if let Some(old) = queue.pop_front() {
+            // 只有终态记明细：合并提醒要能说清"是哪几个槽的什么事"。
+            mgr.notice_dropped
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(DroppedNotice {
+                    kind: old.kind,
+                    slot: old.slot,
+                });
         }
         log_buffer::warn(format!(
             "任务台播报队列已满（{} 条）⇒ 丢弃最旧一条（用户刚听过更新的状态）；\
@@ -3019,10 +3262,82 @@ fn enqueue_terminal_notice(
     }
     let position = queue.len() + 1;
     queue.push_back(QueuedNotice { kind, slot, text });
-    log_buffer::info(format!(
-        "任务台终态播报「{}」已排队（第 {position} 条）—— 当前播放结束后补播，不打断任何人",
-        kind.text()
-    ));
+    if kind.is_debounceable() {
+        log_buffer::info(format!(
+            "任务台进度播报「{}」已排队（第 {position} 条）—— 喇叭一空出来就补播这条最新进度，绝不压在终态前面",
+            kind.text()
+        ));
+    } else {
+        log_buffer::info(format!(
+            "任务台播报「{}」已排队（第 {position} 条）—— 当前播放结束后补播，不打断任何人",
+            kind.text()
+        ));
+    }
+}
+
+/// 一条通知该不该进队列、以什么姿势进。
+///
+/// 抽成**纯函数**（不碰 `DeskManager`）是为了能单测：排队规则是这批修复里
+/// 最容易随"再加一种 kind"而悄悄漂移的逻辑，而它的失败形态是**静默的**
+/// （用户听不到某句播报，且没有任何报错），只能靠测试钉死。
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueDecision {
+    /// 入队（队尾追加）。
+    Append,
+    /// 入队，但先移除队里的进度类（只留最新一条）。
+    Replace,
+    /// 不入队。`reason` 进 info 日志。
+    Drop { reason: &'static str },
+}
+
+fn enqueue_decide(queue: &VecDeque<QueuedNotice>, kind: NoticeKind) -> EnqueueDecision {
+    // 终态（Completed / Failed / LostContact）：不可丢，必排队。
+    if kind.is_terminal() {
+        return EnqueueDecision::Append;
+    }
+    if kind.is_debounceable() {
+        // 规则 1：队里有终态 ⇒ 过期丢弃。进度排在终态后永远播不到
+        // （排水是 FIFO），而终态播完时任务多已结束，"正在推进"成了废话。
+        if queue.iter().any(|q| q.kind.is_terminal()) {
+            return EnqueueDecision::Drop {
+                reason: "队列里有终态播报待补 —— 进度信息排在它后面播不出价值，且终态播完时任务多已结束",
+            };
+        }
+        // 规则 2：队里已有进度 ⇒ 被最新的一条取代。只有最新状态值得说。
+        if queue.iter().any(|q| q.kind.is_debounceable()) {
+            return EnqueueDecision::Replace;
+        }
+        // 规则 3：空队列 ⇒ 入队。进度类不占 NOTICE_QUEUE_CAP 的终态位。
+        return EnqueueDecision::Append;
+    }
+    // 其余事件类（TaskStarted 等）：丢弃，理由见 enqueue_notice 文档。
+    EnqueueDecision::Drop {
+        reason: "事件类播报不排队 —— 任务状态在前端的灯与页面里实时可见，迟到补播只会抢注意力",
+    }
+}
+
+/// 合并提醒正文：报**条数 + 槽位 + 事项**，不再只是一个数字。
+///
+/// v0.42.0 这里只说"还有 N 条任务结果未播报"—— 用户仍然不知道是哪几个槽的
+/// 事，只能挨个点开看（遗留项第 2 条，v0.43.4 补）。槽位编号与前端
+/// `SlotView.index` 同一套（S1–S4）。
+///
+/// 最多列 3 条明细：TTS 按字数计费，一句提醒念半分钟比不念更糟；
+/// 超限退化为纯条数（与 v0.42.0 一致）。
+fn merged_reminder_text(dropped: &[DroppedNotice]) -> String {
+    let n = dropped.len();
+    if n <= 3 {
+        let names: Vec<String> = dropped
+            .iter()
+            .map(|d| match d.slot {
+                Some(s) => format!("S{} {}", s + 1, d.kind.text()),
+                None => d.kind.text().to_string(),
+            })
+            .collect();
+        format!("还有 {n} 条任务结果未播报（{}），请点击查看。", names.join("、"))
+    } else {
+        format!("还有 {n} 条任务结果未播报，请点击查看。")
+    }
 }
 
 /// 补播排队中的终态通知。**任何播放结束后都应触发一次**。
@@ -3048,11 +3363,13 @@ async fn drain_notice_queue(app: tauri::AppHandle) {
             queue.pop_front()
         };
         let Some(item) = next else {
-            // 队列排空：这轮排水期间丢过最旧的 ⇒ 补一条合并短通知。
-            let dropped = mgr.notice_dropped.swap(0, Ordering::AcqRel);
-            if dropped > 0 {
+            // 队列排空：这轮排水期间丢过最旧的终态 ⇒ 补一条合并短通知。
+            // v0.43.4 起正文带槽位明细（"S1 任务已完成、S3 任务失败"）——
+            // 只报条数的话用户仍然不知道是哪几个槽，只能挨个点开看。
+            let dropped = std::mem::take(&mut *mgr.notice_dropped.lock().unwrap_or_else(|e| e.into_inner()));
+            if !dropped.is_empty() {
                 let now = now_ms();
-                let detail = format!("还有 {dropped} 条任务结果未播报，请点击查看。");
+                let detail = merged_reminder_text(&dropped);
                 emit_notice_with(
                     &app,
                     GateId::Slot,
@@ -3065,7 +3382,7 @@ async fn drain_notice_queue(app: tauri::AppHandle) {
             }
             break;
         };
-        match speak_notice(&mgr, item.kind, item.text.as_deref()).await {
+        match speak_notice(&app, &mgr, item.kind, item.text.as_deref()).await {
             Ok(_) => {}
             Err(NoticeSpeakError::Busy(_)) => {
                 // 又被新的播放占了（多半是用户按了「播报未读」）⇒ 放回队首等下一次。
@@ -3085,6 +3402,12 @@ async fn drain_notice_queue(app: tauri::AppHandle) {
         }
     }
 
+    // 收尾推一次：**兜住所有中途没有推过的路径**。
+    // 正常播出的那几条，起播/播完时 `speak_notice` 内部各推过一次；
+    // 但 `Busy` 分支是 `push_front` 之后直接 break 的（队列回到原样、
+    // 本轮没有起播 ⇒ 一次都没推），少了这一次，界面就会停留在
+    // "少了 1 条" 的旧状态，直到下一次播放动作才自愈。
+    emit_channel_state(&app);
     mgr.notice_draining.store(false, Ordering::Release);
 }
 
@@ -3655,6 +3978,178 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    // ---- 播报排队规则（v0.43.4：进度类收敛 + 合并提醒带槽位）----
+    //
+    // 排队规则的失败形态是**静默的**（用户听不到某句播报，且没有任何报错），
+    // 所以这里用纯函数 `enqueue_decide` / `merged_reminder_text` 钉死每一种输入。
+
+    fn queued(kind: NoticeKind, slot: Option<usize>) -> QueuedNotice {
+        QueuedNotice { kind, slot, text: None }
+    }
+
+    // ---- 喇叭/队列投影（遗留项第 3 条：等待期要看得见）----
+
+    #[test]
+    fn an_empty_channel_projects_to_idle_and_no_queue() {
+        let dir = temp_dir("channel_empty");
+        let mgr = create_manager(&dir);
+        let (playing, queue) = project_channel(&mgr);
+        assert!(playing.is_none(), "空闲时不该有正在播的内容");
+        assert!(queue.is_empty(), "空闲时不该有排队");
+    }
+
+    #[test]
+    fn the_queue_projects_positions_and_slot_labels() {
+        // 用户要看见的是"还排着 2 条，分别是 S2 完成、S3 失败"，
+        // 而不是"还有 2 条"。位置从 1 起（1 = 下一个就轮到它）。
+        let dir = temp_dir("channel_queue");
+        let mgr = create_manager(&dir);
+        {
+            let mut q = mgr.notice_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(queued(NoticeKind::Completed, Some(1)));
+            q.push_back(queued(NoticeKind::Failed, Some(2)));
+        }
+        let (playing, queue) = project_channel(&mgr);
+        assert!(playing.is_none());
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].position, 1);
+        assert_eq!(queue[0].slot_label.as_deref(), Some("S2"));
+        assert!(queue[0].terminal, "完成是终态，前端据此配色");
+        assert_eq!(queue[1].slot_label.as_deref(), Some("S3"));
+        assert!(queue[1].terminal);
+    }
+
+    #[test]
+    fn a_global_progress_entry_has_no_slot_label() {
+        // 全局进度类没有归属槽位：显示"S0"或"SN"都是编造信息。
+        let dir = temp_dir("channel_progress");
+        let mgr = create_manager(&dir);
+        mgr.notice_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(queued(NoticeKind::Progressing, None));
+        let (_, queue) = project_channel(&mgr);
+        assert!(queue[0].slot_label.is_none());
+        assert!(!queue[0].terminal, "进度类不是终态");
+    }
+
+    #[test]
+    fn the_snapshot_and_the_event_never_disagree() {
+        // 两条出口（快照 / 实时事件）必须同源：各自算一遍早晚会漂移成
+        // "喇叭响着 A、界面写着在播 B"，而这种 bug 恰恰在排查时最难重现。
+        let dir = temp_dir("channel_same_source");
+        let mgr = create_manager(&dir);
+        mgr.notice_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(queued(NoticeKind::Completed, Some(0)));
+        let a = project_channel(&mgr);
+        let b = project_channel(&mgr);
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+    }
+
+    #[test]
+    fn terminal_notices_always_queue_no_matter_what_is_in_line() {
+        // 终态的价值不随时间衰减 ⇒ 空队列、被进度类占着、满员，都要排队。
+        for queue in [
+            VecDeque::new(),
+            vec![queued(NoticeKind::Progressing, None)].into(),
+            vec![
+                queued(NoticeKind::Completed, Some(0)),
+                queued(NoticeKind::Failed, Some(1)),
+                queued(NoticeKind::LostContact, Some(2)),
+            ]
+            .into(),
+        ] {
+            assert_eq!(
+                enqueue_decide(&queue, NoticeKind::Completed),
+                EnqueueDecision::Append
+            );
+        }
+    }
+
+    #[test]
+    fn a_progress_notice_queues_when_the_queue_is_empty() {
+        // v0.43.4 起进度类不再"被占即丢"：喇叭一空出来就补播最新进度。
+        let queue: VecDeque<QueuedNotice> = VecDeque::new();
+        assert_eq!(
+            enqueue_decide(&queue, NoticeKind::Running15Min),
+            EnqueueDecision::Append
+        );
+    }
+
+    #[test]
+    fn a_newer_progress_replaces_the_queued_one() {
+        // 只有最新状态值得说：旧的"正在推进"被新的"已运行十五分钟"取代。
+        let queue: VecDeque<QueuedNotice> =
+            vec![queued(NoticeKind::Progressing, None)].into();
+        assert_eq!(
+            enqueue_decide(&queue, NoticeKind::Running15Min),
+            EnqueueDecision::Replace
+        );
+    }
+
+    #[test]
+    fn a_progress_notice_expires_when_a_terminal_is_queued() {
+        // 队里有终态 ⇒ 进度过期。压在终态后永远播不到（FIFO），
+        // 而终态播完时任务多已结束，"正在推进"成了废话。
+        let queue: VecDeque<QueuedNotice> = vec![queued(NoticeKind::Completed, Some(0))].into();
+        assert!(
+            matches!(
+                enqueue_decide(&queue, NoticeKind::Progressing),
+                EnqueueDecision::Drop { .. }
+            ),
+            "队里有终态时进度必须过期丢弃：{:?}",
+            enqueue_decide(&queue, NoticeKind::Progressing)
+        );
+    }
+
+    #[test]
+    fn non_terminal_events_never_queue() {
+        // "任务已开始"类：前端灯与页面实时可见，迟到补播只会抢注意力。
+        let queue: VecDeque<QueuedNotice> = VecDeque::new();
+        assert!(
+            matches!(
+                enqueue_decide(&queue, NoticeKind::TaskStarted),
+                EnqueueDecision::Drop { .. }
+            ),
+            "事件类不进队列：{:?}",
+            enqueue_decide(&queue, NoticeKind::TaskStarted)
+        );
+    }
+
+    #[test]
+    fn merged_reminder_lists_slots_and_kinds() {
+        // 遗留项第 2 条：只报条数 ⇒ 用户不知道是哪几个槽，只能挨个点开。
+        let dropped = vec![
+            DroppedNotice { kind: NoticeKind::Completed, slot: Some(0) },
+            DroppedNotice { kind: NoticeKind::Failed, slot: Some(2) },
+        ];
+        let text = merged_reminder_text(&dropped);
+        assert!(text.contains("2 条"), "条数要在：{text}");
+        assert!(text.contains("S1 任务已完成"), "槽位+事项要在：{text}");
+        assert!(text.contains("S3 任务失败"), "槽位+事项要在：{text}");
+    }
+
+    #[test]
+    fn merged_reminder_omits_the_label_when_slot_is_unknown() {
+        let dropped = vec![DroppedNotice { kind: NoticeKind::Completed, slot: None }];
+        let text = merged_reminder_text(&dropped);
+        assert!(text.contains("任务已完成"), "{text}");
+        assert!(!text.contains('S'), "无槽位不该出现 S 前缀：{text}");
+    }
+
+    #[test]
+    fn merged_reminder_falls_back_to_count_past_three() {
+        // TTS 按字数计费：一句提醒念半分钟比不念更糟。>3 条退化为纯条数。
+        let dropped: Vec<DroppedNotice> = (0..4)
+            .map(|i| DroppedNotice { kind: NoticeKind::Completed, slot: Some(i) })
+            .collect();
+        let text = merged_reminder_text(&dropped);
+        assert_eq!(text, "还有 4 条任务结果未播报，请点击查看。");
     }
 
     #[test]

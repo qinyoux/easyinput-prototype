@@ -511,6 +511,22 @@ export default function GeneralSettings() {
         </div>
       </div>
 
+      {/* ================= 分组边界：通用设置 ↔ 任务台相关设置 =================
+          分界依据（不是拍脑袋划的）：
+          上面三节（通信配置 / 界面主题 / Everything 搜索）管的是**应用自身**——
+          连开发板、换配色、找软件；换一台机器、换一个用户，它们照样成立。
+          从「文本注入」往下（文本注入 / 终端启动 / 界面选项 / Agent 任务台）
+          管的是**任务台这条链路**——文字怎么进终端、Agent 怎么被派发、结果怎么回来。
+          两类设置的**变更节奏和影响面都不同**，所以必须在视觉上分开，
+          否则用户滚到中段时会以为「粘贴方式」也在管麦克风。 */}
+      <div className="settings-group-head desk">
+        <span className="settings-group-title">任务台相关设置</span>
+        <span className="settings-group-desc">
+          文字怎么送出去、Agent 怎么派发、结果怎么回来 —— 语音输入与任务台的<strong>共用底层</strong>
+        </span>
+        <span className="settings-group-count">5 项</span>
+      </div>
+
       <div className="settings-section">
         <h3 className="settings-section-title">文本注入</h3>
         <div className="field">
@@ -542,14 +558,9 @@ export default function GeneralSettings() {
           {/* 当前选项的 hint 常显（"这一格选了会怎样"）；下面这段是 TUI raw mode 的原理，收起。 */}
           <CollapsibleHint id="gen-paste-why" label="为什么需要这一项">
             <p className="hint">
-              <code>Ctrl+V</code> 在终端里的 TUI 程序
-              （codex / vim / htop 等）中<strong>粘不进去</strong> —— TUI 会把终端置于
-              raw mode 直接读按键字节，<code>Ctrl+V</code> 在那里是字面量 <code>0x16</code>，
-              会被 TUI 当成自己的快捷键吃掉。终端级粘贴由<strong>终端模拟器</strong>处理，
-              而不同终端的键位<strong>不一样</strong>（本机实测）：
-              <code>Windows Terminal</code> 用 <code>Ctrl+Shift+V</code>（或鼠标右键），
-              <code>Git Bash</code> 用 <code>Shift+Insert</code>。选「自动」时按焦点窗口
-              类名选对应那组键；认不出的窗口回落 <code>Ctrl+V</code>。
+              <code>Ctrl+V</code> 在 TUI 程序（codex / vim / htop）里<strong>粘不进去</strong> ——
+              TUI 处于 raw mode，<code>Ctrl+V</code> 是字面量 <code>0x16</code>，被当成自己的快捷键吃掉。
+              终端级粘贴由<strong>终端模拟器</strong>处理，而各终端键位不同（本机实测）。
             </p>
           </CollapsibleHint>
           {pasteStyleStatus && (

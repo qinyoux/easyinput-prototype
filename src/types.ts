@@ -12,7 +12,9 @@ export type ActionSpec =
   | { kind: "text"; value: string }
   | { kind: "host_action"; value: string }
   /** Agent 任务台槽位按键。value 是槽位号字符串 "1"–"4"。 */
-  | { kind: "task_desk"; value: string };
+  | { kind: "task_desk"; value: string }
+  /** 内容台旋钮导航。value 是 "prev" / "next" / "confirm"。 */
+  | { kind: "studio"; value: string };
 
 /** 本机应用库的打开目标。 */
 export type AppTarget =
@@ -67,9 +69,57 @@ export interface ConfigAck {
   crc16: number;
 }
 
+/**
+ * 开发板固件状态（后端 `device_firmware_status` 回读的摘要）。
+ *
+ * `firmware` 是板子**自己报出**的固件版本串（如 `0.4.53-idf-v2-ble-store-v1`）——
+ * 这是"板子上到底烧了哪一版"唯一可信的回答，不依赖任何本地文件。
+ */
+export interface DeviceFirmwareStatus {
+  firmware: string;
+  /** 状态 JSON 的 schema，如 `ai_keyboard.config_status.v1`（用于判断协议代际）。 */
+  schema: string;
+  /** 电池电压 mV；固件没报就是 null。 */
+  battery_mv: number | null;
+  /** 电池电量 %；固件没报就是 null。 */
+  battery_percent: number | null;
+}
+
+/** 授权（注册）状态——本地激活码校验结果。 */
+export interface LicenseInfo {
+  /** 是否有效（已注册且未过期/未篡改）。 */
+  valid: boolean;
+  /** 版次标识，如 trial / pro / team。 */
+  edition: string;
+  /** 过期时间（Unix 毫秒）；null = 永不过期。 */
+  exp: number | null;
+  /** 备注（授权对象、订单号等）。 */
+  note: string;
+  /** 是否绑定了机器。 */
+  machineBound: boolean;
+  /** 给用户的提示文案。 */
+  message: string;
+}
+
+/** 一组可绑定到按键的「具名动作」，前端以独立下拉菜单呈现（按插件归类）。 */
+export interface ActionGroup {
+  /** 分组 id：插件 id（如 `live-translate`）。 */
+  id: string;
+  /** 分组展示名（下拉菜单标题），如「实时翻译」「内容台」「风格调色盘」。 */
+  label: string;
+  /** 该分组下的动作 id 列表（顺序即下拉顺序）。 */
+  actions: string[];
+}
+
 /** 后端 `get_vocabulary` 返回的词表与常量。 */
 export interface Vocabulary {
   named_actions: string[];
+  /** 插件声明的动作 id → 中文标签（来自各插件 commands[].title）。 */
+  action_labels: Record<string, string>;
+  /** 按插件归类的动作分组（每个可见插件 => 一个顶层菜单）。 */
+  action_groups: ActionGroup[];
+  /** 主机内置功能动作（「功能动作」菜单用，不含插件命令）。 */
+  core_actions: string[];
   modifiers: string[];
   named_keys: string[];
   text_max_utf8_bytes: number;
@@ -365,6 +415,41 @@ export interface DeskSnapshot {
   output_dir: string;
   config_path: string;
   slots: SlotView[];
+  /**
+   * 喇叭上**正在播**的内容（v0.43.4 新增；`null` = 空闲）。
+   *
+   * 没有它，前端只能显示"正在播报"四个字 —— 排队等待的不可见正是
+   * "S2 怎么没声音"这类反馈的温床（等待感来自不可见，不来自等待）。
+   */
+  playing: PlayingView | null;
+  /**
+   * **排队等补播**的通知（队首在前，v0.43.4 新增）。
+   *
+   * 与 `playing` 合起来回答：现在在播什么、我还有几条没播、分别是什么。
+   */
+  notice_queue: NoticeQueueItemView[];
+}
+
+/** 当前喇叭上正在播的内容（`DeskSnapshot.playing`）。 */
+export interface PlayingView {
+  /** `null` = 正在播某槽的**结果**（用户按下的）；否则为状态播报种类。 */
+  notice_kind: NoticeKind | null;
+  text: string;
+  /** 槽位标签（"S1"…）；无槽位为 `null`。 */
+  slot_label: string | null;
+}
+
+/** 排队中的一条通知（`DeskSnapshot.notice_queue` 的元素）。 */
+export interface NoticeQueueItemView {
+  /** 排队位置（1 起，1 = 下一个就轮到它）。 */
+  position: number;
+  kind: NoticeKind;
+  /** 展示文本：有动态正文用正文，否则用固定语料。 */
+  text: string;
+  /** 槽位标签（"S1"…）；无槽位为 `null`。 */
+  slot_label: string | null;
+  /** 是否终态播报（前端据此配色：终态=该听完的承诺，进度=状态更新）。 */
+  terminal: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +591,10 @@ export type NoticeKind =
   | "failed"
   | "needs_confirmation"
   | "timed_out"
-  | "lost_contact";
+  | "lost_contact"
+  // ⚠️ 追加在末尾：Rust 侧 `NoticeKind::code()` 即缓存文件名，顺序是契约。
+  | "running_15min"
+  | "results_waiting";
 
 /** 一条语料的缓存状态。 */
 export interface NoticeItemView {
@@ -583,6 +671,19 @@ export interface NoticeEventPayload {
   detail?: string;
 }
 
+/**
+ * `agent-desk-channel` 事件载荷：喇叭正在播什么 + 后面还排着谁。
+ *
+ * ⚠️ 为什么不塞进 `agent-desk-state`：**触发时机不同**。
+ * `agent-desk-state` 由任务状态驱动，而喇叭的占用与排队由**播放动作**驱动 ——
+ * 一次播完、一次抢占、一次入队，都可能发生在任务状态完全没变的时刻。
+ * 等任务状态再变时才通知，队列等待期就是一片死寂（遗留项第 3 条）。
+ */
+export interface ChannelStatePayload {
+  playing: PlayingView | null;
+  notice_queue: NoticeQueueItemView[];
+}
+
 // ---------------------------------------------------------------------------
 // 文本注入（A″：语音打进终端 / TUI 场景）
 // ---------------------------------------------------------------------------
@@ -594,8 +695,12 @@ export interface NoticeEventPayload {
  * 把终端置于 raw mode 直接读按键字节，`Ctrl+V` 在那里是字面量 0x16，会被 TUI
  * 当成自己的快捷键吃掉 —— **粘不进去**。
  *
- * ⚠️ 而终端该用哪一组键**没有统一答案**（本机实测 09-20）：
- * Windows Terminal → `Ctrl+Shift+V`；Git Bash（mintty）→ `Shift+Insert`。
+ * ⚠️ 终端该用哪一组键**没有统一答案**，而且**人手能按 ≠ 程序模拟能生效**。
+ * 本机用程序模拟逐个实测的结论（`text_delivery.rs` 的 `resolve_for_window`）：
+ * Windows Terminal → `Ctrl+Shift+V`；Git Bash（mintty）→ **`Ctrl+V`**。
+ * ⚠️ mintty 那一行是人手 `Shift+Insert` 好好的、但**程序模拟一个键都到不了**
+ * （它读修饰键用泛用 `VK_SHIFT`，注入的 shift 置不上那个位）；mintty 为注入专门留了
+ * `Ctrl+V` 分支。所以**「自动」给 Git Bash 选的是 `Ctrl+V`，不是 `Shift+Insert`**。
  *
  * `auto` 是默认值：由**焦点窗口的类名**自动决定（按实测表选键），不必手动切。
  */
@@ -606,18 +711,18 @@ export const PASTE_STYLE_OPTIONS: { value: PasteStyle; label: string; hint: stri
   {
     value: "auto",
     label: "自动（推荐）",
-    hint: "看当前焦点窗口：Windows Terminal → Ctrl+Shift+V，Git Bash → Shift+Insert，其余（含认不出的终端）→ Ctrl+V",
+    hint: "看焦点窗口：Windows Terminal → Ctrl+Shift+V，Git Bash → Ctrl+V，其余 → Ctrl+V",
   },
-  { value: "ctrl_v", label: "Ctrl+V", hint: "图形界面约定。强制使用，不看焦点窗口" },
+  { value: "ctrl_v", label: "Ctrl+V", hint: "图形界面约定；也是程序模拟在 Git Bash 里唯一有效的那一组" },
   {
     value: "shift_insert",
     label: "Shift+Insert",
-    hint: "Git Bash / mintty 的粘贴键（实测可用）。TUI 程序（codex / vim 等）必须用终端级粘贴",
+    hint: "人手动按在 Git Bash 里有效，但程序模拟发过去无反应 —— 慎选",
   },
   {
     value: "ctrl_shift_v",
     label: "Ctrl+Shift+V",
-    hint: "Windows Terminal 的粘贴键（实测可用，Shift+Insert 在那里不保证能用）",
+    hint: "Windows Terminal 的粘贴键（程序模拟实测可用）",
   },
 ];
 

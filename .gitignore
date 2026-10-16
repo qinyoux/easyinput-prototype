@@ -31,6 +31,7 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+*.env
 *.key
 *.pem
 
@@ -60,6 +61,20 @@ scripts/_probe_out/
 # 不是项目资产；可复用的**工具**（如 cdp_eval.mjs）与**记忆**（memory/）照常入库。
 .workbuddy/shots/
 .workbuddy/watch/
+.workbuddy/backup/
+.workbuddy/forensics/
+.workbuddy/rt.err
+.workbuddy/rt.out
+.workbuddy/fs-full.xml
+.workbuddy/taskdesk_lesson7_update.xml
+
+# 历史发布归档（旧版便携 exe，**不入库**，安装包只挂 GitHub Release）
+release/
+
+# 插件 / 工具内部产物
+plugins/builtin/.workbuddy/
+**/__pycache__/
+*.pyc
 
 # 内容生产流水线的中间产物（飞书文档 API 往返 JSON / 组稿草稿 xml），**不入库**
 # 起因：它们与 easyop 代码无关，且是别的工作流（内容台/飞书）的一次性中间态，

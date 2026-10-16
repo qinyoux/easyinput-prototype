@@ -1,0 +1,147 @@
+=== 01-speak-and-walk-away.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnFseG7y4QL4YlOnzKYZ6Vbg",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "E7EybI5xsodwdsxsiU8cgprlnpb",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 02-light-on-slot-empty.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnx9RCoy5sdt5iN0a4Q1gtah",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "UbmMbjD4iopGDxxywafc28kSnyb",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 03-four-light-states.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnwEtmn7S04EW2jzqmmxoPWz",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "HdyUbDjXeo3f3rxsc9hccg1Dnff",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 04-cache-not-refreshed.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnZz1xSCHSCVUPy9nFn6NFGe",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "I4RibR3ZwoM9P2xQDZ3cIjo8n0e",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 05-data-invisible.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnkroKUUN2brH9Z33hkt5tHc",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "RelqbZtpUoJSSvx8QkzcjbrEnVc",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 06-three-evidence-gates.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnl3bFS3uySCf0d8DQWyjhx1",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "TPlhbE7ShoUNaqxoBlxcmGwtnze",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}
+=== 07-taskdesk-final-ui.png ===
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "block_id": "doxcnVWulRpUCVralFrlu5s1Z6f",
+    "document_id": "NgerdaeZroqs2hxeoV7cLBx7n8e",
+    "file_token": "LUwCb2dljo4oZYx0aSLcaVq5n9f",
+    "height": 507,
+    "type": "image",
+    "width": 760
+  },
+  "_notice": {
+    "update": {
+      "command": "lark-cli update",
+      "current": "1.0.97",
+      "latest": "1.0.98",
+      "message": "lark-cli 1.0.98 available, current 1.0.97, run: lark-cli update"
+    }
+  }
+}

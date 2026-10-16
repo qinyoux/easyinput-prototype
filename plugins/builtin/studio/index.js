@@ -1,7 +1,7 @@
 /**
  * 内容台（studio）—— easyop 的内置插件
  *
- * 定位：easyop 进程内的内容生产工作台。选题台账 → AI 生成（标题 / 正文 / 去 AI 味）
+ * 定位：easyop 进程内的内容生产工作台。选题台账 → AI 生成（标题 / 正文 / 内容优化）
  * → 导出成品包（调 content-publisher 的 pub.py）。台账用 eo.storage 持久化。
  *
  * 形态：单文件 ESM。**必须自包含**——宿主用 `blob:` URL 动态 import，blob 模块
@@ -21,15 +21,14 @@
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 六阶段流转。顺序即推进顺序。 */
-const STAGES = ['inspiration', 'intel', 'body', 'humanized', 'figures', 'exported'];
+/** 五阶段流转。顺序即推进顺序。（「配图」阶段已移除，推进流程只保留实际存在的阶段） */
+const STAGES = ['inspiration', 'intel', 'body', 'humanized', 'exported'];
 
 const STAGE_LABEL = {
   inspiration: '灵感',
   intel: '情报卡',
   body: '正文',
-  humanized: '去AI味',
-  figures: '配图',
+  humanized: '内容优化',
   exported: '已导出',
 };
 
@@ -37,7 +36,6 @@ const STAGE_LABEL = {
 const STAGE_REQUIRE = {
   body: (t) => (t.intel && countIntel(t.intel) >= 3) || null,
   humanized: (t) => (t.body && t.body.trim()) || null,
-  figures: (t) => (t.humanized || t.body || '').trim() || null,
   exported: (t) => (t.humanized || t.body || '').trim() || null,
 };
 
@@ -189,8 +187,11 @@ export function activate(context) {
   context.registerCommand('studio.gen.intel', cmdGenIntel);
   context.registerCommand('studio.gen.all', cmdGenAll);
   context.registerCommand('studio.export', cmdExport);
+  context.registerCommand('studio.publish.html', cmdPublishHtml);
+  context.registerCommand('studio.open.dir', cmdOpenDir);
   context.registerCommand('studio.doctor', cmdDoctor);
   context.registerCommand('studio.quick_action', cmdQuickAction);
+  context.registerCommand('studio.set_focus', cmdSetFocus);
 
   // ── 页签贡献点 ──
   // 契约：docs/路径A-插件页签接口契约.md §三
@@ -254,10 +255,21 @@ function countIntel(intel) {
   return n;
 }
 
+/**
+ * 归一化阶段：兼容已移除的「配图」阶段与非法值。
+ * 历史数据若停在 figures，落到内容等价的 humanized，避免推进时把阶段回退到第一步。
+ */
+function normalizeStage(stage) {
+  if (STAGES.includes(stage)) return stage;
+  if (stage === 'figures') return 'humanized';
+  return STAGES[0];
+}
+
 function nextStage(stage) {
-  const i = STAGES.indexOf(stage);
+  const cur = normalizeStage(stage);
+  const i = STAGES.indexOf(cur);
   if (i < 0) return STAGES[0];
-  if (i >= STAGES.length - 1) return stage;
+  if (i >= STAGES.length - 1) return cur;
   return STAGES[i + 1];
 }
 
@@ -494,7 +506,6 @@ async function cmdStageAdvance(args) {
     const why = {
       body: '情报卡至少要有 3 条内容（角度/事实/金句/风险合计）',
       humanized: '还没有正文',
-      figures: '还没有正文',
       exported: '还没有正文',
     }[target];
     return fail(CODE.STAGE_GUARD, `不能进入「${STAGE_LABEL[target]}」：${why}`);
@@ -617,7 +628,7 @@ async function cmdGenHumanize(args) {
   await refreshPanel();
   return ok(
     { before, after, driftPercent: drift, stage: saved.stage },
-    `已去 AI 味：${before} → ${after} 字（${drift >= 0 ? '+' : ''}${drift}%）`,
+    `已内容优化：${before} → ${after} 字（${drift >= 0 ? '+' : ''}${drift}%）`,
   );
 }
 
@@ -631,7 +642,7 @@ function countCjk(s) {
 }
 
 // ---------------------------------------------------------------------------
-// 命令：生成情报卡 + 一条龙
+// 命令：生成情报卡 + 一键执行
 // ---------------------------------------------------------------------------
 
 /** 从 LLM 输出里提取 JSON（容错：剥代码块包裹、找第一个 { 到最后一个 }）。 */
@@ -681,8 +692,8 @@ async function cmdGenIntel(args) {
 }
 
 /**
- * 一条龙：自动依次跑 生成情报卡 → 生成标题 → 生成正文 → 去AI味。
- * 每步检查前置，失败就停下报原因。到去AI味为止，不含导出。
+ * 一键执行：自动依次跑 生成情报卡 → 生成标题 → 生成正文 → 内容优化。
+ * 每步检查前置，失败就停下报原因。到内容优化为止，不含导出。
  */
 async function cmdGenAll(args) {
   const steps = [];
@@ -702,34 +713,34 @@ async function cmdGenAll(args) {
   // 1. 情报卡不足 → 生成
   if (countIntel(topic.intel) < 3) {
     const r = await run('生成情报卡', () => cmdGenIntel({ id: topic.id }));
-    if (!r.ok) return fail(CODE.LLM_FAILED, `一条龙在「${r.label}」停下：${r.result?.message || '失败'}`);
+    if (!r.ok) return fail(CODE.LLM_FAILED, `一键执行在「${r.label}」停下：${r.result?.message || '失败'}`);
   }
 
   // 2. 没标题 → 生成
   ({ topic } = await resolveCurrent(topic.id));
   if (!(topic.titles || []).length) {
     const r = await run('生成标题', () => cmdGenTitle({ id: topic.id }));
-    if (!r.ok) return fail(CODE.LLM_FAILED, `一条龙在「${r.label}」停下：${r.result?.message || '失败'}`);
+    if (!r.ok) return fail(CODE.LLM_FAILED, `一键执行在「${r.label}」停下：${r.result?.message || '失败'}`);
   }
 
   // 3. 没正文 → 生成
   ({ topic } = await resolveCurrent(topic.id));
   if (!(topic.body || '').trim()) {
     const r = await run('生成正文', () => cmdGenBody({ id: topic.id, wordCount: args && args.wordCount }));
-    if (!r.ok) return fail(CODE.LLM_FAILED, `一条龙在「${r.label}」停下：${r.result?.message || '失败'}`);
+    if (!r.ok) return fail(CODE.LLM_FAILED, `一键执行在「${r.label}」停下：${r.result?.message || '失败'}`);
   }
 
-  // 4. 没去AI味 → 生成
+  // 4. 没内容优化 → 生成
   ({ topic } = await resolveCurrent(topic.id));
   if (!(topic.humanized || '').trim()) {
-    const r = await run('去AI味', () => cmdGenHumanize({ id: topic.id }));
-    if (!r.ok) return fail(CODE.LLM_FAILED, `一条龙在「${r.label}」停下：${r.result?.message || '失败'}`);
+    const r = await run('内容优化', () => cmdGenHumanize({ id: topic.id }));
+    if (!r.ok) return fail(CODE.LLM_FAILED, `一键执行在「${r.label}」停下：${r.result?.message || '失败'}`);
   }
 
   await refreshPanel();
   return ok(
     { steps },
-    `一条龙完成：${steps.join(' → ')}`,
+    `一键执行完成：${steps.join(' → ')}`,
   );
 }
 
@@ -771,21 +782,8 @@ function wrapHtmlShell(title, bodyHtml) {
   ].join('\n');
 }
 
-/** 检测公众号登录态（解析 pub.py status 输出）。 */
-async function checkWechatLogin(paths) {
-  try {
-    const r = await eo.run(paths.pyExe, ['-u', paths.cpPy, 'status'], { timeoutSecs: 30, cwd: paths.cpDir });
-    const out = String((r.stdout || '') + '\n' + (r.stderr || ''));
-    const line = out.split('\n').find((l) => l.includes('微信公众号') || l.includes('wechat'));
-    if (!line) return { ok: false, reason: 'status 输出未包含公众号状态行' };
-    if (line.includes('✓') || line.includes('已登录')) return { ok: true };
-    return { ok: false, reason: line.trim() };
-  } catch (e) {
-    return { ok: false, reason: String(e) };
-  }
-}
-
-/** 调 eo.chat 把正文排版成内联样式 HTML 片段，套进预览外壳。 */
+/** 调 eo.chat 把正文排版成内联样式 HTML 片段，套进预览外壳。
+ *  LLM 不可用时降级到本地零依赖转换器（对齐同一份排版规范），保证平台发布不中断。 */
 async function cmdTypeset(topic) {
   const body = (topic.humanized || topic.body || '').trim();
   if (!body) return { ok: false, html: '', reason: '没有正文' };
@@ -794,6 +792,28 @@ async function cmdTypeset(topic) {
   try {
     fragment = await askLlm(TYPESETTING_SYSTEM, body, { temperature: 0.3 });
   } catch (e) {
+    // 本地兜底：studio_io.py 的 markdown-to-html（零依赖，样式对齐排版规范核心约束）
+    try {
+      const paths = await resolvePaths();
+      const helper = helperPath();
+      if (!helper.startsWith('__')) {
+        const r = await eo.run(
+          paths.pyExe,
+          ['-u', helper, 'markdown-to-html', '--topic-id', topic.id],
+          { timeoutSecs: 30, cwd: paths.cpDir },
+        );
+        const localHtml = String((r.stdout || '')).trim();
+        if (localHtml && localHtml.toLowerCase().includes('<!doctype html')) {
+          return {
+            ok: true,
+            html: localHtml,
+            title,
+            degraded: true,
+            note: `LLM 排版失败（${e.message}），已用本地转换器兜底`,
+          };
+        }
+      }
+    } catch (_) { /* 兜底也失败就如实报 LLM 错误 */ }
     return { ok: false, html: '', reason: `排版 LLM 调用失败：${e.message}` };
   }
   fragment = String(fragment || '')
@@ -871,97 +891,71 @@ async function cmdExport(args) {
     check = { ok: false, exitCode: -1, tail: String(e) };
   }
 
-  // 3) 可选：小红书本地投放包（不开浏览器；公众号走二期）
-  //    注意：小红书要求 ≥1 张配图，缺图时 pub.py 退出码 3——如实上报，不吞。
-  let pack = null;
-  if (a.packXhs) {
-    try {
-      const r = await eo.run(
-        paths.pyExe,
-        ['-u', paths.cpPy, 'pack', 'xhs', '--post', postPath],
-        { timeoutSecs: 120, cwd: paths.cpDir },
-      );
-      pack = unwrapRun(r);
-    } catch (e) {
-      pack = { ok: false, exitCode: -1, tail: String(e) };
-    }
-  }
-
-  // 4) 可选：公众号发布（有授权走自动填草稿，无授权降级生成本地 HTML 投放包）
-  let wechat = null;
-  if (a.publishWechat) {
-    const login = await checkWechatLogin(paths);
-    if (login.ok) {
-      try {
-        const r = await eo.run(
-          paths.pyExe,
-          ['-u', paths.cpPy, 'publish', 'wechat', '--post', postPath, '--headless', '--save-draft'],
-          { timeoutSecs: 300, cwd: paths.cpDir },
-        );
-        const wr = unwrapRun(r);
-        wechat = { mode: 'auto', ok: wr.ok, tail: wr.tail };
-      } catch (e) {
-        wechat = { mode: 'auto', ok: false, tail: String(e) };
-      }
-    } else {
-      // 登录态不可用：降级生成本地 HTML 投放包（排版走 eo.chat + skill 模板规范）
-      const ts = await cmdTypeset(topic);
-      if (ts.ok) {
-        const slug = slugify(topic.chosenTitle || topic.title);
-        const words = countCjk(topic.humanized || topic.body);
-        try {
-          const r = await eo.run(
-            paths.pyExe,
-            ['-u', helper, 'write-html', '--html', ts.html, '--slug', slug, '--title', ts.title, '--word-count', String(words)],
-            { timeoutSecs: 60, cwd: paths.cpDir },
-          );
-          const wr = unwrapRun(r);
-          wechat = { mode: 'html', ok: wr.ok, tail: wr.tail, loginReason: login.reason };
-        } catch (e) {
-          wechat = { mode: 'html', ok: false, tail: String(e), loginReason: login.reason };
-        }
-      } else {
-        wechat = { mode: 'html', ok: false, tail: ts.reason, loginReason: login.reason };
-      }
-    }
-  }
-
   await upsertTopic({ id: topic.id, stage: stageAtLeast(topic.stage, 'exported'), postPath });
   await refreshPanel();
 
   const notes = [`稿件：${postPath}`];
   notes.push(check && check.ok ? '校验：通过' : `校验：未通过（exit=${check ? check.exitCode : '?'}）${check ? ' ' + check.tail : ''}`);
-  if (pack) {
-    notes.push(
-      pack.ok
-        ? '小红书投放包：已生成'
-        : `小红书投放包：未生成（exit=${pack.exitCode}）${pack.tail}`,
-    );
-  }
-  if (wechat) {
-    if (wechat.mode === 'auto') {
-      notes.push(wechat.ok ? '公众号：已自动填入草稿（可到后台点发表）' : `公众号自动填草稿失败：${wechat.tail}`);
-    } else {
-      notes.push(
-        wechat.ok
-          ? `公众号：登录态不可用，已生成本地 HTML 投放包（${wechat.tail}）`
-          : `公众号 HTML 投放包生成失败：${wechat.tail}`,
-      );
-    }
-  }
-  notes.push('导出 ≠ 已发布：小红书图需手动上传；公众号 HTML 需手动粘贴。');
+  notes.push('要发公众号：点「平台发布」，它会直接产出一个排版好的 HTML。');
   return ok(
     {
       postPath,
       checkOk: check ? check.ok : false,
       checkTail: check ? check.tail : '',
-      packOk: pack ? pack.ok : null,
-      packTail: pack ? pack.tail : '',
-      wechatMode: wechat ? wechat.mode : null,
-      wechatOk: wechat ? wechat.ok : null,
-      wechatTail: wechat ? wechat.tail : '',
     },
     notes.join('　'),
+  );
+}
+
+/**
+ * 平台发布：只做一件事——把整理好的内容排版成**一个 HTML 文件**，
+ * 浏览器打开后全选复制粘贴到公众号即可。
+ *
+ * 不再生成 .md 稿件、投放说明、正文.txt、_manifest.json 或任何其他附加文件。
+ */
+async function cmdPublishHtml(args) {
+  const a = args || {};
+  const { topic } = await resolveCurrent(a.id);
+  const paths = await resolvePaths();
+  if (!topic) return fail(CODE.NO_TOPIC, '还没有选题');
+  if (!(topic.humanized || topic.body || '').trim()) {
+    return fail(CODE.STAGE_GUARD, '还没有正文，先走「生成正文」');
+  }
+
+  const helper = helperPath();
+  if (helper.startsWith('__')) {
+    return fail(CODE.NOT_READY, '拿不到插件目录（宿主未提供 pluginDir），无法定位自带脚本');
+  }
+
+  // 1) 调排版 skill（eo.chat + 公众号排版规范）把正文排成内联样式 HTML
+  const ts = await cmdTypeset(topic);
+  if (!ts.ok) return fail(CODE.IO_FAILED, `排版失败：${ts.reason}`);
+
+  // 2) 只落一个 HTML 文件（无 .md / 无投放说明 / 无 manifest）
+  const slug = slugify(topic.chosenTitle || topic.title);
+  const words = countCjk(topic.humanized || topic.body);
+  let w;
+  try {
+    const r = await eo.run(
+      paths.pyExe,
+      ['-u', helper, 'write-html-file', '--html', ts.html, '--slug', slug, '--title', ts.title, '--word-count', String(words)],
+      { timeoutSecs: 60, cwd: paths.cpDir },
+    );
+    w = unwrapRun(r);
+  } catch (e) {
+    return fail(CODE.IO_FAILED, `写 HTML 失败：${e}`);
+  }
+  if (!w.ok) return fail(CODE.IO_FAILED, `写 HTML 失败（exit=${w.exitCode}）：${w.tail}`);
+
+  const htmlPath = extractHtmlPath(w.stdout);
+  if (!htmlPath) return fail(CODE.IO_FAILED, `写 HTML 脚本未返回文件路径，stdout=${w.tail}`);
+
+  await upsertTopic({ id: topic.id, htmlPath, stage: stageAtLeast(topic.stage, 'exported') });
+  await refreshPanel();
+
+  return ok(
+    { htmlPath, degraded: !!ts.degraded, note: ts.note || '' },
+    `已生成公众号 HTML：${htmlPath}${ts.degraded ? `（${ts.note}）` : ''}　用浏览器打开后全选复制，粘贴到公众号即可。`,
   );
 }
 
@@ -988,6 +982,15 @@ function extractPath(stdout) {
   const tagged = s.match(/^POST=(.+)$/m);
   if (tagged) return tagged[1].trim();
   const abs = s.match(/[A-Za-z]:[\\/][^\r\n"']+\.md/);
+  return abs ? abs[0].trim() : '';
+}
+
+/** 从脚本 stdout 里取形如 `HTML=<路径>` 的 HTML 文件路径。 */
+function extractHtmlPath(stdout) {
+  const s = String(stdout || '');
+  const tagged = s.match(/^HTML=(.+)$/m);
+  if (tagged) return tagged[1].trim();
+  const abs = s.match(/[A-Za-z]:[\\/][^\r\n"']+\.html/);
   return abs ? abs[0].trim() : '';
 }
 
@@ -1061,11 +1064,66 @@ async function cmdQuickAction({ action } = {}) {
     case 'studio_wechat': {
       const meta = await loadMeta();
       if (!meta.currentId) return fail(CODE.NOT_READY, '没有当前选题');
-      return cmdExport({ id: meta.currentId, publishWechat: true });
+      return cmdPublishHtml({ id: meta.currentId });
     }
     default:
       return fail(CODE.BAD_ARGS, `未知动作：${action}`);
   }
+}
+
+/**
+ * 打开「文件实际生成的目录本身」（用 eo.run 调 explorer）。
+ *
+ * 定位优先级：平台发布产出的 HTML > 导出产出的 .md —— 即最近一次真实落盘的产物。
+ * 打开的是该文件所在的目录（不是它的上一级目录）。
+ */
+async function cmdOpenDir(args) {
+  const a = args || {};
+  const { topic } = await resolveCurrent(a.id);
+  if (!topic) return fail(CODE.NO_TOPIC, '还没有选题');
+  // 定位最近一次真实落盘的产物：平台发布的 HTML > 导出的 .md
+  const target = topic.htmlPath || topic.postPath;
+  if (!target) return fail(CODE.NOT_READY, '还没有生成过文件，先点「平台发布」或「导出」');
+
+  const win = String(target).replace(/\//g, '\\');
+  const slashIdx = win.lastIndexOf('\\');
+  if (slashIdx < 0) return fail(CODE.BAD_ARGS, `路径格式异常：${target}`);
+  const dir = win.slice(0, slashIdx);
+
+  try {
+    // /select 必须是【两个独立参数】：['/select,', '<反斜杠路径>']。
+    // 踩过的坑：写成单个字符串 '/select,"C:\\path"' 时，runner 的 argv 转义会把
+    // 含空格的串二次包引号，explorer 拿到畸形命令行 → 解析失败 → 打开「此电脑」。
+    // 反斜杠同样必须：explorer 只认反斜杠，正斜杠会被当相对路径落到上层。
+    // 此写法与 easyop 核心 open_containing_folder（ss_palette.rs）完全一致。
+    await eo.run('explorer.exe', ['/select,', win], { timeoutSecs: 15 });
+    return ok({ dir, file: target }, `已定位到文件所在目录：${dir}`);
+  } catch (e) {
+    // 兜底：直接打开目录本身（照 easyop 核心 open_log_dir 的官方写法）
+    try {
+      await eo.run('explorer.exe', [dir], { timeoutSecs: 15 });
+      return ok({ dir, file: target }, `已打开：${dir}`);
+    } catch (e2) {
+      return fail(CODE.IO_FAILED, `打开目录失败：${e2}`);
+    }
+  }
+}
+
+/**
+ * 旋钮焦点切换：高亮面板上对应的功能按钮。
+ * 由前端 App.tsx 收到 studio-focus 事件后调 invokePluginCommand 触发。
+ * index 对应 STUDIO_ACTION_IDS：0=新建选题 1=一键执行 2=推进阶段 3=导出 4=平台发布
+ */
+async function cmdSetFocus({ index } = {}) {
+  if (index === undefined || index === null) return fail(CODE.BAD_ARGS, '缺少 index');
+  for (const view of allViews()) {
+    if (!view || !view.ui || !view.ui.root) continue;
+    const btns = view.ui.root.querySelectorAll('[data-studio-focus]');
+    btns.forEach((b) => b.classList.remove('studio-focused'));
+    const target = view.ui.root.querySelector(`[data-studio-focus="${index}"]`);
+    if (target) target.classList.add('studio-focused');
+  }
+  return ok({ index }, `焦点 → ${index}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,11 +1155,23 @@ function buildView(container) {
       <button class="sp-help-btn" data-sp="help" title="使用说明">?</button>
     </div>
     <div class="sp-bar">
-      <button class="sp-btn sp-btn-accent" data-sp="new">＋ 新建选题</button>
+      <button class="sp-btn sp-btn-accent" data-sp="new" data-studio-focus="0">＋ 新建选题</button>
       <input class="sp-input" data-sp="newtitle" placeholder="选题标题（可留空，用选中文本）" />
     </div>
-    <div class="sp-list" data-sp="list"></div>
-    <div class="sp-detail" data-sp="detail"></div>
+    <div class="sp-split" data-sp="split">
+      <div class="sp-list-pane" data-sp="listPane">
+        <div class="sp-list-head">
+          <span class="sp-list-title">选题</span>
+          <button class="sp-collapse-btn" data-sp="collapseList" title="折叠 / 展开选题栏">⟨⟩</button>
+        </div>
+        <div class="sp-list" data-sp="list"></div>
+      </div>
+      <div class="sp-splitter" data-sp="splitter" title="拖拽调整宽度"></div>
+      <div class="sp-detail-pane" data-sp="detailPane">
+        <div class="sp-acts-bar" data-sp="actsBar"></div>
+        <div class="sp-detail" data-sp="detail"></div>
+      </div>
+    </div>
     <div class="sp-foot" data-sp="status">就绪</div>
     <div class="sp-help-mask" data-sp="helpMask" style="display:none">
       <div class="sp-help-card">
@@ -1110,27 +1180,39 @@ function buildView(container) {
           <button class="sp-help-close" data-sp="helpClose">✕</button>
         </div>
         <div class="sp-help-body">
-          <h3>六阶段流程</h3>
-          <p class="sp-help-flow">灵感 → 情报卡 → 正文 → 去AI味 → 配图 → 已导出</p>
-          <p>每个阶段有准入校验：进「正文」要情报卡 ≥3 条；进「去AI味」要有正文。缺前置会报错，不静默跳过。</p>
+          <h3>五阶段流程</h3>
+          <p class="sp-help-flow">灵感 → 情报卡 → 正文 → 内容优化 → 已导出</p>
+          <p>每个阶段有准入校验：进「正文」要情报卡 ≥3 条；进「内容优化」要有正文。缺前置会报错，不静默跳过。</p>
           <h3>按钮说明</h3>
           <ul>
-            <li><b>一条龙</b>：自动依次跑 情报卡→标题→正文→去AI味，中途失败可重试（跳过已完成的步骤）</li>
+            <li><b>一键执行</b>：自动依次跑 情报卡→标题→正文→内容优化，中途失败可重试（跳过已完成的步骤）</li>
             <li><b>生成情报卡</b>：根据选题标题生成四板块（角度/事实/金句/风险）</li>
             <li><b>生成标题</b>：生成 3 个标题候选，点选其一</li>
             <li><b>生成正文</b>：基于情报卡生成正文，可在「字数」框设置目标字数（默认 500）</li>
-            <li><b>去 AI 味</b>：把正文改写得更像人写的，并报字数漂移</li>
+            <li><b>内容优化</b>：把正文改写得更像人写的，并报字数漂移</li>
             <li><b>推进阶段</b>：手动推进到下一阶段（带准入校验）</li>
-            <li><b>导出</b>：组稿 → pub.py check 校验</li>
-            <li><b>+小红书包</b>：导出 + 打小红书投放包（需配图，当前会因缺图失败）</li>
-            <li><b>+公众号</b>：导出 + 尝试自动填公众号草稿（登录态失效则生成 HTML 供手动粘贴）</li>
+            <li><b>导出</b>：组稿成 .md → pub.py check 校验</li>
+            <li><b>平台发布</b>：把整理好的内容排版成<b>一个 HTML 文件</b>，浏览器打开全选复制粘贴到公众号即可（不生成 .md / 投放说明等任何附加文件）</li>
             <li><b>自检</b>：检查 Python / pub.py / 自带脚本是否就位</li>
             <li><b>删除</b>：删除当前选题</li>
           </ul>
           <h3>字数设置</h3>
-          <p>动作区的「字数」输入框设置正文目标字数，默认 500。点「生成正文」或「一条龙」时生效。</p>
+          <p>动作区的「字数」输入框设置正文目标字数，默认 500。点「生成正文」或「一键执行」时生效。</p>
           <h3>选题列表</h3>
-          <p>上方列表展示所有选题，点击切换。新建时可手填标题，或留空自动取选中文本。</p>
+          <p>上方列表展示所有选题，点击切换。新建时可手填标题，或留空自动取选中文本。点「浮窗查看/编辑」可在独立浮窗里看全量内容并直接改。</p>
+        </div>
+      </div>
+    </div>
+    <div class="sp-modal-mask" data-sp="modalMask">
+      <div class="sp-modal">
+        <div class="sp-modal-head">
+          <h3 data-sp="modalTitle">选题详情 · 查看 / 编辑</h3>
+          <button class="sp-modal-close" data-sp="modalClose" title="关闭">✕</button>
+        </div>
+        <div class="sp-modal-body" data-sp="modalBody"></div>
+        <div class="sp-modal-actions">
+          <button class="sp-btn" data-sp="modalCancel">取消</button>
+          <button class="sp-btn sp-btn-accent" data-sp="modalSave">保存修改</button>
         </div>
       </div>
     </div>
@@ -1249,9 +1331,37 @@ function buildView(container) {
     .studio-panel .sp-btn[disabled]{opacity:.35;cursor:default;border-color:var(--sp-btn-dis-bd);
       box-shadow:none;background:var(--sp-btn-dis-bg);}
     .studio-panel .sp-btn-accent{border-color:var(--sp-btn-acc-bd);background:var(--sp-btn-acc-bg);}
-    .studio-panel .sp-btn-accent:hover{border-color:var(--sp-btn-acc-hv-bd);box-shadow:var(--sp-btn-acc-hv-sh);}
-    .studio-panel .sp-list{max-height:200px;overflow:auto;display:flex;flex-direction:column;gap:5px;
-      position:relative;z-index:1;}
+     .studio-panel .sp-btn-accent:hover{border-color:var(--sp-btn-acc-hv-bd);box-shadow:var(--sp-btn-acc-hv-sh);}
+     .studio-panel .sp-btn.studio-focused{border-color:var(--sp-acc);box-shadow:0 0 12px var(--sp-acc-glow);background:var(--sp-card-bg);outline:none;}
+    .studio-panel .sp-split{flex:1;min-height:0;display:flex;position:relative;z-index:1;gap:0;}
+    .studio-panel .sp-list-pane{display:flex;flex-direction:column;min-width:140px;width:280px;max-width:72%;
+      overflow:hidden;border:1px solid var(--sp-card-bd);border-radius:10px;background:var(--sp-card-bg);}
+    .studio-panel .sp-list-pane.is-collapsed{width:34px!important;min-width:34px!important;max-width:34px!important;}
+    .studio-panel .sp-list-pane.is-collapsed .sp-list-title,
+    .studio-panel .sp-list-pane.is-collapsed .sp-list{display:none;}
+    .studio-panel .sp-list-head{display:flex;align-items:center;justify-content:space-between;
+      padding:6px 8px;border-bottom:1px solid var(--sp-card-bd);}
+    .studio-panel .sp-list-title{font-size:12px;font-weight:600;color:var(--sp-card-h4-c);white-space:nowrap;}
+    .studio-panel .sp-collapse-btn{cursor:pointer;background:none;border:1px solid var(--sp-btn-bd);
+      border-radius:6px;color:var(--sp-text-dim);font:inherit;font-size:12px;padding:1px 6px;line-height:1.4;transition:all .2s;}
+    .studio-panel .sp-collapse-btn:hover{border-color:var(--sp-btn-hv-bd);color:var(--sp-text);}
+    .studio-panel .sp-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:5px;
+      padding:6px;position:relative;z-index:1;}
+    .studio-panel .sp-splitter{flex:0 0 6px;cursor:col-resize;background:transparent;position:relative;margin:0 1px;}
+    .studio-panel .sp-splitter:hover,.studio-panel .sp-splitter.is-drag{background:var(--sp-ac2);opacity:.45;}
+    .studio-panel .sp-detail-pane{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;}
+    .studio-panel .sp-detail-head{display:flex;flex-direction:column;gap:3px;padding:6px 2px 8px;border-bottom:1px solid var(--sp-card-bd);margin-bottom:6px;}
+    .studio-panel .sp-detail-title{font-size:15px;font-weight:600;color:var(--sp-text);line-height:1.35;word-break:break-word;}
+    .studio-panel .sp-detail-meta{font-size:11px;color:var(--sp-text-dim);}
+    .studio-panel .sp-float-btn{align-self:flex-start;margin-top:4px;}
+    .studio-panel .sp-acts-bar{display:flex;flex-wrap:wrap;gap:5px;align-items:center;
+      padding:4px 2px 8px;border-bottom:1px solid var(--sp-card-bd);}
+    .studio-panel .sp-detail{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px;
+      padding-right:2px;position:relative;z-index:1;}
+    .studio-panel .sp-card h4{cursor:pointer;user-select:none;}
+    .studio-panel .sp-card h4::after{content:'▾';margin-left:auto;font-size:10px;color:var(--sp-text-dim);transition:transform .2s;}
+    .studio-panel .sp-card.is-collapsed h4::after{transform:rotate(-90deg);}
+    .studio-panel .sp-card.is-collapsed > *:not(h4){display:none;}
     .studio-panel .sp-item{display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;
       background:var(--sp-item-bg);border:1px solid var(--sp-item-bd);border-radius:8px;transition:all .2s;}
     .studio-panel .sp-item:hover{border-color:var(--sp-item-hv-bd);background:var(--sp-item-hv-bg);}
@@ -1275,8 +1385,8 @@ function buildView(container) {
     .studio-panel .sp-chip.is-on{border-color:var(--sp-chip-on-bd);color:var(--sp-chip-on-c);
       background:var(--sp-chip-on-bg);box-shadow:var(--sp-chip-on-sh);}
     .studio-panel .sp-acts{display:flex;flex-wrap:wrap;gap:5px;align-items:center;}
-    .studio-panel .sp-wc{display:flex;align-items:center;gap:3px;font-size:11px;color:var(--sp-text-dim);}
-    .studio-panel .sp-wc-input{width:52px;text-align:center;}
+    .studio-panel .sp-wc{flex:0 0 auto;display:flex;align-items:center;gap:4px;font-size:11px;color:var(--sp-text-dim);white-space:nowrap;}
+    .studio-panel .sp-wc-input{flex:0 0 64px;width:64px!important;text-align:center;padding:4px 6px;}
     .studio-panel .sp-foot{font-size:11.5px;color:var(--sp-text-dim);min-height:28px;
       white-space:pre-wrap;word-break:break-word;position:relative;z-index:1;padding:0 2px;}
     .studio-panel .sp-foot.is-err{color:var(--sp-err);}
@@ -1302,6 +1412,28 @@ function buildView(container) {
     .studio-panel .sp-help-body b{color:var(--sp-help-b-c);}
     .studio-panel .sp-help-flow{color:var(--sp-flow-c);font-weight:500;
       background:var(--sp-flow-bg);border-radius:8px;padding:6px 10px;border:1px solid var(--sp-flow-bd);}
+    .studio-panel .sp-modal-mask{position:fixed;inset:0;z-index:10000;display:none;
+      background:var(--sp-mask-bg);backdrop-filter:blur(4px);
+      align-items:flex-start;justify-content:center;padding:32px 16px;overflow:auto;}
+    .studio-panel .sp-modal-mask.is-open{display:flex;}
+    .studio-panel .sp-modal{max-width:780px;width:100%;max-height:86vh;overflow:auto;
+      border:1px solid var(--sp-help-bd);border-radius:14px;background:var(--sp-help-bg);
+      box-shadow:var(--sp-help-sh);padding:16px 18px;}
+    .studio-panel .sp-modal-head{display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+    .studio-panel .sp-modal-head h3{margin:0;font-size:15px;color:var(--sp-text);flex:1;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .studio-panel .sp-modal-close{cursor:pointer;background:none;border:1px solid var(--sp-input-bd);
+      color:var(--sp-text-dim);border-radius:8px;width:30px;height:30px;font-size:14px;transition:all .2s;}
+    .studio-panel .sp-modal-close:hover{color:var(--sp-err);border-color:var(--sp-err);}
+    .studio-panel .sp-field{margin-bottom:11px;}
+    .studio-panel .sp-field>label{display:block;font-size:12px;color:var(--sp-text-dim);margin-bottom:4px;}
+    .studio-panel .sp-field textarea,.studio-panel .sp-field input{width:100%;box-sizing:border-box;
+      background:var(--sp-input-bg);color:var(--sp-text);border:1px solid var(--sp-input-bd);
+      border-radius:8px;padding:7px 9px;font:inherit;font-size:13px;line-height:1.55;resize:vertical;min-height:36px;}
+    .studio-panel .sp-field textarea:focus,.studio-panel .sp-field input:focus{outline:none;
+      border-color:var(--sp-input-foc-bd);box-shadow:var(--sp-input-foc-sh);}
+    .studio-panel .sp-modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:4px;}
+    .studio-panel .sp-detail-empty{color:var(--sp-text-dim);font-size:13px;padding:14px 2px;}
   `;
   document.head.appendChild(style);
   container.appendChild(root);
@@ -1316,6 +1448,15 @@ function buildView(container) {
     status: q('status'),
     newtitle: q('newtitle'),
     helpMask: q('helpMask'),
+    actsBar: q('actsBar'),
+    listPane: q('listPane'),
+    splitter: q('splitter'),
+    modalMask: q('modalMask'),
+    modalTitle: q('modalTitle'),
+    modalBody: q('modalBody'),
+    modalClose: q('modalClose'),
+    modalCancel: q('modalCancel'),
+    modalSave: q('modalSave'),
   };
   const view = { root, style, ui };
 
@@ -1355,6 +1496,125 @@ function buildView(container) {
       return r;
     });
   });
+
+  // 选题栏折叠（点击 ⟨⟩ 收起/展开左侧）
+  const collapseBtn = q('collapseList');
+  if (collapseBtn && ui.listPane) {
+    collapseBtn.addEventListener('click', () => {
+      ui.listPane.classList.toggle('is-collapsed');
+    });
+  }
+
+  // 分栏拖拽：拖动中间竖条手动调选题栏宽度
+  const splitter = ui.splitter;
+  const splitEl = q('split');
+  if (splitter && splitEl && ui.listPane) {
+    let dragging = false;
+    const onMove = (e) => {
+      if (!dragging) return;
+      const rect = splitEl.getBoundingClientRect();
+      let w = e.clientX - rect.left - 4;
+      const min = 140;
+      const max = rect.width * 0.72;
+      if (w < min) w = min;
+      if (w > max) w = max;
+      ui.listPane.style.width = w + 'px';
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      splitter.classList.remove('is-drag');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    splitter.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      dragging = true;
+      splitter.classList.add('is-drag');
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    });
+  }
+
+  // 卡片折叠：点卡片标题收起/展开该栏目（便于聚焦）
+  if (ui.detail) {
+    ui.detail.addEventListener('click', (e) => {
+      const h4 = e.target.closest('h4');
+      if (!h4 || !h4.closest('.sp-card')) return;
+      const card = h4.closest('.sp-card');
+      if (card) card.classList.toggle('is-collapsed');
+    });
+  }
+
+  // 浮窗：查看 / 编辑当前选题全量内容（长正文不再挤占主区）
+  const modal = ui.modalMask;
+  let modalTopicId = null;
+  const closeModal = () => { if (modal) modal.classList.remove('is-open'); };
+
+  const modalFields = () => {
+    const out = {};
+    if (!ui.modalBody) return out;
+    ui.modalBody.querySelectorAll('[data-fname]').forEach((el) => {
+      const k = el.dataset.fname;
+      let v = el.value;
+      if (k === 'titles') v = v.split('\n').map((s) => s.trim()).filter(Boolean);
+      out[k] = v;
+    });
+    return out;
+  };
+
+  const openTopicModal = (topic) => {
+    if (!modal || !topic) return;
+    modalTopicId = topic.id;
+    if (ui.modalTitle) ui.modalTitle.textContent = `选题详情 · ${topic.chosenTitle || topic.title || '未命名'}`;
+    const intel = topic.intel || {};
+    const intelRaw = topic.intelRaw
+      || [
+          `角度：${(intel.angle || []).join('；') || '—'}`,
+          `事实：${(intel.fact || []).join('；') || '—'}`,
+          `金句：${(intel.quote || []).join('；') || '—'}`,
+          `风险：${(intel.risk || []).join('；') || '—'}`,
+        ].join('\n');
+    const mk = (label, name, val, rows) => {
+      const f = document.createElement('div');
+      f.className = 'sp-field';
+      const l = document.createElement('label');
+      l.textContent = label;
+      const el = document.createElement(rows ? 'textarea' : 'input');
+      el.value = val == null ? '' : String(val);
+      el.dataset.fname = name;
+      if (rows) el.rows = rows;
+      f.appendChild(l);
+      f.appendChild(el);
+      return f;
+    };
+    const body = ui.modalBody;
+    body.innerHTML = '';
+    body.appendChild(mk('标题（选题主题）', 'title', topic.title || ''));
+    body.appendChild(mk('选定标题', 'chosenTitle', topic.chosenTitle || ''));
+    body.appendChild(mk('标题候选（每行一个）', 'titles', (topic.titles || []).join('\n'), 3));
+    body.appendChild(mk('情报卡（原始，可编辑）', 'intelRaw', intelRaw, 8));
+    body.appendChild(mk('正文', 'body', topic.body || '', 10));
+    body.appendChild(mk('内容优化后', 'humanized', topic.humanized || '', 10));
+    modal.classList.add('is-open');
+  };
+
+  if (modal) {
+    ui.modalClose.addEventListener('click', closeModal);
+    ui.modalCancel.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+    ui.modalSave.addEventListener('click', () => {
+      if (!modalTopicId) return;
+      const fields = modalFields();
+      runUi('保存浮窗修改', async () => {
+        await upsertTopic({ id: modalTopicId, ...fields });
+        await refreshPanel();
+        closeModal();
+        return ok({ id: modalTopicId }, '已保存浮窗修改');
+      });
+    });
+  }
+  ui.openTopicModal = openTopicModal;
 
   return view;
 }
@@ -1421,7 +1681,7 @@ async function refreshPanel() {
   for (const view of views) {
     const ui = view.ui;
 
-    ui.stage.textContent = cur ? STAGE_LABEL[cur.stage] || cur.stage : '空台账';
+    ui.stage.textContent = cur ? STAGE_LABEL[normalizeStage(cur.stage)] || cur.stage : '空台账';
 
     ui.list.innerHTML = '';
     if (!list.length) {
@@ -1439,7 +1699,7 @@ async function refreshPanel() {
       a.title = t.title || '';
       const b = document.createElement('span');
       b.className = 'sp-s';
-      b.textContent = STAGE_LABEL[t.stage] || t.stage;
+      b.textContent = STAGE_LABEL[normalizeStage(t.stage)] || t.stage;
       row.appendChild(a);
       row.appendChild(b);
       row.addEventListener('click', () => {
@@ -1455,12 +1715,35 @@ async function refreshPanel() {
     }
 
     ui.detail.innerHTML = '';
+    if (ui.actsBar) ui.actsBar.innerHTML = '';
     // 注意是 continue 不是 return —— 一个视图没有当前选题，不能把其余视图一起跳过。
     if (!cur) continue;
 
-    const sec = (title, body) => {
+    // 顶部紧凑信息条：选定标题 + 阶段/来源 + 浮窗入口（长文不再挤占主区）
+    const head = document.createElement('div');
+    head.className = 'sp-detail-head';
+    const ht = document.createElement('div');
+    ht.className = 'sp-detail-title';
+    ht.textContent = cur.chosenTitle || cur.title || '未命名';
+    const hmeta = document.createElement('div');
+    hmeta.className = 'sp-detail-meta';
+    hmeta.textContent = [
+      `阶段：${STAGE_LABEL[normalizeStage(cur.stage)] || cur.stage || '—'}`,
+      cur.source ? `来源：${cur.source}` : '',
+      cur.postPath ? '已导出' : '',
+    ].filter(Boolean).join(' · ');
+    const floatBtn = document.createElement('button');
+    floatBtn.className = 'sp-btn sp-btn-accent sp-float-btn';
+    floatBtn.textContent = '🗔 浮窗查看/编辑';
+    floatBtn.addEventListener('click', () => { if (ui.openTopicModal) ui.openTopicModal(cur); });
+    head.appendChild(ht);
+    head.appendChild(hmeta);
+    head.appendChild(floatBtn);
+    ui.detail.appendChild(head);
+
+    const sec = (title, body, collapsed) => {
       const d = document.createElement('div');
-      d.className = 'sp-card';
+      d.className = 'sp-card' + (collapsed ? ' is-collapsed' : '');
       const h = document.createElement('h4');
       h.textContent = title;
       const p = document.createElement('p');
@@ -1502,33 +1785,29 @@ async function refreshPanel() {
     ui.detail.appendChild(tsec);
 
     const intel = cur.intel || {};
-    sec(
-      `情报卡（${countIntel(intel)} 条）`,
-      [
-        `角度：${(intel.angle || []).join('；') || '—'}`,
-        `事实：${(intel.fact || []).join('；') || '—'}`,
-        `金句：${(intel.quote || []).join('；') || '—'}`,
-        `风险：${(intel.risk || []).join('；') || '—'}`,
-      ].join('\n'),
-    );
-    if (cur.body) sec(`正文（${countCjk(cur.body)} 字）`, cur.body.slice(0, 300) + (cur.body.length > 300 ? '\n…' : ''));
-    if (cur.humanized) sec(`去 AI 味后（${countCjk(cur.humanized)} 字）`, cur.humanized.slice(0, 240) + (cur.humanized.length > 240 ? '\n…' : ''));
+    const intelHas = countIntel(intel) > 0;
+    const intelText = intelHas
+      ? [
+          `角度：${(intel.angle || []).join('；') || '—'}`,
+          `事实：${(intel.fact || []).join('；') || '—'}`,
+          `金句：${(intel.quote || []).join('；') || '—'}`,
+          `风险：${(intel.risk || []).join('；') || '—'}`,
+        ].join('\n')
+      : (cur.intelRaw || '（暂无情报卡）');
+    sec(`情报卡（${intelHas ? countIntel(intel) + ' 条' : '原始'}）`, intelText, true);
+    if (cur.body) sec(`正文（${countCjk(cur.body)} 字）`, cur.body.slice(0, 300) + (cur.body.length > 300 ? '\n…' : ''), true);
+    if (cur.humanized) sec(`内容优化后（${countCjk(cur.humanized)} 字）`, cur.humanized.slice(0, 240) + (cur.humanized.length > 240 ? '\n…' : ''), true);
 
-    // 动作区
-    const actCard = document.createElement('div');
-    actCard.className = 'sp-card';
-    const actH = document.createElement('h4');
-    actH.textContent = '动作';
-    actCard.appendChild(actH);
-    const acts = document.createElement('div');
-    acts.className = 'sp-acts';
-    const act = (label, fn, disabled) => {
+    // 动作区（置顶常驻工具条，不再沉到详情底部）
+    const actsBar = ui.actsBar;
+    const act = (label, fn, disabled, focusIdx) => {
       const b = document.createElement('button');
       b.className = 'sp-btn';
       b.textContent = label;
+      if (focusIdx !== undefined) b.setAttribute('data-studio-focus', String(focusIdx));
       if (disabled) b.disabled = true;
       else b.addEventListener('click', () => runUi(label, fn));
-      acts.appendChild(b);
+      if (actsBar) actsBar.appendChild(b);
     };
     // 字数设置
     const wcBox = document.createElement('span');
@@ -1541,24 +1820,23 @@ async function refreshPanel() {
     wcInput.title = '正文目标字数';
     wcInput.style.width = '52px';
     wcBox.appendChild(wcInput);
-    acts.appendChild(wcBox);
+    if (actsBar) actsBar.appendChild(wcBox);
     const getWc = () => {
       const v = parseInt(wcInput.value, 10);
       return v > 0 ? v : 500;
     };
-    act('一条龙', () => cmdGenAll({ id: cur.id, wordCount: getWc() }));
+    act('一键执行', () => cmdGenAll({ id: cur.id, wordCount: getWc() }), false, 1);
     act('生成情报卡', () => cmdGenIntel({ id: cur.id }));
     act('生成标题', () => cmdGenTitle({ id: cur.id }));
     act('生成正文', () => cmdGenBody({ id: cur.id, wordCount: getWc() }), countIntel(cur.intel) < 3);
-    act('去 AI 味', () => cmdGenHumanize({ id: cur.id }), !(cur.body || '').trim());
-    act('推进阶段', () => cmdStageAdvance({ id: cur.id }));
-    act('导出', () => cmdExport({ id: cur.id }), !(cur.humanized || cur.body || '').trim());
-    act('+小红书包', () => cmdExport({ id: cur.id, packXhs: true }), !(cur.humanized || cur.body || '').trim());
-    act('+公众号', () => cmdExport({ id: cur.id, publishWechat: true }), !(cur.humanized || cur.body || '').trim());
+    act('内容优化', () => cmdGenHumanize({ id: cur.id }), !(cur.body || '').trim());
+    act('推进阶段', () => cmdStageAdvance({ id: cur.id }), false, 2);
+    act('导出', () => cmdExport({ id: cur.id }), !(cur.humanized || cur.body || '').trim(), 3);
+    act('平台发布', () => cmdPublishHtml({ id: cur.id }), !(cur.humanized || cur.body || '').trim(), 4);
     act('自检', () => cmdDoctor());
     act('删除', () => cmdTopicsRemove({ id: cur.id }));
-    actCard.appendChild(acts);
-    ui.detail.appendChild(actCard);
+    // 打开「文件实际生成的目录本身」
+    act('打开目录', () => cmdOpenDir({ id: cur.id }), !(cur.htmlPath || cur.postPath));
   }
 }
 

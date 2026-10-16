@@ -21,7 +21,9 @@ pub fn validate_action(action: &ActionSpec, input: &str) -> Result<(), String> {
     match action {
         ActionSpec::Disabled => Ok(()),
         ActionSpec::Named(name) => {
-            if !NAMED_ACTIONS.contains(&name.as_str()) {
+            if !NAMED_ACTIONS.contains(&name.as_str())
+                && !crate::plugin_registry::is_plugin_action(&name)
+            {
                 return Err(format!(
                     "「{input}」的具名动作「{name}」不在固件词表中"
                 ));
@@ -44,6 +46,14 @@ pub fn validate_action(action: &ActionSpec, input: &str) -> Result<(), String> {
                 ));
             }
             Ok(())
+        }
+        ActionSpec::Studio(v) => {
+            match v.as_str() {
+                "prev" | "next" | "confirm" => Ok(()),
+                _ => Err(format!(
+                    "「{input}」的内容台动作非法（应为 prev / next / confirm，实际 {v:?}）"
+                )),
+            }
         }
     }
 }

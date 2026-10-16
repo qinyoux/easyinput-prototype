@@ -1,135 +1,112 @@
-# easyop 项目长期记忆（精简版）
+# easyop 项目长期记忆
 
-> 仅保留跨会话有效的事实；逐次过程写每日日志。
+> 仅保留跨会话有效事实；逐次过程写每日工作日志。
 
-## 启动与真机联调
-- 调试需同时后台运行 Vite（1420）和 `src-tauri/target/debug/easyop.exe`；debug 前端依赖 `devUrl`，无 Vite 会白屏。
-- Vite 清缓存可能触发批量删除保护；目标仅限 `node_modules/.vite/deps`。
-- CDP 选择主窗口使用 URL 正则 `~^http://localhost:1420/$`。
-- TTS 配置在 `%APPDATA%\com.easyop.app\agent_desk.json` 的 `tts` 段；`config.json` 不含 TTS。Volc 的资源头取 `resource_id`，忽略百炼专用 `model`（展示/日志一律走 `active_model()`，见下文「配置字段的按分支才生效陷阱」）。
-- HID 枚举返回全部设备，VID/PID 校验在打开阶段；蓝牙在线不等于 USB Feature Report 配置通道可用。
-- `desk_tts_test` 只合成并保存 WAV，不播放。2026-09-24 真机验证双向流式 TTS 可用：48 kHz、229404 采样、4779 ms 音频、16 帧/13 句、墙钟 1389 ms。
-- 有运行实例时 `cargo build` 可能 LNK1104；不要强杀用户实例。
+## 核心架构与任务台
+- 硬件按键/页面按钮统一进入 `agent_desk::dispatch_task → resolve_driver → dispatch_into → pump_slot`；队列、完成判定、门禁、历史、播报、续接集中在此链路。
+- 同槽严格串行、跨槽并行，默认超时 180 s，CLI 预置可用 900 s，最大深度 8。完成信号分 High/Medium，`evidence_cmd` 可升 High；世界门禁仅在基础执行成功后运行。
+- `pump_slot` 顺序依赖：认领→执行→终态→播报→结果留存→历史/产物→会话回写。播报早于历史落盘，前端历史用低频轮询。
+- 历史在 `output_dir()/tasks/`，`index.jsonl` + 单任务日志，保留 200 条；产物按任务开始时间和 glob 判定。
+- 运行时灯态必须使用后端纯函数 `LightState::from_queue`，前端只做颜色映射；running 用橙色，backlog 表示有积压但无人运行。
+- 未读语义不可混用：`desk_ack_playback` 表示听完并递减；`desk_discard_unread` 表示用户主动放弃并清零。任何自动流程不得丢弃未读。
 
-## 任务台核心架构
-- 硬件按键与页面按钮统一进入 `agent_desk::dispatch_task → resolve_driver → dispatch_into → pump_slot`；队列、完成判定、门禁、历史、播报、续接均在此链路。
-- 原“向当前终端投命令”的出口已于 v0.35.0 删除；`delivery.rs` 仅供“启动终端”等待前台使用，`submit_after_paste` 也只影响该路径。
-- `pump_slot` 顺序有依赖：认领→执行→终态→播报→留存结果→历史/产物→会话回写。播报早于历史落盘，前端历史用低频轮询，不能在播报回调立即拉取。
-- 默认超时 180 s，CLI 预置应自设更长超时（当前 900 s）；同槽严格串行、跨槽并行，最大深度 8。
-- 完成信号：HTTP 流结束/日志模式为 High；进程 0 退出/异步轮询为 Medium；`evidence_cmd` 可升 High。世界门禁只在基础执行成功后运行，可把成功翻为失败。
-- Codex 续接使用 argv `resume <id>`，Windows 可执行名必须是 `codex.cmd`。
-- 历史位于 `output_dir()/tasks/`：`index.jsonl` + 单任务日志，保留 200 条，先写日志再写索引。
-- 产物判据：mtime 不早于任务开始 + 可选 glob；glob 匹配相对工作目录，`*` 不跨目录、`**` 可跨。`artifact_open` 默认 true；排序为 mtime 降序、路径升序以保证可复现。
-- 播报支持 `Corpus/Text/Summarize`；二次总结必须在通知后台任务中执行，不能阻塞槽位。
-- 默认执行器：doubao-api（启用）、codex-cli、dsh。
-- **运行时三态灯**（v0.39.3）：`RuntimeSnapshot.light = idle|running|backlog`，判据是
-  `state.rs` 的**纯函数** `LightState::from_queue`，**前端只做颜色映射**（`LIGHT_UI`）。
-  ⛔ 不许前端从 `busy`/`idle`/`total_pending` 自己推 —— 那是第二份判据，会静默不一致。
-  `backlog`（有积压却没人跑）＝原先"`busy==false` 且 `idle==false`"的组合。
-  `running` 用橙（`--accent`）**不用红**：红＝"坏了"，而"在跑"是最正常的时刻。
-  ⚠️ 动画光晕色走 `--glow-rgb` 按档位切换，**keyframes 里不能写死** `accent-rgb`。
-- **板端灯语**（`device_led.rs::language_for`）：第 1–4 颗 = 各槽未读（绿，亮度三档；
-  播放中的槽换色），**第 5 颗 = 正在执行的槽数 0–4 → 绿/黄/橙/紫/红五档**。
-  ⛔ 旧界面写的"第 5 颗灯：亮/灭"是**错的**（那不是开关），已于 v0.39.3 改正。
-- **任务台板块现状**（v0.39.3）：概览 → 槽位 → 运行时 → **调试工具**（收起）→ 播报（收起）→ 任务历史（收起）。
-  「调试工具」= ① 手动派发 + ② 播放租约；**「取租约」已从槽位卡移入 ②**
-  （自带 `leaseSlot`，独立于派发/播报槽位；槽位卡只留只读徽标）。
-  位置**刻意不挪页尾**：Phase 3 之前它是唯一能手动压完整链路的入口。
-- 任务台「执行器」板块已于 v0.39.2 删除（是「模型配置→④ 执行器」+ 页首 `blockers` 的第三份重复）。
+## 音频、网络与固件
+- 当前已有 ESP32-S3 Wi-Fi 音频输入、UDP/EIAU、PTT、流式 ASR、豆包/百炼 TTS、PC 播放和任务播报；板载扬声器下行尚未形成闭环。
+- **Codex CLI 沙箱与联网（v0.43.3）**：任务台 codex-cli 预置带 `--sandbox danger-full-access`
+  （完全去沙箱，网络+全盘不设限；代价=模型命令零隔离，仅适用本机自用）。
+  根因两层：`codex exec` 默认 workspace-write 策略禁网 + 本机
+  `~/.codex/config.toml` 的 `[windows] sandbox = "elevated"`（Windows 原生沙箱，防火墙挡网）。
+  ⚠️ 该 config.toml **顶层** `network_access = "enabled"` 是无效写法——codex 只认
+  `[sandbox_workspace_write]` 表内同名字段（钦友个人全局配置，应用不代改）。
+  老配置靠 `migrate_presets` 世代 3 方向三补旗标（只补一个沙箱旗标都没有的；
+  `SANDBOX_FLAG_CANDIDATES` 三种形态任一出现即视为用户已表过态）。
+  实测对照：无旗标 curl exit 1/`000`；有旗标 exit 0/`200`。
+  `codex sandbox windows` 自身起不来（CreateProcessAsUserW error 2），不能当沙箱测试工具。
+- TTS 配置按 provider 分流，展示/日志必须使用 `active_model()`，不能简单取非空字段。
+- Wi-Fi 在线唯一可信判据是 EIHB 心跳，当前超时 15 s；每次配置下发必须带完整 Wi-Fi 端点。首次配网必须插 USB。
+- 固件状态回读：Feature Report `0x13` 请求，`0x11` kind `0x04` 分块响应；必须同一 HID 句柄先写后读，畸形请求会 fail-closed。固件源码在独立仓库 `E:\MY_AI\trae\ESP32_S3_BOT\skills\easy-input-maker\`。
+- TTS 双向流协议事件/帧形状严格，双向要求 WSS；已有探针脚本。当前实测双向 TTS 可用，但应用侧仍主要完整合成后播放。
 
-## 取消与执行反馈
-- 取消必须终止整棵进程树：先 `taskkill /T /F /PID`，再 `child.kill()+wait()`；反序会丢失父子链。
-- 管道收尾必须有硬超时：正常 2 s、终止后 300 ms，保证 `run()` 返回。
-- API 取消以 future 竞速实现，取消时结果正文为空，避免半截输出被留存。
-- 当前执行过程中仍无逐行反馈（`NullSink`），这是“等待感”主因；运行结束后才有完整日志。
+## 稳定性与安全约束
+- `AppHandle` 跨线程 Rc abort 已通过 `vendor/tao` Arc 补丁根治，勿删除补丁；`diag_clone_storm` 仅用于诊断，不接 UI。
+- 取消需先终止整棵进程树，再回收子进程；管道收尾必须有硬超时。当前执行中逐行反馈仍不足，容易造成等待感。
+- 密钥/配置安全仍需继续收口；插件和未来 MCP 工具应使用能力白名单，不开放任意程序路径执行。
 
-## 字幕浮层
-- 显隐只由后端决定：录音开始 show，各终态 hide；前端不得再根据状态推导显隐。
-- 任务台字幕必须先发 `asr-final` 正文、再发状态；空 `asr-partial` 在统一入口过滤；派发后保留 1.8 s。
-- 验证要同时检查窗口可见性、正文 DOM、状态 DOM；DOM 有字不等于用户可见。
+## 版本与协作纪律
+- `package.json` 是唯一版本真源；用 `scripts/version.mjs` 同步 tauri/Cargo/lock 文件。改动必须同步 `CHANGELOG.md`、`README.md`，收工执行版本一致性检查。
+- **打包必须走 `npm run tauri:build`**：手 `cargo build --release` 缺 `custom-protocol` 特性 ⇒ dev 模式包（前端没内嵌，双击报 ERR_CONNECTION_REFUSED）。产物是便携 exe（无 installer bundle），按惯例归档到 `release/easyop-v<版本>.exe`。
+- 多 agent 共树禁止回退他人改动、顺手格式化、盲目全量暂存；Rust 混合行尾修改前需保护行尾。验证失败要区分主工作区他人半成品与本次改动。
+- 工作区记忆每日追加到 `.workbuddy/memory/YYYY-MM-DD.md`；本项目不删除 `.workbuddy`。
 
-## TTS 双向协议
-- 单向帧：头+sequence+size+payload（flags `0b0001`）；双向帧：头+event+sid_len+sid+size+payload（flags `0b0100`）。帧形状错会静默 0 帧。
-- 会话事件必须带非空 sid；仅事件 152 表示会话结束，351 是逐句结束；文本只放 `TaskRequest`。
-- 双向握手：`1→50→100→150→200→35x→102→152→2→52`；FinishConnection 失败可忽略。
-- `is_bidirection()` 仅在 URL 最后一段严格为 `bidirection` 时成立；Volc 双向要求 WSS。
-- 探针：`scripts/probe_tts_bidirection.py`、`_probe_bidir_variants.py`、`_capture_bidir_frames.py`。
-- ASR 潜在风险：最终空帧可能覆盖已有 `final_text`；当前非现症，若修应只在非空时覆盖。
+## 已知未实现
+- MCP Runtime、统一 Conversation Orchestrator、运行中实时日志、失败自动重试、键盘喇叭播放/ESP32 音频下行、离线唤醒词、声纹和视觉能力尚未完整实现。
+- 播报排队机制遗留（v0.42.0）：排队只覆盖终态类；`ResultsWaiting` 只报条数不报槽位；队首等待无实时进度。
+- 当前重点：把小智式速度分析纳入方案，先补齐 trace 测量，再优化 LLM 增量可见、句子级 TTS、短播报和 CLI 管道收尾。
 
-## Wi-Fi 链路自动化（v0.37.0 起，动 `wifi_link.rs` 前必读）
+## SS 命令面板与Everything（2026-10-13 定位）
+- easyop 的 SS 命令面板是**自带独立实现**，与 `E:\MY_AI\workbuddy\Super_Startup\` **无任何依赖**（全仓0 处引用）。
+  相关文件全在 easyop 内：`src-tauri/src/everything.rs`、`public/ss_palette.html`、`src/components/GeneralSettings.tsx`。
+- ⚠️ **已修复（v0.41.7）**：`everything.rs` 曾用 `es.exe -csv` 读 stdout（实为 ACP/GBK 字节）
+  却调 `String::from_utf8_lossy` 按 UTF-8 解 → 中文变 `�`。已改为 `-export-csv <tmp> -utf8-bom`
+  +剥BOM + `String::from_utf8`（严格）。**教训：`from_utf8_lossy` 只保证不 panic，不代表解码正确。**
+- **跨进程只有字节，没有编码契约**：es.exe 是 ANSI 程序，管道是裸字节流，不做编码协商。
+  「调用关系」≠「编码一致」。`-csv` 不等于 UTF-8，唯一 UTF-8 出口是 `-export-csv`+`-utf8-bom`。
+- easyop 全仓**0 处引用 Everything SDK**（无 libloading/LoadLibrary），只用 es.exe CLI。
+- 教训：项目名相似（easyop「SS 面板」vs Super_Startup「SS」）极易误判，跨项目诊断前先验依赖边界。
 
-- **⛔ 「连上了」的唯一可信判据 = 收到板子的 EIHB 心跳**（`is_online()`，**15 s** 超时，UDP 17333）。
-  ⚠️ 这个超时值被改过（v0.37.1：5 s → 15 s），**别照旧资料写 5 s**；要引用就调
-  `keyboard_audio::heartbeat_timeout_secs()`，文案里也别手写数字。
-  **下发成功 ≠ 已连接** —— 只说明端点进了 NVS。前端「Wi-Fi 已连接」徽标只读后端的 `board_online`，
-  不许再本地硬写。历史上正是"点一下连接就本地置真"导致"点了成功但麦克风不出声"可以一直挂着。
-- **⛔ 每一次配置下发都必须带 Wi-Fi 端点**（`payload::build_firmware_payload_with_wifi`）。
-  固件 `ConfigState::apply_json` 是**整体替换**语义：未提及的字段一律回默认值 ⇒
-  漏带端点会把 `wifi_ssid`/`audio_host` 清成空串 ⇒ `audio_ready()` 为假 ⇒ 板子**主动释放 Wi-Fi、
-  麦克风静默失效**。（旧 `build_firmware_payload(profile)` 已删除，就是为了从类型上消灭这类漏带。）
-- **四环节**：检测（每秒 tick，指纹 `epoch = 当前SSID|首选IPv4`）/ 自动连接
-  （T1 开机 3 s 后 · T2 USB 通道出现 · T4 离线 > 20 s；退避 0/5/15/30/60 s）/
-  历史（`output_dir()/wifi_known.json`，上限 16，只在**离线→在线跃迁**记一次）/
-  快速重连（端点已在 NVS ⇒ **板子自己连**，约 10 s 一轮；T3 环境指纹变了才重下发）。
-- **首次配网必须插 USB**：端点没进 NVS 时板子不在网上，UDP 直投这条路（服务端判 `from == dest`）必然不通。
-- 麦克风来源 ≠ Wi-Fi 时整条链路**主动停摆**（`state=disabled`），这是故意的。
-- 板子端**没有**扫描环境的能力（未改固件、未加 Report ID）；判断全在上位机。
-- 历史文件里**密码明文**（与 `config.json` 同级，未新增暴露面）；迁移是"只增不清"。
+## 任务台播报三 BUG 根因（2026-10-13 诊断 → v0.42.0 已修复，各配回归测试）
+- **BUG 1「下发即播任务已完成」= 外部会话监工误报**：`codex_probe` 的 24h mtime 窗口 + `seen` 回收，
+  使任务台自己 `codex exec resume` 追加写的旧 rollout 被当「全新文件」从偏移 0 整读，
+  全历史 task_complete 变新 hit，`hits.first()` 播出最旧一条（23 天前）。
+  已修复：首见一律按 EOF 登记（删 primed 分支，消灭整类误报）+ 桌面任务有槽在跑或完成后
+  10s 宽限内 probe 只消费偏移不出声（`last_desk_finish_ms` + `PROBE_GRACE_MS`）。
+- **BUG 2「只播一小段」= 音频保活截止时间单位错**：`audio_out.rs` 把 `total_from_pcm` 的**毫秒**
+  当样本数套 `micros = ms*1e6/rate`，48kHz 下时长缩 1/48 ⇒ >10.3s 的播报在 `0.02×时长+10s` 被 drop 流掐断。
+  已修复：`PlaybackControl::duration_ms()` 是设备侧权威值（含重采样/声道展开），`keepalive_deadline(毫秒进毫秒出)`；
+  调用方等播完必须用 `duration_ms()`，禁止自己估算。**没有也不该有播放时长设置**；
+  真旋钮是 `summary.max_chars`（该音色 ~6.6 字/s，252 字≈40s 过长，建议 80–120）。
+- **BUG 3「S2 完成静默进未读」= NoticeGate 全局一本账 + 后到抢占**：「同类 kind 不重复播」四槽共用
+  ⇒ S1 完成后 S2 同名终态被吞。已修复为**两套账本**：进度类走全局账本（跃迁+最小间隔，原逻辑）；
+  事件类（起点/终态）按 `(slot, kind)` 记账 + `EVENT_REPEAT_GUARD_MS=3_000`（只挡同拍双送达）。
+  **终态播报排队**：`notice_queue` cap 3、满丢最旧+计数、单飞排水、排空后补 `ResultsWaiting` 合并提醒；
+  `may_start_playing`：结果可接管一切、进度类后到接管、终态绝不抢占。
+  `dispatch_task` 的 `emit_notice(TaskStarted)` 必须在 `emit_state_if_changed` **之前**（同拍双 notice 否则互抢）。
+- `NoticeKind` 闭集 12 类（`ResultsWaiting=11` 只能末尾追加，`code()` 是缓存文件名契约）；闭集变更后需重跑「预合成语料」补齐。
 
-### 心跳判据与"假离线"（v0.37.1，用户报"Wi-Fi 偶尔断开"的真根因）
+## 播报排队三条遗留（2026-10-15 → v0.44.0 全关）
+- **① 进度类不再"被占即丢"**：纯函数 `enqueue_decide` 返回 `Append / Replace / Drop{reason}`；
+  终态必排队；进度类**队里有终态则过期丢弃**（FIFO 下永远排在终态后，终态播完时任务多已结束），
+  队里有同类则 Replace 只留最新。判据是**价值的时间衰减曲线**（终态不衰减/进度衰减/事件前端实时可见）。
+- **② 合并提醒记明细而非计数**：`notice_dropped` 从 `AtomicUsize` 改为
+  `Mutex<Vec<DroppedNotice { kind, slot }>>`；正文"还有 2 条（S1 任务已完成、S3 任务失败）"，
+  >3 条退化纯条数（TTS 按字数计费）。进度类被丢**不记**明细（过期进度报进提醒是噪音）。
+- **③ 队首等待实时可见**：新事件 `agent-desk-channel`（`playing` + `notice_queue`）+ 前端喇叭实况区
+  （在播什么 / 排几条 / 队首单独点出"下一个轮到谁"）。
 
-- **心跳周期 2 s vs 超时 5 s ⇒ 只容忍连丢 1 个包。** 实测空档 **7748 ms**（连丢 3 个），
-  一小时冒 9 次「中断 → 恢复」且成对间隔只有 1～16 秒 ⇒ 那是判据太紧，**不是 Wi-Fi 不稳**。
-- **真正的伤害是丢音，不是图标闪。** `resolve_mic` 按 `is_online()` 选录音源 ⇒
-  翻转瞬间退回**电脑麦克风** ⇒ 用户对着板子说话却录到静音，提示只写"空结果"。
-  用户说的"不稳定"绝大多数是**录到静音**。排查这类报障先查录音源切换，别只看徽标。
-- **两处 `now_ms()` 必须用单调时钟**（`OnceLock<Instant>`）：判据问的是"过了多久"，
-  与"现在几点"无关。用墙钟时 NTP 校时会让差值跳变 —— 往前跳 = 凭空一次离线；
-  **往后跳 = `saturating_sub` 归零 ⇒ 真掉线也不报**（静默失效，比误报危险）。
-  真实时刻（`last_success_unix`）才用墙钟，两者不混用。
-- **`+1` 不是笔误**：`0` 在本仓库是"未开始 / 从未发生"的哨兵值，业务时间戳取到 0 会被读成"还没开始"。
-- **抖动不计入成功**（`RESUMED_FLAP_MS = 30_000`）。原先每次"离线→在线"都 `mark_success`，
-  而 `success_count`/`last_success_unix` 正是历史表的**排序依据** ⇒ 抖得最凶的网反而被推得最高。
-  实测某网 `success_count` 已到 17，而它真实只连过 2 次。
-- **判据抽成纯函数 `counts_as_success(offline_ms_before, ever_online_before)`，日志与历史共用同一调用** ——
-  不允许出现两份证据互相打架。⚠️ 别用 `offline_ms_before == 0` 表示"首次连接"：
-  `offline_since_ms` **刻意**在"第一次评估到非在线"就起表（否则 T4 永不触发）⇒ 启动时会假命中最先那个 tick。
-  **"从未在线过"与"刚离线 0 毫秒"是两件事，不能用一个数值兼任。**
-- **"确认 + 写历史"必须在选网之后。** 它要 `target_ssid` 兜底，而那个字段由**下发分支**写入 ⇒
-  心跳先于启动延迟（3 s）到达时目标恒为 `None` ⇒ 板子常开则历史**永远积累不起来**（而历史表正是选网依据）。
-- ⚠️ 未跑完的闭环：「抖动不计成功」需板子真离线 ≥ 45 秒再回来。判据已由单测钉住，
-  且该日志路径已真机触发过一次。**下次板子在场且方便断电时补验。**
-- ⚠️ 待查风险：`netsh wlan show networks` 同步阻塞 tick，可能让 `offline_since_ms` 时间测量偏斜。
-- ⚠️ **注入式验证前必须先确认真信号源不在场**：`.workbuddy/inject_heartbeat.py`（往 17333 注入 EIHB 帧）
-  首次跑无效 —— 我把"USB 不在位"当成了"无心跳源"，实际板子 Wi-Fi 那头一直在发 ⇒
-  注入被真流量淹没，两条路刷同一时间戳，连"离线"都造不出来。前提已写进脚本文件头。
+## 播报通道机制（易复发的坑）
+- **触发模型不同必须分事件**：`agent-desk-state` 由任务状态驱动；
+  `agent-desk-channel` 由**播放动作**驱动（播完/抢占/入队都发生在任务状态没变的时刻，
+  等状态事件再变时等待期已经结束）。
+- **同一份投影只能算一遍**：`project_channel` 是喇叭实况唯一投影，快照（5s）与实时事件**同源取值**；
+  两处各算一遍会漂移成"喇叭响着 A、界面写着在播 B"，这类 bug 排查时最难重现。
+- 事件"真变化才发"用**内容比对**（derive `PartialEq` + `last_channel_state`），
+  **不用版本号** —— 并发播放下版本号必然错序。
+- ⚠️ 持 `notice_queue` 锁时**禁止**调会重入该锁的函数（`Mutex` 重入即死锁）；
+  `enqueue_notice` 把决策结果记成 `queued` 布尔带出作用域后再推事件。
+- `speak_notice` 带了 `app` 参数：播放起止都在它内部，调用方在外面拿不到准确时刻。
+- 前端"事件 + 轮询"混合时，轮询只作**初值兜底**（`channelSeenRef` 门控）——
+  无条件覆盖会因请求往返延迟让界面在"在播/空闲"之间来回跳，比慢 5 秒更困惑。
+- 排队规则的失败形态是**静默的**（听不到、也无报错），只能靠纯函数单测钉死。
+- 枚举变体带字段时，测试里想忽略字段必须 `matches!(.., Variant { .. })`；
+  写 `{ reason: _ }` 编译失败（`_` 只能做赋值左值，E0599）。
 
-### 配置字段的"按分支才生效"陷阱（v0.37.1）
-
-- `TtsConfig` 里 `resource_id`（豆包 / `X-Api-Resource-Id`）与 `model`（百炼）**按 provider 才生效**。
-  ⇒ 任务台卡片原先读 `cfg.tts.model` 就一直显示陈旧的 `seed-tts-1.0`，而界面填的是 `seed-tts-2.0`。
-- **展示与日志一律走 `TtsConfig::active_model()`**（按 provider 分流），三处展示点已统一。
-  ⛔ **不能**用"哪个字段非空取哪个"兜底：切换过 provider 的配置两个字段都非空，猜错就把不生效的显示出来。
-- **通用自查口径**：结构体里有"按分支才生效的字段"（provider / 模式 / 协议）时，
-  任何 `cfg.xxx.field` 的**展示与日志**都可能是错的 —— 值得全局 grep 一遍 `\.field`，确认每个都经过分流函数。
-
-## 已知未实现/受限能力
-- 槽位“按能力/自动判定”未实现。
-- `RunOutcome` 无独立 stderr，历史 stderr 段为空；失败原因在截断后的 reason。
-- 历史面板没有打开产物入口。
-- 未实现：AsyncTaskPoll、运行中实时日志、失败自动重试、键盘喇叭播放、板端灯语 0x16。
-- 外部会话监工播报仍用固定语料。
-
-## 协作与版本纪律
-- 版本唯一真源为 `package.json`；同步**五处**：tauri.conf.json / Cargo.toml / package-lock.json /
-  **src-tauri/Cargo.lock**（第 5 处曾被漏掉 —— 它是唯一会被 `cargo build` 自动改写的一处，
-  漏同步会让版本号在"一致 / 又不一致"间来回摆）。任何改动同步 CHANGELOG、README，
-  并以 `npm run version:check` exit 0 收工。
-- CDP 工具 `.workbuddy/cdp_eval.mjs`：`list` / `eval` / `evalfile` / `shot <png>`。
-  取证顺序：先 eval 查 `isVisible()` + `getBoundingClientRect()`（DOM 有字 ≠ 看得见），再 `shot` 看版式。
-- `cargo test --lib` 必须加 `--test-threads=1`。
-- 多 agent 环境禁止回退他人改动、顺手格式化、批量换行、盲目 `git add -A`。
-- Rust 文件行尾混合；修改前检测，二进制方式保留原行尾，避免整文件假 diff。
-- CHANGELOG/README 顶部曾被外部进程两次覆盖：提交前备份，提交后再次跑 `version:check`；失败时先检查版本节是否被删。
-- 入库前：精确暂存/干跑检查、密钥扫描、提交后复验版本。
-- `.gitignore` 已覆盖备份、取证截图/监控、飞书流水线临时目录。
+## 主工作区当前编译状态（2026-10-13）
+- ⚠️ `cargo build` **失败**，原因是**其他 agent 的半成品**，非本项目改动：
+  `live_translate.rs`（`RecordedSentence` 缺 `start_ms`/`end_ms` 初始化）、
+  `plugin_registry.rs`（`PluginManifest` 新增 `hidden` 字段后测试构造器未跟上）。
+- 验证手法：把目标模块抽成独立 crate 编译测试，可绕开他人半成品拿到干净结论（本次12/12 通过）。
+## 内置插件部署纪律（2026-10-12 事故后立规）
+- 插件运行时只读 `%APPDATA%\com.easyop.app\plugins\`；仓库 `plugins/builtin/` 只是模板，**改仓库不生效，必须 `node scripts/deploy-plugins.mjs <id>`**。
+- **部署前先 diff 运行目录 vs 仓库**：运行目录那份可能是用户/agent 直接改过的唯一副本（live-translate 曾因此丢功能，无 git 无历史不可恢复）。
+- deploy-plugins.mjs 已内置覆盖前自动备份（`<id>.bak.<时间戳>`），但「先看再部署」仍是第一纪律。
+- live-translate 插件**未入 git**；studio/stylecam/demo 已入 git 与否以 `git log -- plugins/builtin/<id>` 为准。

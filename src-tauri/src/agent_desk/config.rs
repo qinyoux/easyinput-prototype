@@ -512,13 +512,23 @@ pub struct DeskConfig {
     pub preset_features_version: Option<u32>,
 }
 
-/// **预置清单的**当前世代。改动预置（补新能力 / 退役旧条目）⇒ 这个数 +1。
+/// **预置清单的**当前世代。改动预置（补新能力 / 退役旧条目 / 补参数）⇒ 这个数 +1。
 ///
 /// ⚠️ 名字里的 `FEATURES` 是历史留名，**别据此以为它只管"加能力"**：
 /// 它守的是"我对预置清单做过第几轮演进"，而演进的方向有两个。
 /// 共用一个世代标记是刻意的 —— 拆成两个标记会各自演化、互相不同步，
 /// 而它们要防的是同一件事："同一个迁移跑第二遍"。
-const PRESET_FEATURES_VERSION: u32 = 2;
+const PRESET_FEATURES_VERSION: u32 = 3;
+
+/// codex-cli 的"沙箱已关"写法集合 —— `migrate_presets` 判"用户是不是已经表过态"用。
+///
+/// 三种等价形态都认：长选项、短选项、以及连审批一起绕过的总开关。
+/// 只要出现任意一种，就认为用户自己做过选择，迁移不再插旗。
+const SANDBOX_FLAG_CANDIDATES: &[&str] = &[
+    "--sandbox",
+    "-s",
+    "--dangerously-bypass-approvals-and-sandbox",
+];
 
 /// 已**退役**的预置执行器 id。加进这里 = 下次启动从用户配置里删掉。
 ///
@@ -653,11 +663,11 @@ impl DeskConfig {
     ///
     /// # 与 [`Self::apply_preset_patches`] 的分工
     ///
-    /// | | 纠错补丁 | 本函数 |
-    /// |---|---|---|
-    /// | 处理对象 | 已知**错值** | 老配置里**还没有**的新能力 / **已经不该有**的旧条目 |
-    /// | 判据 | 磁盘值 == 错值 | 世代标记 < 当前版本 |
-    /// | 用户已设置 | 绝不动 | 绝不动（只补 `None`、只删退役 id）|
+/// | | 纠错补丁 | 本函数 |
+/// |---|---|---|
+/// | 处理对象 | 已知**错值** | 老配置里**还没有**的新能力 / **缺失的参数** / **已经不该有**的旧条目 |
+/// | 判据 | 磁盘值 == 错值 | 世代标记 < 当前版本 |
+/// | 用户已设置 | 绝不动 | 绝不动（只补 `None`、只补一个旗标都没有的、只删退役 id）|
     ///
     /// # 为什么必须有世代标记
     ///
@@ -691,6 +701,35 @@ impl DeskConfig {
             if d.continuation.is_none() {
                 d.continuation = Some(preset_cont);
                 changed.push(format!("{}（会话续接）", preset.id));
+            }
+        }
+
+        // ---- 方向三：给老配置的 codex-cli 补上「去沙箱」参数（v0.42.1）----
+        //
+        // 与方向二同构：只补"一个沙箱旗标都没有"的。用户设了 `-s` / `--sandbox` /
+        // `--dangerously-bypass-approvals-and-sandbox` 任意一种都不碰 ——
+        // 那是他的选择（可能是想留隔离），迁移不是"重写预置"。
+        //
+        // 为什么必须迁移而不能只改 `default_drivers()`：`normalize()` 只按 id 补
+        // "从未出现过"的预置，而老用户磁盘上的 codex-cli 条目一直在 ⇒ 只改预置
+        // 对老用户不生效，表现为"升级了还是不能联网"。
+        if let Some(d) = self.drivers.iter_mut().find(|d| d.id == "codex-cli") {
+            let declared = d
+                .args
+                .iter()
+                .any(|a| SANDBOX_FLAG_CANDIDATES.contains(&a.trim()));
+            if !declared {
+                let flag = ["--sandbox".to_string(), "danger-full-access".to_string()];
+                // 插在 `{prompt}` 之前：与预置参数顺序一致（全局选项在前），
+                // 也保证续接的 `resume <id>` 仍落在这个旗标之后、prompt 之前
+                // （codex 要求子命令落在全局选项之后，顺序是 09-20 实测定死的）。
+                match d.args.iter().position(|a| a.contains("{prompt}")) {
+                    Some(i) => {
+                        d.args.splice(i..i, flag);
+                    }
+                    None => d.args.extend(flag),
+                }
+                changed.push("codex-cli（去沙箱以放行联网）".to_string());
             }
         }
 
@@ -856,10 +895,29 @@ fn default_drivers() -> Vec<DriverConfig> {
             //
             // `--json` 把事件以 **JSONL 打到 stdout**。
             // `--skip-git-repo-check`：工作目录未必是 git 仓库，不给它 codex 会直接拒跑。
+            //
+            // ---- 沙箱：为什么要显式关掉（2026-10-14 钦友实测要求）----
+            //
+            // 不关时 codex 把**网络**一起禁掉，且是两层原因叠加：
+            // ① `codex exec` 默认 sandbox 策略是 workspace-write，该策略下
+            //    `sandbox_workspace_write.network_access` 默认 false；
+            // ② 他本机 `~/.codex/config.toml` 里 `[windows] sandbox = "elevated"`
+            //    是 Windows 原生沙箱（专用低权沙箱用户 + 防火墙规则），模型让
+            //    pip / curl / git 联网一律被挡，报"沙箱受限"。
+            //    （该文件顶层的 `network_access = "enabled"` **位置是错的**——
+            //    codex 只认 `[sandbox_workspace_write]` 表内的同名字段，顶层写法被静默忽略。）
+            //
+            // `--sandbox danger-full-access` = 完全去掉沙箱：命令以当前用户权限运行，
+            // 网络与全盘都不再受限。**代价必须说清**：模型生成的 shell 命令失去全部隔离，
+            // 与"任务文本来自语音识别"叠加 ⇒ 只适用于本机自用、prompt 来源可信的场景。
+            // 想恢复隔离：删掉这两个参数，或在 config.toml 配
+            // `[sandbox_workspace_write] network_access = true`（保留文件系统边界、只放网络）。
             args: vec![
                 "exec".into(),
                 "--json".into(),
                 "--skip-git-repo-check".into(),
+                "--sandbox".into(),
+                "danger-full-access".into(),
                 "{prompt}".into(),
             ],
             env: vec!["HOME=C:\\Users\\86136".into()],
@@ -1234,6 +1292,116 @@ mod tests {
 
         assert!(cfg.migrate_presets().is_empty());
         assert!(cfg.driver("codex-cli").unwrap().continuation.is_none());
+    }
+
+    /// v0.42.1：预置的 codex-cli 必须显式关沙箱。
+    ///
+    /// 不关时两层原因叠加把网全禁掉：`codex exec` 默认 workspace-write 策略
+    /// （`network_access` 默认 false）+ 钦友本机 `[windows] sandbox = "elevated"`
+    /// 原生沙箱的防火墙规则 ⇒ 模型让 pip/curl/git 联网一律"沙箱受限"。
+    #[test]
+    fn codex_preset_runs_without_sandbox() {
+        let codex = DeskConfig::default()
+            .driver("codex-cli")
+            .expect("预置必须有 codex-cli")
+            .clone();
+        let args = &codex.args;
+        let i = args
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("预置必须带 --sandbox（codex 默认沙箱会禁网）");
+        assert_eq!(
+            args[i + 1],
+            "danger-full-access",
+            "旗标值必须是完全去沙箱，不是 workspace-write"
+        );
+        // 且必须落在 `{prompt}` 之前：续接的 `resume <id>` 插在 {prompt} 处，
+        // 顺序错了 codex 会把旗标当成 resume 的参数（09-20 同款事故）。
+        let prompt_at = args
+            .iter()
+            .position(|a| a.contains("{prompt}"))
+            .expect("预置必须带 {{prompt}}");
+        assert!(
+            i < prompt_at,
+            "--sandbox 必须落在 {{prompt}} 之前，实际 {args:?}"
+        );
+    }
+
+    /// 老配置（世代 2）升级后必须补上沙箱旗标 —— 只改预置对老用户不生效，
+    /// 因为 `normalize()` 只补"从未出现过"的条目，他磁盘上的 codex-cli 一直在。
+    #[test]
+    fn old_codex_config_gains_the_no_sandbox_flag_once() {
+        let mut cfg = DeskConfig::default();
+        // 模拟钦友磁盘上的实况：世代 2、args 里没有任何沙箱旗标。
+        cfg.drivers
+            .iter_mut()
+            .find(|d| d.id == "codex-cli")
+            .unwrap()
+            .args = vec![
+                "exec".into(),
+                "--json".into(),
+                "--skip-git-repo-check".into(),
+                "{prompt}".into(),
+            ];
+        cfg.preset_features_version = Some(2);
+
+        let changed = cfg.migrate_presets();
+        assert!(
+            changed.iter().any(|c| c.contains("codex-cli")),
+            "必须给老配置补上去沙箱旗标：{changed:?}"
+        );
+        assert_eq!(
+            cfg.driver("codex-cli").unwrap().args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+                "{prompt}".to_string(),
+            ],
+            "补的旗标位置必须与预置一致（prompt 占位符之前）"
+        );
+
+        // 第二次：世代标记已推进 ⇒ 不再动（也不会把用户删掉的旗标又插回来）。
+        assert!(cfg.migrate_presets().is_empty());
+    }
+
+    /// 用户自己表过态的（三种形态任意一种）一律不碰 —— 迁移不是"重写预置"。
+    #[test]
+    fn user_chosen_sandbox_flag_is_never_overridden() {
+        for user_flag in [
+            "--sandbox",
+            "-s",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ] {
+            let mut cfg = DeskConfig::default();
+            cfg.drivers
+                .iter_mut()
+                .find(|d| d.id == "codex-cli")
+                .unwrap()
+                .args = vec![
+                    "exec".into(),
+                    user_flag.to_string(),
+                    "workspace-write".into(),
+                    "{prompt}".into(),
+                ];
+            cfg.preset_features_version = Some(2);
+
+            let changed = cfg.migrate_presets();
+            assert!(
+                !changed.iter().any(|c| c.contains("codex-cli")),
+                "用户已设 {user_flag}，迁移不该再插旗：{changed:?}"
+            );
+            let args = &cfg.driver("codex-cli").unwrap().args;
+            assert_eq!(
+                args.iter()
+                    .filter(|a| SANDBOX_FLAG_CANDIDATES.contains(&a.trim()))
+                    .count(),
+                1,
+                "旗标数量必须保持用户原样，实际 {args:?}"
+            );
+        }
     }
 
     #[test]

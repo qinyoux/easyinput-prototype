@@ -27,8 +27,10 @@ mod ei_protocol;
 mod host_action;
 mod keyboard_audio;
 mod launcher;
+mod live_translate;
 mod llm_client;
 mod log_buffer;
+mod license;
 mod mini_apps;
 mod model;
 mod payload;
@@ -57,6 +59,9 @@ mod tts;
 mod wifi_link;
 /// Agent 任务台（第 7 课作业落地）。**纯增量**：删除本目录 + 摘命令即回滚。
 mod agent_desk;
+mod diag_clone_storm;
+/// 开发板固件状态回读（0x13 → 0x11/kind 0x04）。协议真源与两个静默失效陷阱见文件头。
+mod status_query;
 
 use session::{SessionManager, TriggerMode};
 use state::AppState;
@@ -1005,6 +1010,62 @@ fn get_edit_phase(state: tauri::State<'_, SessionManager>) -> session::EditPhase
     state.edit_phase()
 }
 
+// ---------------------------------------------------------------------------
+// 实时翻译（live-translate 插件）
+// ---------------------------------------------------------------------------
+
+/// 启动实时翻译会话。
+///
+/// ASR 配置（Key / URL / Resource ID）从全局 `SessionManager` 取 —— 用户只需在
+/// 「模型配置」里填一次，翻译链路与语音输入链路共用，不新增配置项。
+#[tauri::command]
+async fn lt_start(
+    mode: String,
+    source_lang: String,
+    target_lang: String,
+    state: tauri::State<'_, SessionManager>,
+    lt: tauri::State<'_, live_translate::LiveTranslateManager>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    lt.start(
+        app,
+        live_translate::TranslateMode::parse(&mode),
+        source_lang,
+        target_lang,
+        state.api_key(),
+        state.asr_url(),
+        state.resource_id(),
+    )
+    .await
+}
+
+/// 停止实时翻译会话。
+#[tauri::command]
+async fn lt_stop(
+    lt: tauri::State<'_, live_translate::LiveTranslateManager>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    lt.stop(&app).await
+}
+
+/// 查询实时翻译状态。
+#[tauri::command]
+fn lt_status(
+    lt: tauri::State<'_, live_translate::LiveTranslateManager>,
+) -> live_translate::LtStatus {
+    lt.status()
+}
+
+/// 导出当前会话记录（md / txt / json），返回落盘路径。
+#[tauri::command]
+async fn lt_export(
+    format: String,
+    lt: tauri::State<'_, live_translate::LiveTranslateManager>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    lt.export(&app, &format).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(SessionManager::new())
@@ -1058,9 +1119,12 @@ pub fn run() {
             // 初始化 LLM 客户端 + 语音编辑管理器。
             let llm_config = llm_client::LlmConfig::default();
             let llm_client = llm_client::LlmClient::new(llm_config);
-            let voice_edit_mgr = voice_edit::VoiceEditManager::new(llm_client);
+            // LlmClient 内部是 Arc：克隆成本极低，实时翻译与语音编辑**共用同一份**配置/连接池。
+            let voice_edit_mgr = voice_edit::VoiceEditManager::new(llm_client.clone());
             app.state::<SessionManager>().set_voice_edit(voice_edit_mgr.clone());
             app.manage(voice_edit_mgr);
+            // 实时翻译管理器（live-translate 插件后端）。
+            app.manage(live_translate::LiveTranslateManager::new(llm_client.clone()));
 
             // 所有模块已初始化，重新加载配置以分发 LLM / PTT 等配置。
             // 放在 PTT 引擎启动之前，避免 PttKey::parse / PttEngine::start 失败时跳过配置加载。
@@ -1297,6 +1361,11 @@ pub fn run() {
             cli_terminal_set_config,
             cli_terminal_launch,
             commands::device_status,
+            // 开发板固件版本回读（0x13 → 0x11/kind 0x04）。与上一条分开是有意的：
+            // 那条是"枚举即返回"的高频在线检测，这条要走一次完整的状态回读。
+            commands::device_firmware_status,
+            commands::activate_license,
+            commands::license_status,
             commands::push_config,
             commands::get_vocabulary,
             commands::start_listener,
@@ -1394,6 +1463,7 @@ pub fn run() {
             agent_desk::desk_grant_playback,
             agent_desk::desk_ack_playback,
             agent_desk::desk_release_playback,
+            agent_desk::desk_discard_unread,
             // Agent 任务台（Phase 3 · 「后声」：状态播报 / 未读播报 —— PC 侧喇叭）
             agent_desk::desk_notice_status,
             agent_desk::desk_prepare_notices,
@@ -1401,6 +1471,12 @@ pub fn run() {
             agent_desk::desk_session_info,
             agent_desk::desk_reset_session,
             agent_desk::desk_render_result,
+            diag_clone_storm::diag_clone_storm,
+            // 实时翻译（live-translate 插件）
+            lt_start,
+            lt_stop,
+            lt_status,
+            lt_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

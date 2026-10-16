@@ -30,13 +30,29 @@ const CAPABILITY_LABELS: Record<Capability, string> = {
   vision: "读图",
 };
 
+/**
+ * 各绑定方式的说明。**只用一行说清"它做什么"**，
+ * 不可用的那两种额外点明原因（`mode` 选中时显示，见 `MODE_UNAVAILABLE`）。
+ */
 const MODE_HINTS: Record<SlotBinding["mode"], string> = {
-  empty: "按下该键不派发任何任务（保留按键，先不接执行器）。",
-  exact:
-    "钉死一个执行器：路径确定、完全可复现，也最省 token——推荐先从这里开始。",
-  capability:
-    "只声明这一槽要什么能力，由路由在具备该能力的执行器里挑。候选留空时路由会**直接报错**，不会随便挑一个。",
-  auto: "连能力都交给路由判。只建议给预估 30 秒内能做完的短任务用——长任务的「先声明后执行」来不及否决。",
+  empty: "不派发任务（保留按键，暂不接执行器）。",
+  exact: "钉死一个执行器：确定、可复现、最省 token。推荐先用这个。",
+  capability: "由路由在具备该能力的执行器里挑。",
+  auto: "连能力都交给路由判。",
+};
+
+/**
+ * ⛔ 后端**明确拒绝**的两种绑定方式。
+ *
+ * `agent_desk::mod.rs::resolve_driver` 对 `Capability` / `Auto` 直接返回 Err
+ * （Phase 4 的 Router 尚未实现，"失败不静默"硬约束）。所以它们在界面上必须
+ * 读作**不可用**，而不是"选了就能用" —— 否则用户配完按下键才撞到报错。
+ * 这里不 `disabled` 掉 `<option>`：那会让老配置里的这两种绑定**读不出来**，
+ * 反而变成另一种"看不出问题在哪"。改为照常可选 + 显式标注不可用及原因。
+ */
+const MODE_UNAVAILABLE: Partial<Record<SlotBinding["mode"], string>> = {
+  capability: "能力路由未实现（Phase 4）—— 选它后派发会直接报错",
+  auto: "自动路由未实现（Phase 4）—— 选它后派发会直接报错",
 };
 
 function clone<T>(v: T): T {
@@ -142,8 +158,8 @@ export default function DeskSlotBinding({ slot }: Props) {
           >
             <option value="empty">未绑定</option>
             <option value="exact">指定执行器</option>
-            <option value="capability">按能力</option>
-            <option value="auto">自动判定</option>
+            <option value="capability">按能力（不可用）</option>
+            <option value="auto">自动判定（不可用）</option>
           </select>
 
           {binding.mode === "exact" && (
@@ -185,6 +201,11 @@ export default function DeskSlotBinding({ slot }: Props) {
           )}
         </div>
         <p className="hint">{MODE_HINTS[binding.mode]}</p>
+        {MODE_UNAVAILABLE[binding.mode] && (
+          <p className="hint bad">
+            <span className="desk-tag off">不可用</span> {MODE_UNAVAILABLE[binding.mode]}
+          </p>
+        )}
       </div>
 
       {binding.mode === "capability" && (
@@ -192,7 +213,10 @@ export default function DeskSlotBinding({ slot }: Props) {
           <label>候选执行器（勾选即加入优先顺序）</label>
           <div className="desk-prefer">
             {cfg.drivers.map((d) => (
-              <label key={d.id} className="desk-prefer-item">
+              <label
+                key={d.id}
+                className={`desk-prefer-item${d.enabled ? "" : " off"}`}
+              >
                 <input
                   type="checkbox"
                   disabled={busy}
@@ -209,6 +233,7 @@ export default function DeskSlotBinding({ slot }: Props) {
                   }}
                 />
                 {d.label}
+                {!d.enabled && <span className="desk-opt-reason">不可用：未启用</span>}
               </label>
             ))}
           </div>
@@ -222,9 +247,7 @@ export default function DeskSlotBinding({ slot }: Props) {
 
       <div className="desk-slot-binding-cfgpath">
         <p className="hint">
-          执行器本身在别处配：「<strong>设置 → Agent 任务台 → 执行器</strong>」管命令 / 启用 /
-          完成判定，<strong>API 型执行器的端点与密钥</strong>在「<strong>模型配置</strong>」页。
-          这个面板只管「槽位交给谁」。
+          执行器本身在「<strong>模型配置 → ④ 执行器</strong>」配命令 / 启用 / 完成判定，本面板只管「槽位交给谁」。
         </p>
       </div>
     </div>

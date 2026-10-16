@@ -42,10 +42,7 @@ export const NAMED_ACTION_LABELS: Record<string, string> = {
   ss_palette: "⌘SS 命令面板",
   // 启动终端并预置命令（easyop 主机端专有动作）
   cli_terminal: "启动终端",
-  // 内容台旋钮导航（easyop 主机端专有动作）
-  studio_prev: "内容台 · 上一项",
-  studio_next: "内容台 · 下一项",
-  studio_confirm: "内容台 · 确认",
+
 };
 
 /** 提示词库相关的具名动作 ID，界面分组与提示文案都以此为准。 */
@@ -67,11 +64,18 @@ export const CLI_TERMINAL_ACTION = "cli_terminal";
 /** 上者的数组形式，供分组判断复用同一份 ID。 */
 export const CLI_TERMINAL_ACTIONS: string[] = [CLI_TERMINAL_ACTION];
 
-/** 内容台旋钮导航相关的具名动作 ID。 */
+/** 内容台旋钮导航相关的具名动作 ID（旧 Named kind 的残留，仅用于分组判断兼容）。 */
 export const STUDIO_ACTIONS: string[] = [
   "studio_prev",
   "studio_next",
   "studio_confirm",
+];
+
+/** 内容台旋钮导航的子动作选项（新 Studio kind 的下拉用）。 */
+export const STUDIO_KIND_OPTIONS: { value: string; label: string }[] = [
+  { value: "prev", label: "上一项（左旋切换焦点）" },
+  { value: "next", label: "下一项（右旋切换焦点）" },
+  { value: "confirm", label: "确认（按下执行）" },
 ];
 
 /** 动作类型的中文名，用于类型选择下拉。 */
@@ -84,6 +88,10 @@ export const ACTION_KIND_LABELS: Record<string, string> = {
   // Agent 任务台：把这一键归入某个槽位（S1–S4），说不说、播不播由任务台决定。
   // 固件侧它被编码成 `host_action:<保留 UUID>`，所以不需要固件改动。
   task_desk: "任务台",
+  // 内容台旋钮导航：编码器旋转切换焦点、按下确认执行。
+  // 固件侧同样编码成 `host_action:<保留 UUID>`。
+  // 注意：内容台 *插件* 的命令菜单在动作类型下拉里另称「内容台」，与旋钮区分。
+  studio: "内容台 · 旋钮",
 };
 
 /**

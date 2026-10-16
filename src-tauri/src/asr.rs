@@ -14,6 +14,7 @@
 //!
 //! 参考：https://www.volcengine.com/docs/6561/1354869
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +39,10 @@ const FLAG_LAST_PACKAGE: u8 = 0b0010;
 const SER_RAW: u8 = 0b0000;
 const SER_JSON: u8 = 0b0001;
 
+// 压缩方式
+const COMP_NONE: u8 = 0b0000;
+const COMP_GZIP: u8 = 0b0001;
+
 /// 构造一帧二进制数据（不压缩）。
 fn build_frame(
     message_type: u8,
@@ -46,16 +51,40 @@ fn build_frame(
     sequence: Option<i32>,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + payload.len());
+    build_frame_with_compression(message_type, flags, serialization, COMP_NONE, sequence, payload)
+}
+
+/// 构造一帧二进制数据（可指定压缩方式）。
+///
+/// # 为什么实时翻译要用 gzip
+///
+/// 官方 Python demo 对首包 JSON 和音频包 PCM 都做 gzip 压缩（`compression=GZIP`）。
+/// 实测（2026-09-27）：`audio.format=wav` + 不压缩 → 服务端 8 秒不返回任何识别结果；
+/// 同样的参数 + gzip 压缩 → 正常识别。推测 `format=wav` 路径要求 gzip 压缩的音频包。
+/// 仅 `run_translate` 启用 gzip，`run_recognition` / `run_call` 仍用不压缩（已验证可用）。
+fn build_frame_with_compression(
+    message_type: u8,
+    flags: u8,
+    serialization: u8,
+    compression: u8,
+    sequence: Option<i32>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let body = if compression == COMP_GZIP {
+        gzip_compress(payload)
+    } else {
+        payload.to_vec()
+    };
+    let mut v = Vec::with_capacity(8 + body.len());
     v.push(0x11); // version=1, header_size=1
     v.push((message_type << 4) | flags);
-    v.push(serialization << 4); // compression = NONE
+    v.push((serialization << 4) | compression);
     v.push(0x00);
     if let Some(seq) = sequence {
         v.extend_from_slice(&seq.to_be_bytes());
     }
-    v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    v.extend_from_slice(payload);
+    v.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    v.extend_from_slice(&body);
     v
 }
 
@@ -87,6 +116,21 @@ fn final_frame() -> Vec<u8> {
         FLAG_LAST_PACKAGE, // 只有 LAST，**不带** HAS_SEQUENCE
         SER_RAW,
         None,
+        &[],
+    )
+}
+
+/// 构造「音频结束」负包（带负序号，与官方 Python demo 对齐）。
+///
+/// 官方 demo 用 `NEG_WITH_SEQUENCE`(= HAS_SEQUENCE | LAST_PACKAGE) + 负序号。
+/// `run_translate` 启用说话人分离时用这种写法，与官方完全对齐。
+/// `run_recognition` / `run_call` 仍用 `final_frame()`（不带 sequence，已实测通过）。
+fn final_frame_with_negative_seq(seq: i32) -> Vec<u8> {
+    build_frame(
+        MT_AUDIO_ONLY_REQUEST,
+        FLAG_HAS_SEQUENCE | FLAG_LAST_PACKAGE,
+        SER_RAW,
+        Some(seq),
         &[],
     )
 }
@@ -188,6 +232,14 @@ fn parse_server_frame(data: &[u8]) -> Option<(String, bool)> {
         }
         _ => None,
     }
+}
+
+/// 简单 gzip 压缩。
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).ok();
+    encoder.finish().unwrap_or_default()
 }
 
 /// 简单 gzip 解压（防御性，正常不触发）。
@@ -577,6 +629,10 @@ pub async fn run_recognition(
         );
         headers.insert(
             "X-Api-Request-Id",
+            HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "X-Api-Connect-Id",
             HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
         );
         headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
@@ -994,6 +1050,10 @@ pub async fn run_call(
             "X-Api-Request-Id",
             HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
         );
+        headers.insert(
+            "X-Api-Connect-Id",
+            HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
+        );
         headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
     }
 
@@ -1240,6 +1300,854 @@ pub async fn run_call(
     Ok(())
 }
 
+// ===========================================================================
+// 实时翻译（live-translate 插件）—— 说话人分离流式识别
+// ===========================================================================
+//
+// 与 `run_call` 同构（持续录音 + 服务端 VAD 断句），但投递目标不同：
+// `run_call` 把定稿句直接注入光标处；本函数把它交给**翻译编排器**（live_translate.rs），
+// 由后者调 LLM 翻译后再上屏。识别这一环只负责"听清 + 分句 + 标说话人"。
+
+/// 一句话的识别结果（含说话人标签）。
+///
+/// # 为什么不复用 `AsrOutcome`
+///
+/// `AsrOutcome` 是「一次按住说话」的**终态汇总**（整段文本 + 时段实况）；
+/// 实时翻译是**逐句投递**的长会话：每定稿一句就立刻翻译、立刻上屏，不等会话结束。
+/// 两者生命周期不同，硬塞进同一个结构只会让两边都别扭。
+#[derive(Debug, Clone)]
+pub struct TranscriptSentence {
+    /// 句序号（从 0 递增）。UI 用它把「中间结果 → 定稿 → 译文」串成同一句。
+    pub utterance_id: u64,
+    /// 识别文本（源语言）。
+    pub text: String,
+    /// 说话人标签："spk0" / "spk1" / ...
+    pub speaker_id: String,
+    /// 是否定稿。false = 中间结果（还会变），true = 这一句说完了。
+    pub definite: bool,
+    /// 该句起点（毫秒，服务端可能不给）。
+    pub start_ms: Option<i64>,
+    /// 该句终点（毫秒，服务端可能不给）。
+    pub end_ms: Option<i64>,
+    /// **迟到修订**：服务端回补了**已定稿**句的文本。
+    /// 接收端据此改写已记录句的原文，**不重翻译**（翻译昂贵且原文已上过屏）。
+    pub correction: bool,
+}
+
+/// 实时翻译首包参数：在 `call_request_json` 基础上加说话人分离 + 语言参数化。
+///
+/// 与 `call_request_json` 的差异：
+/// - `enable_speaker = true` 时：不指定 `language`（用默认中英文模型，支持英文识别 +
+///   说话人分离），并加 `ssd_version = "200"` —— 这是官方文档要求的三个前置条件之二
+///   （另一个 `enable_nonstream` 已在下方开启）。缺任一条，服务端会静默忽略
+///   `enable_speaker_info`，返回的 utterances 无 speaker_id。
+/// - `enable_speaker = false` 且 `src_lang == "auto"` 时开启 `enable_lid`（中英方言自动识别）；
+/// - `enable_speaker = false` 且 `src_lang` 具体时，设置 `language` 为该值；
+/// - 加 `show_utterances`（输出分句 + 说话人）。
+fn translate_request_json(src_lang: &str, enable_speaker: bool) -> String {
+    let auto = src_lang == "auto";
+    let mut request = serde_json::json!({
+        "model_name": "bigmodel",
+        "enable_itn": true,
+        "enable_punc": true,
+        "enable_ddc": true,
+        "enable_nonstream": true,
+        "end_window_size": 500,
+        "result_type": "single",
+    });
+    {
+        let obj = request.as_object_mut().unwrap();
+        // 说话人分离的前置条件（官方文档 enable_speaker_info 说明）：
+        //   ① language 不指定或为 "zh-CN"（用默认中英文模型）
+        //   ② enable_nonstream = true（已在上方开启）
+        //   ③ ssd_version = "200"
+        // 三者缺一，服务端会静默忽略 enable_speaker_info，返回的 utterances 无 speaker_id
+        // —— 这正是"两人对话只识别出一人音色"的根因。
+        if enable_speaker {
+            // 与官方 Python demo 对齐的说话人分离参数：
+            //   enable_speaker_info + show_utterances + enable_nonstream + ssd_version="200"
+            //   enable_ddc=false（语义顺滑可能干扰说话人聚类）
+            //   end_window_size=800（VAD 判停，官方示例值）
+            // 不指定 language（用默认中英文模型，支持英文识别 + 说话人分离）。
+            obj.insert("enable_speaker_info".into(), Value::Bool(true));
+            obj.insert("ssd_version".into(), Value::String("200".into()));
+            obj.insert("enable_ddc".into(), Value::Bool(false));
+            obj.insert("end_window_size".into(), Value::Number(1500.into()));
+        } else if auto {
+            // 自动语种识别：源语言不确定时用（牺牲一点准确度换省心）。
+            obj.insert("enable_lid".into(), Value::Bool(true));
+        } else {
+            obj.insert("language".into(), Value::String(src_lang.to_string()));
+        }
+        // 输出分句 / 分词 / 说话人 / 停顿信息 —— 取 speaker_id 的前提。
+        obj.insert("show_utterances".into(), Value::Bool(true));
+    }
+
+    // 设计文档：audio.format=pcm，codec=raw，s16le/16k/mono。
+    let mut req = serde_json::json!({
+        "user": { "uid": "lt-mic", "platform": "Windows" },
+        "audio": {
+            "format": "pcm",
+            "codec": "raw",
+            "rate": 16000,
+            "bits": 16,
+            "channel": 1
+        },
+        "request": request
+    });
+    inject_hotwords(&mut req);
+    req.to_string()
+}
+
+/// 从 utterance / result 对象提取说话人标签，兼容多种字段名与取值格式。
+///
+/// # 为什么不能只认 `speaker_id` 的字符串形式
+///
+/// 豆包不同模型版本 / `result_type` 下，说话人字段可能是 `speaker_id`、`speaker`
+/// 或 `spk`，取值可能是字符串 `"1"`、`"spk1"`，也可能是数字 `1`。只认一种写法时，
+/// 取不到就静默回退成 `spk0` —— 表现正是"所有人都被归成同一个人"。这里把所有
+/// 已知写法都试一遍，取到即归一化成 `spk<N>`。
+fn extract_speaker(obj: &Value) -> Option<String> {
+    // 设计文档：speaker_id 在 utterances[*].additions.speaker_id。
+    // 兼容 additions 子对象和直接子节点两种位置，优先 additions（SSD 二遍的规范路径）。
+    for path in [
+        "/additions/speaker_id", "/additions/speaker", "/additions/spk",
+        "/speaker_id", "/speaker", "/spk",
+    ] {
+        let Some(node) = obj.pointer(path) else {
+            continue;
+        };
+        if let Some(s) = node.as_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(normalize_speaker(s));
+            }
+        } else if let Some(n) = node.as_i64() {
+            return Some(format!("spk{n}"));
+        }
+    }
+    None
+}
+
+/// 归一化说话人标签为 `spk<N>`（UI 依赖其中的数字取色与编号）。
+/// `"spk1"` / `"1"` / `"speaker1"` 都收敛成 `"spk1"`。
+fn normalize_speaker(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        raw.to_string()
+    } else {
+        format!("spk{digits}")
+    }
+}
+
+/// "服务端回了分句、却没有说话人字段"只警告一次，附原始 JSON 便于确认字段名。
+/// 每次都记会把日志刷满，而这个问题一旦出现就是**持续**的，只需看一次。
+fn warn_missing_speaker_once(utt: &Value) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let raw = serde_json::to_string(utt).unwrap_or_default();
+    let head: String = raw.chars().take(400).collect();
+    crate::log_buffer::warn(format!(
+        "asr(translate): 分句缺少说话人字段（说话人分离未生效？）分句原文={head}"
+    ));
+}
+
+/// 从返回 JSON 提取 (文本, 说话人, 是否定稿, start_ms, end_ms)。
+///
+/// ⛔ **取最新分句（last），不是第一条（first）**：
+/// `result.utterances` 是**会话累积**的分句数组（`result_type=full` 时尤甚）。
+/// 取 `first()` 会一直拿到第一句 —— 也就是**第一个说话人**，于是"说话人分离"
+/// 退化成"永远只有一个人"。这正是"两人对话只识别出一人音色"的直接原因。
+fn extract_translate_result(
+    json: &[u8],
+) -> Option<(String, String, bool, Option<i64>, Option<i64>)> {
+    let v: Value = serde_json::from_slice(json).ok()?;
+    let result = v
+        .pointer("/payload_msg/result")
+        .or_else(|| v.pointer("/result"))?;
+
+    if let Some(utts) = result.pointer("/utterances").and_then(|u| u.as_array()) {
+        // 逆序找**最近一条有文本**的分句（跳过服务端的空回声）。
+        for utt in utts.iter().rev() {
+            let text = utt.pointer("/text").and_then(|t| t.as_str()).unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            let speaker = match extract_speaker(utt) {
+                Some(s) => s,
+                None => {
+                    warn_missing_speaker_once(utt);
+                    "spk0".to_string()
+                }
+            };
+            let definite = utt
+                .pointer("/definite")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
+            let start = utt.pointer("/start_time").and_then(|t| t.as_i64());
+            let end = utt.pointer("/end_time").and_then(|t| t.as_i64());
+            return Some((text.to_string(), speaker, definite, start, end));
+        }
+    }
+
+    // 兜底：顶层 text + 说话人（服务端未返回 utterances 时）。
+    let text = result.pointer("/text")?.as_str()?.to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let speaker = extract_speaker(result).unwrap_or_else(|| "spk0".to_string());
+    let definite = result
+        .pointer("/definite")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    Some((text, speaker, definite, None, None))
+}
+
+/// 解析服务端帧，返回 (文本, 说话人, definite, start_ms, end_ms, 是否最后一包)。
+fn parse_translate_frame(
+    data: &[u8],
+) -> Option<(String, String, bool, Option<i64>, Option<i64>, bool)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let header_type = data[1] >> 4;
+    let flags = data[1] & 0x0F;
+    let compression = data[2] & 0x0F;
+
+    let mut offset = 4usize;
+    let mut sequence: i32 = 0;
+    if flags & FLAG_HAS_SEQUENCE != 0 {
+        if data.len() < offset + 4 {
+            return None;
+        }
+        sequence = i32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        offset += 4;
+    }
+    if data.len() < offset + 4 {
+        return None;
+    }
+    let payload_size = u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize;
+    offset += 4;
+    if data.len() < offset + payload_size {
+        return None;
+    }
+    let payload = &data[offset..offset + payload_size];
+
+    let is_last = (flags & FLAG_LAST_PACKAGE) != 0 || sequence < 0;
+
+    match header_type {
+        MT_FULL_SERVER_RESPONSE => {
+            let parsed = if compression == 0x01 {
+                gzip_decompress(payload).and_then(|bytes| extract_translate_result(&bytes))
+            } else {
+                extract_translate_result(payload)
+            };
+            parsed.map(|(t, spk, d, s, e)| (t, spk, d, s, e, is_last))
+        }
+        MT_ERROR => {
+            eprintln!("ASR 服务返回错误: {}", String::from_utf8_lossy(payload));
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 分句跟踪器（UtteranceTracker）
+// ---------------------------------------------------------------------------
+// # 为什么需要它：末尾文本被清掉的根因
+//
+// 旧实现把 `utterance_id` 当「计数器」——每收到一个 `definite` 就 +1，并把它
+// 贴给**下一帧**收到的文本。问题在于服务端一帧里，
+// `extract_translate_result` 取的是 `utterances[]` **最后一条**分句，
+// 而这个"最后一条"并不总是"当前正在说的那句"：
+//
+// 1. **打断**：一句话没说完（服务端还没给 `definite`）对方就插话，服务端把两人
+//    内容塞进同一条 utterance，该 utterance 的 `speaker_id` 只剩一个。旧计数器
+//    **不会前进**，speaker2 的中间结果继续打在 speaker1 的 `utterance_id` 上；
+//    前端 `onPartial` 是覆盖式写入 → speaker1 末尾被抹掉。
+// 2. **迟到修订**：服务端二遍重识别（`enable_nonstream`）会回补**已定稿**句的尾部。
+//    这帧若按「新句」处理，就会盖到 speaker2 正在写的那一行。
+// 3. **跨句文本去重误杀**：旧代码用 `text != last_final` 跨句去重。speaker1 末句
+//    与 speaker2 首句同为「好的 / 对 / OK」这类短句时，第二句被判重复 → **定稿被吞
+//    且计数器不前进** → speaker2 的文本覆盖 speaker1 的行。
+//
+// # 三条规矩
+//
+// - **句子身份用服务端时间戳**（`start_ms`），不用本地计数器；
+// - **换说话人 / 换分句时旧句立即封口**，哪怕服务端没说定稿；
+// - **迟到修订走 `Correction`**：只改它该改的那一行，不新建行、不重翻译。
+
+/// 定稿原因（仅用于日志定位，UI 不依赖）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalReason {
+    /// 服务端 `definite=true`。
+    ServerDefinite,
+    /// 同一分句内说话人变了（对方插话）——旧句必须在此封口。
+    SpeakerSwitch,
+    /// 服务端换了一条新分句。
+    Boundary,
+}
+
+impl FinalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            FinalReason::ServerDefinite => "服务端定稿",
+            FinalReason::SpeakerSwitch => "说话人切换",
+            FinalReason::Boundary => "分句边界",
+        }
+    }
+}
+
+/// 跟踪器交给上层的动作序列（一帧可触发多个动作：先封口旧句、再开新句）。
+#[derive(Debug, Clone)]
+pub enum UttAction {
+    /// 中间结果：刷新 `uid` 这一行的原文（UI 原地更新，不新建行）。
+    Partial { uid: u64, speaker: String, text: String },
+    /// 定稿：封口 `uid` 这一句，投给翻译。
+    Final {
+        uid: u64,
+        speaker: String,
+        text: String,
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+        reason: FinalReason,
+    },
+    /// 迟到修订：只改已定稿那一行的原文。
+    Correction { uid: u64, text: String },
+    /// 丢弃（附原因，仅日志）。
+    Ignore(&'static str),
+}
+
+/// 正在流式输出的一句。
+#[derive(Debug, Clone)]
+struct CurUtt {
+    uid: u64,
+    speaker: String,
+    start_ms: Option<i64>,
+    text: String,
+}
+
+/// 分句跟踪器：把服务端乱序/修订的帧，收敛成「一句一 uid」的干净事件流。
+#[derive(Debug, Default)]
+pub struct UtteranceTracker {
+    /// 下一个待分配的句序号（分配即占位，**定稿时不再自增**）。
+    next_uid: u64,
+    /// 当前正在流式输出的一句。
+    cur: Option<CurUtt>,
+    /// 已定稿分句：`start_ms` -> (uid, 定稿文本)。用于把迟到修订帧定位回它该改的行。
+    finalized: HashMap<i64, (u64, String)>,
+    /// 会话内已定稿句数。
+    finalized_count: usize,
+}
+
+impl UtteranceTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 会话是否至少定稿过一句（替代旧的 `last_final.is_empty()` 判据）。
+    pub fn has_finalized(&self) -> bool {
+        self.finalized_count > 0
+    }
+
+    /// 吃掉一帧服务端结果，产出应当执行的动作。
+    pub fn on_frame(
+        &mut self,
+        text: &str,
+        speaker: &str,
+        definite: bool,
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+    ) -> Vec<UttAction> {
+        let text = text.trim();
+        if text.is_empty() {
+            return vec![UttAction::Ignore("空文本")];
+        }
+        let speaker = if speaker.trim().is_empty() {
+            "spk0"
+        } else {
+            speaker
+        };
+
+        // ── 规矩 1：迟到修订 ───────────────────────────────────────────
+        // 该起点属于**已定稿**句子 → 这是服务端回补，不是新句。
+        if let Some(s) = start_ms {
+            if let Some((uid, old_text)) = self.finalized.get(&s) {
+                if old_text == text {
+                    return vec![UttAction::Ignore("重复定稿帧")];
+                }
+                return vec![UttAction::Correction {
+                    uid: *uid,
+                    text: text.to_string(),
+                }];
+            }
+        }
+
+        let cur = self.cur.take();
+        let mut acts: Vec<UttAction> = Vec::new();
+
+        // 同句判据：**起点相同 且 说话人相同** 才算同一句。
+        // 这里必须把 speaker 一起看：服务端被打断时会把两个人的内容塞进**同一条**
+        // utterance（`start_ms` 相同），此时只有 speaker_id 变化能标识「换人了」。
+        // 只看 start_ms 会让对方的中间结果继续覆盖同一行 → 末尾文本被抹。
+        // 服务端不给时间戳时，退回纯说话人判据。
+        let same_utt = match cur.as_ref() {
+            None => false,
+            Some(c) => {
+                if c.speaker != speaker {
+                    false
+                } else {
+                    match (c.start_ms, start_ms) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+                }
+            }
+        };
+
+        if same_utt {
+            if let Some(mut c) = cur {
+                c.text = text.to_string();
+                if definite {
+                    acts.push(self.commit(c, end_ms, FinalReason::ServerDefinite));
+                } else {
+                    acts.push(UttAction::Partial {
+                        uid: c.uid,
+                        speaker: c.speaker.clone(),
+                        text: c.text.clone(),
+                    });
+                    self.cur = Some(c);
+                }
+                return acts;
+            }
+        }
+
+        // ── 规矩 2：换句 / 换人 → 旧句立即封口（哪怕服务端没说定稿）────
+        if let Some(c) = cur {
+            if c.text.trim().is_empty() {
+                // 空句直接丢弃：不占 uid、不进记录（否则留一行空白）。
+            } else {
+                let reason = if c.speaker == speaker {
+                    FinalReason::Boundary
+                } else {
+                    FinalReason::SpeakerSwitch
+                };
+                // 旧句的终点我们无从得知（新帧的 end_ms 属于新句），故 None。
+                acts.push(self.commit(c, None, reason));
+            }
+        }
+
+        // ── 开新句 ─────────────────────────────────────────────────────
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let c = CurUtt {
+            uid,
+            speaker: speaker.to_string(),
+            start_ms,
+            text: text.to_string(),
+        };
+        if definite {
+            acts.push(self.commit(c, end_ms, FinalReason::ServerDefinite));
+        } else {
+            acts.push(UttAction::Partial {
+                uid,
+                speaker: speaker.to_string(),
+                text: text.to_string(),
+            });
+            self.cur = Some(c);
+        }
+        acts
+    }
+
+    /// 会话结束：把仍在流式中的最后半句封口（用户点「停止」时不丢尾巴）。
+    pub fn flush(&mut self) -> Vec<UttAction> {
+        match self.cur.take() {
+            Some(c) if !c.text.trim().is_empty() => {
+                vec![self.commit(c, None, FinalReason::Boundary)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// 封口一句：登记到 `finalized`（供迟到修订定位），产出 `Final`。
+    fn commit(&mut self, c: CurUtt, end_ms: Option<i64>, reason: FinalReason) -> UttAction {
+        if let Some(s) = c.start_ms {
+            self.finalized.insert(s, (c.uid, c.text.clone()));
+        }
+        self.finalized_count += 1;
+        UttAction::Final {
+            uid: c.uid,
+            speaker: c.speaker,
+            text: c.text,
+            start_ms: c.start_ms,
+            end_ms,
+            reason,
+        }
+    }
+}
+
+/// 执行跟踪器产出的动作：发事件 + 投翻译队列。`false` = 队列已关闭，应终止识别。
+async fn apply_utt_actions(
+    acts: Vec<UttAction>,
+    app: &tauri::AppHandle,
+    sentence_tx: &tokio::sync::mpsc::Sender<TranscriptSentence>,
+) -> bool {
+    for act in acts {
+        match act {
+            UttAction::Partial { uid, speaker, text } => {
+                let _ = app.emit(
+                    "lt-partial",
+                    serde_json::json!({
+                        "utterance_id": uid,
+                        "speaker_id": speaker,
+                        "text": text,
+                    }),
+                );
+            }
+            UttAction::Final {
+                uid,
+                speaker,
+                text,
+                start_ms,
+                end_ms,
+                reason,
+            } => {
+                crate::log_buffer::info(format!(
+                    "asr(translate): 定稿句 #{uid} speaker={speaker} 原因={} 文本={}",
+                    reason.as_str(),
+                    preview(&text)
+                ));
+                // 定稿事件由**识别侧**发（此刻文本最新）。翻译侧不再重复发
+                // lt-final —— 既避免同句两次定稿，也少一次等待。
+                let _ = app.emit(
+                    "lt-final",
+                    serde_json::json!({
+                        "utterance_id": uid,
+                        "speaker_id": speaker,
+                        "text": text,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "reason": reason.as_str(),
+                    }),
+                );
+                let sent = TranscriptSentence {
+                    utterance_id: uid,
+                    text,
+                    speaker_id: speaker,
+                    definite: true,
+                    start_ms,
+                    end_ms,
+                    correction: false,
+                };
+                if sentence_tx.send(sent).await.is_err() {
+                    return false;
+                }
+            }
+            UttAction::Correction { uid, text } => {
+                crate::log_buffer::info(format!(
+                    "asr(translate): 迟到修订 #{uid} 文本={}",
+                    preview(&text)
+                ));
+                let _ = app.emit(
+                    "lt-correction",
+                    serde_json::json!({
+                        "utterance_id": uid,
+                        "text": text,
+                    }),
+                );
+                let sent = TranscriptSentence {
+                    utterance_id: uid,
+                    text,
+                    speaker_id: String::new(),
+                    definite: false,
+                    start_ms: None,
+                    end_ms: None,
+                    correction: true,
+                };
+                if sentence_tx.send(sent).await.is_err() {
+                    return false;
+                }
+            }
+            UttAction::Ignore(why) => {
+                crate::log_buffer::info(format!("asr(translate): 忽略一帧（{why}）"));
+            }
+        }
+    }
+    true
+}
+
+/// 实时翻译会话：持续录音 → 说话人分离流式识别 → 每定稿一句投给翻译编排器。
+///
+/// 与 `run_call` 的差异：
+/// - 首包用 `translate_request_json()`（带说话人分离 + 语言参数）；
+/// - **不做客户端停顿兜底注入**：翻译链路以服务端 `definite` 定稿为准，
+///   避免"半句被翻译"（中间结果直接上屏由 UI 处理，不进翻译）；
+/// - 定稿句带 `utterance_id`（客户端自增）投给 `sentence_tx`。
+///
+/// `sentence_tx` 的接收端是 `live_translate.rs` 的翻译消费任务。
+pub async fn run_translate(
+    app: tauri::AppHandle,
+    api_key: String,
+    asr_url: String,
+    resource_id: String,
+    src_lang: String,
+    enable_speaker: bool,
+    mut audio_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    stop_flag: Arc<AtomicBool>,
+    sentence_tx: tokio::sync::mpsc::Sender<TranscriptSentence>,
+) -> Result<(), String> {
+    // 1. 建连（与 run_recognition / run_call 相同）
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut request = asr_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| format!("构造请求失败: {e}"))?;
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            "X-Api-Key",
+            HeaderValue::from_str(&api_key).map_err(|e| format!("API Key 非法: {e}"))?,
+        );
+        headers.insert(
+            "X-Api-Resource-Id",
+            HeaderValue::from_str(&resource_id).map_err(|e| format!("Resource ID 非法: {e}"))?,
+        );
+        headers.insert(
+            "X-Api-Request-Id",
+            HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "X-Api-Connect-Id",
+            HeaderValue::from_str(&request_id).map_err(|e| e.to_string())?,
+        );
+        headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
+    }
+
+    let connect_started = Instant::now();
+    let (ws, resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| {
+            crate::log_buffer::err(format!(
+                "asr(translate): 建连超时（{} 秒）url={asr_url}",
+                CONNECT_TIMEOUT.as_secs()
+            ));
+            format!(
+                "连接语音服务超时（{} 秒无响应）—— 网络或服务端异常",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| {
+            crate::log_buffer::err(format!("asr(translate): 建连失败 url={asr_url} err={e}"));
+            format!("连接语音服务失败: {e}")
+        })?;
+    let logid = resp
+        .headers()
+        .get("x-tt-logid")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    crate::log_buffer::info(format!(
+        "asr(translate): 建连成功 url={asr_url} lang={src_lang} speaker={enable_speaker} \
+         request_id={request_id} 耗时={}ms logid={logid}",
+        connect_started.elapsed().as_millis()
+    ));
+    let (mut sink, mut stream) = ws.split();
+
+    // 2. 首包（实时翻译参数）
+    let first_json = translate_request_json(&src_lang, enable_speaker);
+    crate::log_buffer::info(format!("asr(translate): → 首包 seq=1 json={first_json}"));
+    let first = build_frame_with_compression(
+        MT_FULL_CLIENT_REQUEST,
+        FLAG_HAS_SEQUENCE,
+        SER_JSON,
+        COMP_GZIP,
+        Some(1),
+        first_json.as_bytes(),
+    );
+    tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Binary(first)))
+        .await
+        .map_err(|_| format!("发送首包超时（{} 秒）", SEND_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("发送首包失败: {e}"))?;
+
+    // 3. 主循环：持续发包；定稿句投给翻译编排器。
+    let mut seq: i32 = 2;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 分句跟踪器：把服务端乱序/修订的帧收敛成「一句一 uid」。详见其文档注释。
+    let mut tracker = UtteranceTracker::new();
+    // 服务端错误帧：记录但不当场失败（会话是边识别边投递的）。
+    let mut server_error: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            maybe_audio = audio_rx.recv() => {
+                match maybe_audio {
+                    Some(pcm) => {
+                        let frame = build_frame(
+                            MT_AUDIO_ONLY_REQUEST,
+                            FLAG_HAS_SEQUENCE,
+                            SER_RAW,
+                            Some(seq),
+                            &pcm,
+                        );
+                        seq += 1;
+                        tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Binary(frame)))
+                            .await
+                            .map_err(|_| {
+                                format!(
+                                    "发送音频超时（{} 秒）—— 上行链路卡住，本次翻译已放弃",
+                                    SEND_TIMEOUT.as_secs()
+                                )
+                            })?
+                            .map_err(|e| format!("发送音频失败: {e}"))?;
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            maybe_msg = stream.next() => {
+                match maybe_msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        match parse_translate_frame(&data) {
+                            Some((text, speaker, definite, start_ms, end_ms, _)) => {
+                                let acts =
+                                    tracker.on_frame(&text, &speaker, definite, start_ms, end_ms);
+                                if !apply_utt_actions(acts, &app, &sentence_tx).await {
+                                    // 接收端已关（会话被停），识别随之收尾。
+                                    crate::log_buffer::warn(
+                                        "asr(translate): 翻译队列已关闭，结束识别",
+                                    );
+                                    break;
+                                }
+                            }
+                            None => {
+                                if let Some(err) = extract_asr_error(&data) {
+                                    crate::log_buffer::err(format!(
+                                        "asr(translate): ← 错误帧 {err}"
+                                    ));
+                                    let _ = app.emit("lt-state", serde_json::json!({
+                                        "running": true,
+                                        "error": err,
+                                    }));
+                                    server_error = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Text(data))) => {
+                        if let Some((text, speaker, definite, start_ms, end_ms)) =
+                            extract_translate_result(data.as_bytes())
+                        {
+                            let acts =
+                                tracker.on_frame(&text, &speaker, definite, start_ms, end_ms);
+                            if !apply_utt_actions(acts, &app, &sentence_tx).await {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(format!("接收失败: {e}")),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // 4. 负包收尾（flags=0b0010，无 sequence，payload 空——设计文档要求）。
+    let _ = sink.send(Message::Binary(final_frame())).await;
+    crate::log_buffer::info("asr(translate): → 负包（flags=LAST，无 sequence）");
+
+    // 5. 收尾：读剩余回包，捕获最后一句定稿。**必须有截止时间**（防砖）。
+    let deadline = tokio::time::sleep(FINALIZE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                crate::log_buffer::warn(format!(
+                    "asr(translate): 收尾超过 {} 秒未收到最后一包，直接收尾",
+                    FINALIZE_TIMEOUT.as_secs()
+                ));
+                break;
+            }
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        match parse_translate_frame(&data) {
+                            Some((text, speaker, definite, start_ms, end_ms, is_last)) => {
+                                let acts =
+                                    tracker.on_frame(&text, &speaker, definite, start_ms, end_ms);
+                                if !apply_utt_actions(acts, &app, &sentence_tx).await {
+                                    break;
+                                }
+                                if is_last {
+                                    break;
+                                }
+                            }
+                            None => {
+                                if let Some(err) = extract_asr_error(&data) {
+                                    crate::log_buffer::err(format!(
+                                        "asr(translate): ← 收尾错误帧 {err}"
+                                    ));
+                                    server_error = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Text(data))) => {
+                        if let Some((text, speaker, definite, start_ms, end_ms)) =
+                            extract_translate_result(data.as_bytes())
+                        {
+                            let acts =
+                                tracker.on_frame(&text, &speaker, definite, start_ms, end_ms);
+                            if !apply_utt_actions(acts, &app, &sentence_tx).await {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+    }
+
+    // 尾部兜底：把仍在流式中的最后半句封口（用户点「停止」时不丢尾巴）。
+    let tail = tracker.flush();
+    let _ = apply_utt_actions(tail, &app, &sentence_tx).await;
+
+    let _ = sink.close().await;
+
+    // 会话边识别边投递：已投出的句子不该因收尾出错作废；只有"一句都没投 + 服务端报错"才算失败。
+    if let Some(e) = server_error {
+        crate::log_buffer::err(format!("asr(translate): 会话结束（服务端报错）{e}"));
+        if !tracker.has_finalized() {
+            return Err(e);
+        }
+    }
+    crate::log_buffer::info("asr(translate): 会话结束");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! 「没识别到文字」必须**说得出病在哪一段链路**。
@@ -1435,6 +2343,53 @@ mod tests {
         assert_ne!(old, f, "新旧写法必须能区分，否则这条测试形同虚设");
     }
 
+    /// `final_frame_with_negative_seq` 与官方 Python demo 对齐：带负序号 + LAST 标志。
+    #[test]
+    fn final_frame_with_negative_seq_matches_official_demo() {
+        let f = final_frame_with_negative_seq(-5);
+        assert_eq!(f.len(), 12, "头 4 + sequence 4 + 长度 4，空 payload");
+        assert_eq!(f[0], 0x11);
+        assert_eq!(f[1] >> 4, MT_AUDIO_ONLY_REQUEST);
+        assert_ne!(f[1] & FLAG_HAS_SEQUENCE, 0, "必须带 sequence 标志");
+        assert_ne!(f[1] & FLAG_LAST_PACKAGE, 0, "必须带 LAST 标志");
+        assert_eq!(f[2], SER_RAW << 4, "负包不压缩");
+        assert_eq!(&f[4..8], &(-5i32).to_be_bytes(), "sequence 必须是传入的负数");
+        assert_eq!(&f[8..12], &[0, 0, 0, 0], "空 payload");
+    }
+
+    /// `build_frame_with_compression` 的 compression 位必须正确写入 header byte2 低 4 位。
+    #[test]
+    fn build_frame_with_compression_sets_gzip_bit() {
+        let payload = b"hello";
+        let f = build_frame_with_compression(
+            MT_FULL_CLIENT_REQUEST,
+            FLAG_HAS_SEQUENCE,
+            SER_JSON,
+            COMP_GZIP,
+            Some(1),
+            payload,
+        );
+        assert_eq!(f[2] & 0x0F, COMP_GZIP, "compression 位必须是 GZIP");
+        assert_eq!(f[2] >> 4, SER_JSON, "serialization 位必须是 JSON");
+        // gzip 压缩后的 payload 一定和原始不同（有 gzip 头）。
+        let payload_size = u32::from_be_bytes([f[8], f[9], f[10], f[11]]) as usize;
+        assert!(payload_size > payload.len(), "gzip 压缩后应包含 gzip 头，比原文大");
+        // 解压回来应该等于原文。
+        let compressed = &f[12..12 + payload_size];
+        let decompressed = gzip_decompress(compressed).expect("gzip 解压必须成功");
+        assert_eq!(decompressed, payload);
+    }
+
+    /// gzip 压缩 → 解压往返必须还原原文。
+    #[test]
+    fn gzip_compress_decompress_roundtrip() {
+        for original in [b"".as_slice(), b"x", b"hello world", &[0u8; 320][..]] {
+            let compressed = gzip_compress(original);
+            let decompressed = gzip_decompress(&compressed).expect("解压必须成功");
+            assert_eq!(decompressed, original, "往返必须还原原文");
+        }
+    }
+
     /// 有文本就**不许**因为服务端错误帧作废 —— 这是用户"说出去的话"。
     #[test]
     fn server_error_does_not_wipe_already_recognized_text() {
@@ -1451,5 +2406,268 @@ mod tests {
         // 失败判定只看"有没有文本"，不看有没有错误 —— 两者都要报，但文本优先保住。
         assert!(!out.text.trim().is_empty(), "有文本就不是失败");
         assert!(out.server_error.is_some(), "错误也要带出去，不瞒着");
+    }
+
+    // -----------------------------------------------------------------------
+    // 实时翻译（live-translate）：首包参数与说话人解析
+    // -----------------------------------------------------------------------
+
+    /// ⛔ 翻译首包必须带上说话人分离三件套：enable_speaker_info + ssd_version=200 + 不指定 language。
+    ///
+    /// 官方文档明确：enable_speaker_info 的前置条件是 ① language 不指定或 zh-CN（用默认中英文模型）
+    /// ② enable_nonstream=true ③ ssd_version="200"。三者缺一，服务端会静默忽略 enable_speaker_info，
+    /// 返回的 utterances 无 speaker_id —— 这正是"两人对话只识别出一人音色"的根因。
+    #[test]
+    fn translate_request_enables_speaker_and_uses_given_language() {
+        let json = translate_request_json("en-US", true);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let req = &v["request"];
+        assert!(req.get("language").is_none(), "说话人分离时不指定 language，用默认中英文模型");
+        assert_eq!(req["enable_speaker_info"], true, "必须开启说话人分离");
+        assert_eq!(req["ssd_version"], "200", "必须配置 ssd_version=200（官方示例要求）");
+        assert_eq!(req["enable_ddc"], false, "说话人分离时关闭 DDC 顺滑（官方示例对齐）");
+        assert_eq!(req["end_window_size"], 1500, "VAD 判停 1500ms（给 SSD 更长音频段聚类）");
+        assert_eq!(req["show_utterances"], true, "必须开启分句输出（speaker_id 的前提）");
+        assert_eq!(req["enable_nonstream"], true, "沿用通话模式的二遍识别 + VAD 断句");
+        assert!(req.get("enable_lid").is_none(), "说话人分离时不该开自动语种识别");
+        assert_eq!(v["audio"]["format"], "pcm", "audio.format=pcm（设计文档要求）");
+        assert_eq!(v["user"]["uid"], "lt-mic", "user.uid 对齐设计文档");
+        assert_eq!(v["user"]["platform"], "Windows", "user.platform 标识客户端");
+    }
+
+    /// `auto` 时改用 `enable_lid`，且**不**下发 `language`（两者互斥）。
+    #[test]
+    fn translate_request_auto_language_uses_lid_instead_of_language() {
+        let json = translate_request_json("auto", false);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let req = &v["request"];
+        assert_eq!(req["enable_lid"], true, "auto 必须开启自动语种识别");
+        assert!(req.get("language").is_none(), "auto 时不该再指定固定语言");
+        assert!(req.get("enable_speaker_info").is_none(), "关闭说话人分离时不该下发该字段");
+        assert!(req.get("ssd_version").is_none(), "关闭说话人分离时不该下发 ssd_version");
+    }
+
+    /// `enable_speaker = false` 且具体语言时，正常下发 `language`，不加说话人相关字段。
+    #[test]
+    fn translate_request_without_speaker_sets_language_and_omits_speaker_fields() {
+        let json = translate_request_json("en-US", false);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let req = &v["request"];
+        assert_eq!(req["language"], "en-US", "关闭说话人分离时语言来自参数");
+        assert!(req.get("enable_speaker_info").is_none(), "不该下发 enable_speaker_info");
+        assert!(req.get("ssd_version").is_none(), "不该下发 ssd_version");
+        assert!(req.get("enable_lid").is_none(), "具体语言时不该开 enable_lid");
+    }
+
+    /// 说话人从 `utterances[0].speaker_id` 取 —— 这是"按人分栏"的唯一数据源。
+    #[test]
+    fn extract_translate_result_reads_speaker_from_utterances() {
+        let json = br#"{"result":{"text":"Hello","utterances":[
+            {"text":"Hello","speaker_id":"spk1","definite":true,"start_time":100,"end_time":900}
+        ]}}"#;
+        let (text, speaker, definite, start, end) =
+            extract_translate_result(json).expect("应能解析");
+        assert_eq!(text, "Hello");
+        assert_eq!(speaker, "spk1", "说话人必须来自 utterances");
+        assert!(definite);
+        assert_eq!(start, Some(100));
+        assert_eq!(end, Some(900));
+    }
+
+    /// 服务端没给 utterances 时，兜底走顶层 text + speaker_id，**翻译链路不许断**。
+    #[test]
+    fn extract_translate_result_falls_back_to_top_level() {
+        let json = br#"{"result":{"text":"Fallback","speaker_id":"spk2","definite":false}}"#;
+        let (text, speaker, definite, _s, _e) =
+            extract_translate_result(json).expect("兜底路径也必须能解析");
+        assert_eq!(text, "Fallback");
+        assert_eq!(speaker, "spk2");
+        assert!(!definite);
+    }
+
+    /// utterances 里 text 为空时（服务端回声帧），继续走兜底而不是返回空句。
+    #[test]
+    fn extract_translate_result_skips_empty_utterance() {
+        let json = br#"{"result":{"text":"real","utterances":[{"text":"","speaker_id":"spk0"}]}}"#;
+        let (text, _speaker, _definite, _s, _e) =
+            extract_translate_result(json).expect("空 utterance 不该让整句丢失");
+        assert_eq!(text, "real", "空 utterance 必须回退到顶层 text");
+    }
+
+    /// ⛔ 回归钉子：多分句时**必须取最新一条**，不能取第一条。
+    ///
+    /// utterances 是会话累积数组，取 `first()` 会永远拿到第一句（第一个说话人），
+    /// 于是"两人对话"永远只显示一个人的音色 —— 这就是本次故障的形状。
+    #[test]
+    fn extract_translate_result_takes_latest_utterance_not_first() {
+        let json = br#"{"result":{"text":"A B","utterances":[
+            {"text":"First speaker","speaker_id":"spk0","definite":true},
+            {"text":"Second speaker","speaker_id":"spk1","definite":true}
+        ]}}"#;
+        let (text, speaker, definite, _s, _e) =
+            extract_translate_result(json).expect("应能解析");
+        assert_eq!(text, "Second speaker", "必须取最新分句，不是第一句");
+        assert_eq!(speaker, "spk1", "说话人必须跟着最新分句走");
+        assert!(definite);
+    }
+
+    /// 说话人字段名与取值格式的兼容：`speaker` / `spk` / 数字型都要认。
+    #[test]
+    fn extract_speaker_accepts_alternate_field_names_and_types() {
+        // additions.speaker_id（SSD 二遍的规范路径——设计文档：utterances[*].additions.speaker_id）
+        let a0: Value = serde_json::from_str(r#"{"text":"x","additions":{"speaker_id":"0"}}"#).unwrap();
+        assert_eq!(extract_speaker(&a0).as_deref(), Some("spk0"));
+        let a1: Value = serde_json::from_str(r#"{"text":"x","additions":{"speaker_id":1}}"#).unwrap();
+        assert_eq!(extract_speaker(&a1).as_deref(), Some("spk1"));
+        // speaker_id 数字型（直接子节点，兼容旧路径）
+        let a: Value = serde_json::from_str(r#"{"text":"x","speaker_id":1}"#).unwrap();
+        assert_eq!(extract_speaker(&a).as_deref(), Some("spk1"));
+        // speaker 字段 + 纯数字字符串
+        let b: Value = serde_json::from_str(r#"{"text":"x","speaker":"2"}"#).unwrap();
+        assert_eq!(extract_speaker(&b).as_deref(), Some("spk2"));
+        // spk 字段 + 带前缀字符串
+        let c: Value = serde_json::from_str(r#"{"text":"x","spk":"spk3"}"#).unwrap();
+        assert_eq!(extract_speaker(&c).as_deref(), Some("spk3"));
+        // 都没有 → None（交由调用方决定回退）
+        let d: Value = serde_json::from_str(r#"{"text":"x"}"#).unwrap();
+        assert_eq!(extract_speaker(&d), None);
+    }
+
+    // ── UtteranceTracker：末尾文本丢失缺陷的回归测试 ──────────────────
+    // 覆盖三条根因路径：句内打断、迟到修订、跨句短句去重误杀。
+
+    /// 抽出 Final 动作的 (uid, text, reason)，非 Final 用哨兵标记。
+    fn finals(acts: &[UttAction]) -> Vec<(u64, String, FinalReason)> {
+        acts.iter()
+            .filter_map(|a| match a {
+                UttAction::Final { uid, text, reason, .. } => {
+                    Some((*uid, text.clone(), *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tracker_single_speaker_continuous_keeps_every_sentence() {
+        let mut t = UtteranceTracker::new();
+        let mut got: Vec<(u64, String, FinalReason)> = Vec::new();
+        // 同一人三句，每句 partial 两帧后 definite。
+        for (spk, s, txt) in [
+            ("spk0", 1000i64, "第一句"),
+            ("spk0", 3000, "第二句"),
+            ("spk0", 5000, "第三句"),
+        ] {
+            t.on_frame(txt, spk, false, Some(s), None);
+            let acts = t.on_frame(&format!("{txt}。"), spk, true, Some(s), Some(s + 900));
+            got.extend(finals(&acts));
+        }
+        let f = got;
+        // 三句都定稿，uid 互不相同
+        assert_eq!(f.len(), 3, "三句都应定稿: {f:?}");
+        assert_eq!(f.iter().map(|(u, _, _)| *u).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(f.iter().all(|(_, tx, _)| tx.ends_with('。')));
+    }
+
+    #[test]
+    fn tracker_speaker_switch_seals_previous_utterance() {
+        // 根因 1：speaker1 还没定稿，speaker2 插话 → speaker1 必须在此封口，
+        // 否则 speaker2 的中间结果会覆盖式写到 speaker1 的行上。
+        let mut t = UtteranceTracker::new();
+        t.on_frame("我先去拿个东西", "spk0", false, Some(1000), None);
+        let acts = t.on_frame("我接着说", "spk1", false, Some(2000), None);
+        let f = finals(&acts);
+        assert_eq!(f.len(), 1, "旧句应立即封口: {acts:?}");
+        assert_eq!(f[0].0, 0);
+        assert_eq!(f[0].1, "我先去拿个东西", "speaker1 的文本必须完整保留");
+        assert_eq!(f[0].2, FinalReason::SpeakerSwitch);
+        // 新句 uid=1，仍是 partial
+        assert!(matches!(acts.last(), Some(UttAction::Partial { uid: 1, .. })));
+    }
+
+    #[test]
+    fn tracker_interruption_within_same_start_ms_switches_speaker() {
+        // 根因 1 的变体：服务端把两人内容塞进同一条 utterance（start_ms 相同），
+        // 靠 speaker 变化切分。
+        let mut t = UtteranceTracker::new();
+        t.on_frame("你以为我想", "spk0", false, Some(1000), None);
+        let acts = t.on_frame("你以为我想，其实", "spk1", false, Some(1000), None);
+        let f = finals(&acts);
+        assert_eq!(f.len(), 1, "{acts:?}");
+        assert_eq!(f[0].2, FinalReason::SpeakerSwitch);
+        assert_eq!(f[0].1, "你以为我想");
+    }
+
+    #[test]
+    fn tracker_repeated_short_sentences_are_not_deduped_away() {
+        // 根因 3：跨句 `text != last_final` 去重会把连续两个「好的」吞掉定稿。
+        let mut t = UtteranceTracker::new();
+        t.on_frame("好的", "spk0", false, Some(1000), None);
+        t.on_frame("好的。", "spk0", true, Some(1000), Some(1200));
+        t.on_frame("好的", "spk1", false, Some(2000), None);
+        let acts = t.on_frame("好的。", "spk1", true, Some(2000), Some(2200));
+        let f = finals(&acts);
+        assert_eq!(f.len(), 1, "第二句必须独立定稿: {acts:?}");
+        assert_eq!(f[0].0, 1, "第二句应是新 uid");
+        assert!(t.has_finalized());
+    }
+
+    #[test]
+    fn tracker_late_revision_becomes_correction_not_new_row() {
+        // 根因 2：SSD 二遍回补已定稿句 → 只改那一行，不新建行、不重翻译。
+        let mut t = UtteranceTracker::new();
+        t.on_frame("今天的会议", "spk0", false, Some(1000), None);
+        t.on_frame("今天的会议结束。", "spk0", true, Some(1000), Some(1800));
+        // 重复定稿帧 → Ignore
+        let dup = t.on_frame("今天的会议结束。", "spk0", true, Some(1000), Some(1800));
+        assert!(
+            dup.iter().all(|a| matches!(a, UttAction::Ignore(_))),
+            "重复帧应被忽略: {dup:?}"
+        );
+        // 修订帧 → Correction，指向 uid 0
+        let acts = t.on_frame("今天的会议已经结束了。", "spk0", true, Some(1000), Some(2000));
+        assert!(
+            matches!(&acts[0], UttAction::Correction { uid: 0, text } if text == "今天的会议已经结束了。"),
+            "{acts:?}"
+        );
+        assert_eq!(finals(&acts).len(), 0, "修订不得产生新 Final");
+    }
+
+    #[test]
+    fn tracker_flush_keeps_trailing_partial_sentence() {
+        // 用户点「停止」时，最后半句不能丢。
+        let mut t = UtteranceTracker::new();
+        t.on_frame("我还没说完呢", "spk0", false, Some(1000), None);
+        let f = finals(&t.flush());
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].1, "我还没说完呢");
+        // 再 flush 幂等
+        assert!(t.flush().is_empty());
+    }
+
+    #[test]
+    fn tracker_flush_is_noop_when_nothing_pending() {
+        let mut t = UtteranceTracker::new();
+        assert!(!t.has_finalized());
+        assert!(t.flush().is_empty());
+        assert!(!t.has_finalized());
+    }
+
+    #[test]
+    fn tracker_empty_text_is_ignored() {
+        let mut t = UtteranceTracker::new();
+        let acts = t.on_frame("   ", "spk0", false, Some(1000), None);
+        assert!(acts.iter().all(|a| matches!(a, UttAction::Ignore(_))));
+        assert_eq!(t.flush().len(), 0);
+    }
+
+    #[test]
+    fn tracker_missing_speaker_falls_back_to_spk0() {
+        let mut t = UtteranceTracker::new();
+        let acts = t.on_frame("喂", "", false, Some(1000), None);
+        assert!(
+            matches!(&acts[0], UttAction::Partial { speaker, .. } if speaker == "spk0"),
+            "{acts:?}"
+        );
     }
 }

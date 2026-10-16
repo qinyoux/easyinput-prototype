@@ -60,6 +60,13 @@
   --accent-text: #ff6b35;
   --accent-rgb: 255, 107, 53;
   --on-accent: #fff;
+  /* 「实心高亮块」的前景色（压 --accent-solid 上）。
+     ⚠️ **不能复用 --on-accent**：深色主题的 --accent-solid 是**亮橙 #ff6b35**，
+     白字压上去对比度只有约 2.9:1，属于"看着有字、实际读不出"——
+     亮色主题的 --accent-solid 是**深橙 #c2410c**，白字才有 5.2:1。
+     同一个变量在两套主题下承担完全不同的角色，所以这里单独给：
+     深色底浅橙 ⇒ 用**近黑**（≈8.6:1）。 */
+  --on-hi: #1a1206;
   --brand-grad-end: #ff9a6b;
 
   /* 语义状态 */
@@ -102,7 +109,10 @@
   --border: #e7e5e4;
   --border-rgb: 231, 229, 228;
   --text: #1c1917;
-  --text-dim: #78716c;
+  /* 次级文字压 panel-2 需 ≥4.5:1。原先 #78716c 只有 4.40:1（差 0.10），
+     凡是「灰底 + 灰字」的次级按钮/徽标在浅色主题下全部擦边不合格。
+     压深到 #6f675e 后为 5.10:1，是同一色相族里的最小改动。 */
+  --text-dim: #6f675e;
 
   /* 品牌强调色：珊瑚橙（文字态加深，保证浅底可读性） */
   --accent: #ff6b35;
@@ -112,6 +122,9 @@
   --accent-text: #c2410c;
   --accent-rgb: 255, 107, 53;
   --on-accent: #fff;
+  /* 亮色主题的 --accent-solid 是深橙 #c2410c，白字 5.2:1 ⇒ 沿用白字。
+     与深色主题的差别见上面 --on-hi 的注释。 */
+  --on-hi: #fff;
   --brand-grad-end: #fb923c;
 
   /* 语义状态 */
@@ -207,10 +220,13 @@ body {
   width: 26px;
   height: 26px;
   border-radius: 7px;
+  /* 渐变两端都是浅橙（--accent #ff6b35 → --brand-grad-end），
+     白字压上去只有约 2.1:1 —— 侧边栏左上角那块 logo 一直读不出来。
+     与实心块同源：改用 --on-hi（深色主题下是近黑），两套主题都能过 4.5:1。 */
   background: linear-gradient(135deg, var(--accent), var(--brand-grad-end));
   font-weight: 700;
   font-size: 12px;
-  color: var(--on-accent);
+  color: var(--on-hi);
 }
 
 .brand-name {
@@ -315,6 +331,115 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/*
+ * 固件版本徽标：贴在「开发板检测」右侧。
+ *
+ * ⚠ 它不是装饰。版本串由板子**自己报出**（0x13 状态请求 → 0x11/kind 0x04），
+ * 是"固件到底烧没烧进去"唯一可信的回答。所以三个态必须在颜色上分得开：
+ * 读到了（ok）/ 读失败（bad）/ 还没读或板子不在线（中性灰）。
+ * 合成一档的话，"读到旧版本"和"没读到"看起来会一模一样。
+ */
+.fw-badge {
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fw-badge:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 离线 / 读取中：不可点，也不该抢注意力。 */
+.fw-badge:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.fw-badge.ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.fw-badge.ok:hover:not(:disabled) {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.fw-badge.bad {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.fw-badge.bad:hover:not(:disabled) {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.license-badge {
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.license-badge:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.license-badge.ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.license-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-family: var(--mono, "JetBrains Mono", monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input, #1c1c22);
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.license-msg {
+  font-size: 13px;
+  margin: 4px 0 10px;
+}
+
+.license-msg.ok {
+  color: var(--ok);
+}
+
+.license-msg.bad {
+  color: var(--err);
 }
 
 /* ---------- 主体布局 ---------- */
@@ -518,7 +643,7 @@ body {
 /* ---------- 按钮 ---------- */
 .btn-primary {
   background: var(--accent-solid);
-  color: var(--on-accent);
+  color: var(--on-hi);
   border: none;
   border-radius: var(--radius-sm);
   padding: 8px 14px;
@@ -685,6 +810,31 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* 「功能动作」按插件 / 功能归类的多个独立下拉 */
+.named-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.named-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.named-group-label {
+  flex: 0 0 92px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.named-group .select {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* ---------- 可视化键盘布局 ---------- */
@@ -918,7 +1068,7 @@ body {
 
 .chip-btn.chip-active {
   background: var(--accent-solid);
-  color: var(--on-accent);
+  color: var(--on-hi);
   border-color: var(--accent-solid);
 }
 
@@ -1243,7 +1393,7 @@ body {
   border-radius: 50%;
   border: none;
   background: var(--accent-solid);
-  color: var(--on-accent);
+  color: var(--on-hi);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1481,7 +1631,7 @@ body {
 .field button {
   border: none;
   background: var(--accent-solid);
-  color: var(--on-accent);
+  color: var(--on-hi);
   font-size: 13px;
   font-weight: 600;
   padding: 0 16px;
@@ -1678,10 +1828,10 @@ body {
 .btn:hover { color: var(--text); border-color: var(--accent); }
 .btn.primary {
   background: var(--accent-solid);
-  color: var(--on-accent);
+  color: var(--on-hi);
   border-color: transparent;
 }
-.btn.primary:hover { background: var(--accent-solid-hover); color: var(--on-accent); }
+.btn.primary:hover { background: var(--accent-solid-hover); color: var(--on-hi); }
 .btn.danger {
   background: transparent;
   color: var(--err-text);
@@ -1836,6 +1986,73 @@ body {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+}
+
+/* ==========================================================================
+   设置页：分组标题条（sticky）
+   --------------------------------------------------------------------------
+   背景：设置页把「通用设置」与「任务台相关设置」拼在**同一个滚动容器**里
+   （`App.tsx`：`<GeneralSettings /><DeskSettings />`），两侧各自是
+   `.settings-section` 卡片流，不做任何区分 ⇒ 滚到中段时用户已经不知道
+   自己在看哪一组的设置。
+   做法：每组一个 sticky 标题条。sticky 是关键 —— 它让"当前属于哪一组"
+   在**滚动的任意时刻**都成立，而不只是在分组起点的那一瞬间可见。
+   配色克制：只用品牌色做一条左侧色条，不铺大面积底色（会盖住卡片）。
+   ========================================================================== */
+.settings-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 2px 8px;
+  margin-top: 4px;
+  background: var(--bg);
+  /* sticky 需要不透明底色，否则卡片会"透"上来。--bg 是页面底色。 */
+}
+
+/* 左侧竖色条：这是"分组"的唯一强信号，比文字更耐扫视。 */
+.settings-group-head::before {
+  content: "";
+  flex-shrink: 0;
+  width: 3px;
+  align-self: stretch;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* 任务台这一组：上边距 + 虚线分割，明确"从这行往下换了类别"。
+   没有 .first 变体 —— 通用设置那组不加分隔（页面开头不需要"从这开始"的提示）。 */
+.settings-group-head.desk {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.settings-group-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+/* 分组下的一句说明，回答"这组管什么、为什么要分开"。 */
+.settings-group-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* 组标题右侧的条目数徽标：一眼看出这组有多大。 */
+.settings-group-count {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  color: var(--text-dim);
 }
 
 /* ===================== 主题外观 ===================== */
@@ -3257,6 +3474,18 @@ body {
   color: var(--warn);
 }
 
+/* 「丢弃未读」那一行：与「播报未读」同处一块，但用虚线分隔在视觉上讲清
+   —— 它是**人工泄压阀**，不是播报流程的一环（流程只负责"听完才消费"）。 */
+.desk-discard-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+
 /* ---------- 任务台播报（Phase 3 第二段「后声」） ---------- */
 /* 语料列表：10 条固定语料逐条可试听。比执行器列表更紧凑 —— 它更长，也更少看。 */
 .desk-notice-list .desk-driver {
@@ -3344,12 +3573,8 @@ body {
   color: var(--text-dim);
 }
 
-.desk-prefer-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
-}
+/* .desk-prefer-item 的样式已移到文件末尾「任务台：选项状态高对比」段，
+   与 .desk-opt / .btn-ghost:disabled 放在一起，便于整体调整状态对比。 */
 
 /* 进度档位的一格：标签 + 分钟输入 + 单位。 */
 .desk-mark {
@@ -3376,6 +3601,13 @@ body {
   border-radius: var(--radius-md);
   background: var(--panel-2);
   overflow: hidden;
+}
+
+/* 不可调度（未配置 / 未启用）：整行压低对比，但**不隐藏** ——
+   用户要能一眼看出"它存在、只是现在派不了"，而不是以为没配过。 */
+.desk-driver-row.off {
+  border-style: dashed;
+  opacity: 0.72;
 }
 
 .desk-driver-row-head {
@@ -3671,6 +3903,21 @@ body {
   display: none;
 }
 
+/* 「播报」里的二级折叠（预合成语料）。
+   标题行沿用一级板块的形态（caret + 标题 + 徽标），但字号/字重降一档、边距收紧 ——
+   让它读起来是"这个板块里的一小节"，而不是又一个平级板块。
+   ⚠️ 一级那条 flex 规则写死成 `.desk-section > h3`（**直接子代**），嵌套的 h3 匹配不到；
+   这里必须显式再给一次 `display:flex`，否则折叠按钮会掉成块级、徽标被挤到下一行。 */
+.desk-subfold > h3.desk-h3-flex {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
 /* 设置页 / 模型配置页：§ 标题一行，说明按钮靠右。 */
 .settings-title-flex {
   display: flex;
@@ -3862,4 +4109,101 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
+}
+
+/* ==========================================================================
+   任务台：选项状态高对比
+   --------------------------------------------------------------------------
+   目标：**一眼分出"现在能按"和"按了没反应"**，不靠读文字。
+   规则（AGENTS.md §3 的视觉对应）：
+     可用   → 实心填充 + 亮前景色 + 正常光标
+     不可用 → 无填充 + 虚线/置灰 + 低对比 + not-allowed
+   禁用原因一律写在旁边的 `desk-opt-reason` 里，不靠 hover 才看得到。
+   ========================================================================== */
+
+/* ---------- 任务台：选项状态高对比 ---------- */
+/* ⚠️ 这里所有规则都写在 `.field label` **之后**，且特异度必须 ≥ (0,1,1)：
+   「播报哪几类」的每一项本身就是 `<label class="desk-prefer-item">`，
+   外面还套着 `.field` ⇒ `.field label`（0,1,1）会压过 `.desk-prefer-item`（0,1,0），
+   它的 `color: var(--text-dim)` 与 `display: block` 都会生效。
+   v0.41.12 就是踩了这个坑：文字压橙色底几乎看不见，而**审计脚本查不出来**
+   （它只算"规则声明的组合"，不算"实际谁赢"）。
+   ⇒ 凡是给 .field 内部的 label 单独上色，必须写成 `.field .desk-prefer-item`。 */
+
+/* --- 选项本体：可用态 --- */
+.desk-opt,
+.field .desk-prefer-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  margin: 0;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  background: var(--accent-solid);
+  color: var(--on-hi);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+
+/* --- 选项本体：不可用态（置灰纯文本） --- */
+.desk-opt.off {
+  border-color: var(--border);
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-dim);
+  font-weight: 400;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+/* 不可用原因：紧跟选项，永远可见（不是 title 提示）。 */
+.desk-opt-reason {
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+.desk-opt-reason.bad {
+  color: var(--err-text);
+}
+
+/* --- 徽章：不可用态。与 .desk-tag.ok / .warn 并列，第三种状态 --- */
+.desk-tag.off {
+  border-color: var(--border);
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+/* --- 候选项（能力勾选、播报分类）：可用实心，禁用置灰 ---
+   基础样式已合并进上面的 `.desk-opt, .field .desk-prefer-item`（同一条规则），
+   这里只补「禁用态」。注意也要带上 `.field ` 前缀压过 `.field label`。 */
+.field .desk-prefer-item:has(input:disabled),
+.field .desk-prefer-item.off {
+  border-color: var(--border);
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-dim);
+  font-weight: 400;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+/* --- ghost 按钮的禁用态：此前完全没有样式，禁用与可点视觉无差别 --- */
+.btn-ghost:disabled {
+  color: var(--text-dim);
+  border-color: var(--border);
+  border-style: dashed;
+  background: transparent;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.btn-ghost:disabled:hover {
+  color: var(--text-dim);
+  border-color: var(--border);
 }

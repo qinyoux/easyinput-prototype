@@ -3,12 +3,30 @@
 //! 通过调用 Everything 官方的命令行工具 `es.exe` 执行搜索。
 //! 要求用户已安装 Everything 且正在后台运行，并配置了 es.exe 的路径。
 //!
-//! es.exe 命令：`es.exe "query" -n 50 -csv -size -attributes`
+//! es.exe 命令：`es.exe "query" -n 50 -export-csv <file> -utf8-bom -size -attributes`
 //!
-//! CSV 格式（UTF-8）：
+//! CSV 格式（**UTF-8 with BOM**）：
 //!   Filename, Size, Attributes
 //!
 //! Attributes: 16=目录(D), 32=存档(A), 1=只读(R), 2=隐藏(H), 4=系统(S)
+//!
+//! ## 为什么必须用 -export-csv + -utf8-bom（而不是直接读 stdout）
+//!
+//! es.exe 是 **ANSI（本地代码页 ACP）程序**，不是 UTF-8 程序：
+//! 它把 UTF-16 文件名按系统 ACP（本机936 = GBK）转换后写 stdout。
+//! Windows 管道是**裸字节流，没有编码协商机制**，子进程不会因为父进程
+//! 想要 UTF-8 就改变编码。所以 `es.exe ... -csv` 的 stdout 是 GBK 字节，
+//! 例如「文档」= `CE C4 B5 B5`。
+//!
+//! 若用 `String::from_utf8_lossy` 按 UTF-8 解这些字节，4 个字节会各自变成
+//! 一个 U+FFFD（`�`），得到「�ĵ�」—— 即中文乱码，且**信息不可恢复**。
+//! 用 `from_utf8_lossy` 只是不 panic，并不代表解码正确。
+//!
+//! `-export-csv <file> -utf8-bom` 是 es.exe 唯一能产出 UTF-8 的方式：
+//! 写文件时强制加 UTF-8 BOM（实测首字节 EF BB BF）。因此本模块读临时文件、
+//! 按 UTF-8 解码并剥掉 BOM，而不是读管道。
+//!
+//! 注意：`-csv` 单独使用时**不会**让 stdout 变成 UTF-8，别被参数名误导。
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -77,6 +95,9 @@ pub fn resolve_es_path(everything_path: &str) -> Option<String> {
 /// - `max_results`: 最多返回多少条结果
 ///
 /// 返回匹配的文件/文件夹列表。
+///
+/// 实现说明：不读 stdout（那是 ACP 字节），改用 `-export-csv` + `-utf8-bom`
+/// 落临时文件后按 UTF-8 读取。详见文件头「为什么必须用 -export-csv」。
 pub fn search(everything_path: &str, query: &str, max_results: usize) -> Result<Vec<EverythingResult>, String> {
     let es_path = resolve_es_path(everything_path)
         .ok_or_else(|| "Everything 未配置或 es.exe 不存在".to_string())?;
@@ -85,12 +106,21 @@ pub fn search(everything_path: &str, query: &str, max_results: usize) -> Result<
         return Ok(Vec::new());
     }
 
-    // 调用 es.exe 搜索并输出 CSV
+    // 每次搜索一个唯一临时文件，避免并发搜索互相覆盖
+    let csv_path = std::env::temp_dir().join(format!(
+        "easyop_es_{}_{}.csv",
+        std::process::id(),
+        next_search_seq()
+    ));
+
+    // 调用 es.exe 搜索并输出 UTF-8 CSV
     let output = Command::new(&es_path)
         .arg(query)
         .arg("-n")
         .arg(max_results.to_string())
-        .arg("-csv")
+        .arg("-export-csv")
+        .arg(&csv_path)
+        .arg("-utf8-bom")
         .arg("-size")
         .arg("-attributes")
         .output()
@@ -98,6 +128,8 @@ pub fn search(everything_path: &str, query: &str, max_results: usize) -> Result<
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // 清理可能残留的半成品文件
+        let _ = std::fs::remove_file(&csv_path);
         return Err(format!(
             "Everything 搜索失败，退出码: {:?}, 错误: {}",
             output.status.code(),
@@ -105,9 +137,46 @@ pub fn search(everything_path: &str, query: &str, max_results: usize) -> Result<
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results = parse_csv(&stdout, max_results)?;
+    // 读 UTF-8 CSV 文件并解析（无论成败都要清理临时文件）
+    let raw = match std::fs::read(&csv_path) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_file(&csv_path);
+            return Err(format!("读取 es.exe 输出文件失败: {}", e));
+        }
+    };
+    let _ = std::fs::remove_file(&csv_path);
+
+    // 剥掉 UTF-8 BOM后按 UTF-8 解码：es.exe -utf8-bom 保证此处必定成功，
+    // 用 from_utf8（严格）以便万一不成立时能暴露问题，而不是静默产生乱码。
+    let csv_text = match String::from_utf8(strip_bom(&raw).to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(format!(
+                "es.exe 输出不是合法 UTF-8（已用 -utf8-bom，应属异常）：{}",
+                e
+            ));
+        }
+    };
+
+    let results = parse_csv(&csv_text, max_results)?;
     Ok(results)
+}
+
+/// 剥掉 UTF-8 BOM（EF BB BF）。
+fn strip_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(&[0xEFu8, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        bytes
+    }
+}
+
+/// 搜索序号计数器，保证同进程内临时文件名唯一（防止并发搜索覆盖）。
+fn next_search_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// 解析 es.exe 输出的 CSV。
@@ -233,6 +302,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_strip_bom() {
+        // 有BOM → 剥掉前3 字节
+        assert_eq!(strip_bom(&[0xEF, 0xBB, 0xBF, b'a']), b"a");
+        // 无 BOM → 原样返回
+        assert_eq!(strip_bom(b"Filename,Size"), b"Filename,Size");
+        // 空输入
+        assert_eq!(strip_bom(&[]), b"");
+    }
+
+    #[test]
+    fn test_bom_stripped_bytes_are_valid_utf8() {
+        // 回归测试：es.exe 旧实现把 GBK 字节交给 String::from_utf8_lossy，
+        // 「文档」= CE C4 B5 B5 会变成两个 U+FFFD。现在走 -utf8-bom，
+        // 文件内容是合法 UTF-8，剥 BOM 后必须能被严格解码。
+        let mut raw: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice("Filename,Size,Attributes\n".as_bytes());
+        raw.extend_from_slice("\"E:\\文档\\a.txt\",100,32\n".as_bytes());
+        let text = String::from_utf8(strip_bom(&raw).to_vec()).expect("剥离BOM 后必须是合法 UTF-8");
+        assert!(text.starts_with("Filename"));
+        assert!(text.contains("文档"));
+        assert!(!text.contains('\u{FFFD}'), "不允许出现替换字符");
+    }
+
+    #[test]
+    fn test_gbk_bytes_would_break_utf8_lossy() {
+        // 反向证明：若有人改回from_utf8_lossy 读 stdout，这个用例会失败。
+        // 「文档」在 GBK(936) 下是 CE C4 B5 B5，不是合法 UTF-8。
+        let gbk = [0xCEu8, 0xC4, 0xB5, 0xB5];
+        assert!(String::from_utf8(gbk.to_vec()).is_err(), "GBK 字节不应能按 UTF-8 严格解码");
+        let lossy = String::from_utf8_lossy(&gbk);
+        assert!(
+            lossy.contains('\u{FFFD}'),
+            "from_utf8_lossy 应产生替换字符，这正是旧 bug 的乱码来源"
+        );
+    }
+
+    #[test]
     fn test_parse_csv_line_simple() {
         let line = r#""C:\test\file.txt",1234,32"#;
         let fields = parse_csv_line(line);
@@ -308,6 +414,56 @@ mod tests {
             println!("  {} [{}字节] dir={}", r.name, r.size, r.is_dir);
             assert!(!r.name.is_empty());
             assert!(r.path.contains(r.name.as_str()));
+        }
+    }
+
+    #[test]
+    fn test_search_real_es_chinese_not_mojibake() {
+        // 端到端回归：搜中文关键词，结果路径里不允许出现 U+FFFD。
+        // 旧实现（es.exe -csv 读 stdout + from_utf8_lossy）在这里必然失败。
+        let everything_path = r"D:\Program Files\Everything1.5\Everything.exe";
+        if resolve_es_path(everything_path).is_none() {
+            println!("跳过测试：Everything 未安装在默认路径");
+            return;
+        }
+
+        let results = search(everything_path, "文档", 10).unwrap();
+        if results.is_empty() {
+            println!("跳过测试：未搜到含「文档」的结果");
+            return;
+        }
+        for r in &results {
+            println!("  {}", r.path);
+            assert!(
+                !r.path.contains('\u{FFFD}'),
+                "路径含替换字符 U+FFFD，说明编码处理有误：{}",
+                r.path
+            );
+            assert!(
+                !r.name.contains('\u{FFFD}'),
+                "文件名含替换字符 U+FFFD：{}",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_real_es_preserves_non_acp_chars() {
+        // ACP(936/GBK) 无法表示的字符（ß/Ω/Δ）必须保真，
+        // 这是 GBK 管道的必然丢失点，UTF-8 导出才修得回来。
+        let everything_path = r"D:\Program Files\Everything1.5\Everything.exe";
+        if resolve_es_path(everything_path).is_none() {
+            println!("跳过测试：Everything 未安装");
+            return;
+        }
+
+        let results = search(everything_path, "Ω", 20).unwrap();
+        for r in &results {
+            assert!(
+                !r.path.contains('\u{FFFD}'),
+                "非 ACP 字符被破坏：{}",
+                r.path
+            );
         }
     }
 }

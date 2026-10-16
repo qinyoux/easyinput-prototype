@@ -38,6 +38,7 @@ function listBuiltin() {
   if (!existsSync(SRC_ROOT)) return [];
   return readdirSync(SRC_ROOT)
     .filter((n) => statSync(join(SRC_ROOT, n)).isDirectory())
+    .filter((n) => !n.startsWith(".")) // 跳过 .workbuddy 等非插件目录
     .sort();
 }
 
@@ -61,7 +62,7 @@ function readFile(p) {
 }
 
 /** 开发期目录/文件，不进运行时（用户不需要，且会把插件目录撑大）。 */
-const EXCLUDE = new Set(["test", "node_modules", ".git", "__pycache__"]);
+const EXCLUDE = new Set(["test", "src", "node_modules", ".git", "__pycache__"]);
 
 function copyDir(from, to) {
   mkdirSync(to, { recursive: true });
@@ -96,6 +97,7 @@ function main() {
   }
 
   // 坏插件在部署阶段就拦下——比装进去让 easyop 静默跳过好。
+  let firstPageTitle = "";
   for (const n of targets) {
     const src = join(SRC_ROOT, n);
     if (!existsSync(src)) {
@@ -104,21 +106,46 @@ function main() {
     }
     const info = assertManifest(src);
     if (!info.ok) {
-      console.error(`✘ ${n} 校验失败：${info.why}`);
-      process.exit(2);
+      if (names.length) {
+        // 显式点名装某个插件时保持严格：装错了要立刻报错。
+        console.error(`✘ ${n} 校验失败：${info.why}`);
+        process.exit(2);
+      }
+      // 全量部署时跳过非插件目录（如 .workbuddy / 备份目录），不拦整批。
+      console.warn(`⚠ 跳过 ${n}：${info.why}`);
+      continue;
     }
     const dst = join(target, n);
     if (dry) {
       console.log(`[dry] ${src} → ${dst}`);
       continue;
     }
+    // 覆盖前先把旧版整体备份：内置插件会随开发迭代，而运行目录那份可能是
+    // 用户/agent 直接改过的唯一副本（曾发生过 v0.41.5 覆盖丢功能的事故）。
+    if (existsSync(join(dst, "plugin.json"))) {
+      const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+      const bak = `${dst}.bak.${stamp}`;
+      try {
+        cpSync(dst, bak, { recursive: true });
+        console.log(`  已备份旧版 → ${bak}`);
+      } catch (e) {
+        console.error(`✘ 备份失败，中止部署以防覆盖丢失：${e.message}`);
+        process.exit(3);
+      }
+    }
     copyDir(src, dst);
     console.log(`✔ ${n} → ${dst}  （${info.manifest.name} v${info.manifest.version || "?"}）`);
+    // 记住第一个页签标题：结尾提示要说清"侧栏会出现哪个页签"，别写死某个插件的名字。
+    if (!firstPageTitle) {
+      firstPageTitle = info.manifest?.contributes?.pages?.[0]?.title || "";
+    }
   }
 
   if (dry) return;
   console.log("");
-  console.log("下一步：重启 easyop（或在插件管理页点刷新 → plugins_rescan），然后 ⌘SS 搜「内容台」。");
+  console.log(
+    `下一步：重启 easyop（或在插件管理页点刷新 → plugins_rescan），侧栏出现「${firstPageTitle || "插件"}」页签。`,
+  );
 }
 
 main();

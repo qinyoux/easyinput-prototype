@@ -26,10 +26,9 @@ pub fn reserved_uuid_for_named(name: &str) -> Option<&'static str> {
         "workbench_confirm" => Some(UUID_WORKBENCH_CONFIRM),
         "ss_palette" => Some(UUID_SS_PALETTE),
         "cli_terminal" => Some(UUID_CLI_TERMINAL),
-        "studio_prev" => Some(UUID_STUDIO_PREV),
-        "studio_next" => Some(UUID_STUDIO_NEXT),
-        "studio_confirm" => Some(UUID_STUDIO_CONFIRM),
-        _ => None,
+
+        // 插件声明的命令（`<plugin>.<command>`）：启动时已注册保留 UUID。
+        _ => crate::plugin_registry::plugin_action_uuid(name),
     }
 }
 
@@ -47,10 +46,9 @@ pub fn named_for_reserved_uuid(uuid: &str) -> Option<&'static str> {
         UUID_WORKBENCH_CONFIRM => Some("workbench_confirm"),
         UUID_SS_PALETTE => Some("ss_palette"),
         UUID_CLI_TERMINAL => Some("cli_terminal"),
-        UUID_STUDIO_PREV => Some("studio_prev"),
-        UUID_STUDIO_NEXT => Some("studio_next"),
-        UUID_STUDIO_CONFIRM => Some("studio_confirm"),
-        _ => None,
+
+        // 插件声明的命令（`<plugin>.<command>`）：逆查得到全限定命令 id。
+        _ => crate::plugin_registry::resolve_action_uuid(uuid).map(|(_, c)| c),
     }
 }
 
@@ -91,6 +89,20 @@ pub fn to_firmware_value(action: &ActionSpec) -> Value {
                 Value::String("disabled".into())
             }
         },
+        ActionSpec::Studio(v) => {
+            let uuid = match v.as_str() {
+                "prev" => UUID_STUDIO_PREV,
+                "next" => UUID_STUDIO_NEXT,
+                "confirm" => UUID_STUDIO_CONFIRM,
+                _ => {
+                    crate::log_buffer::err(format!(
+                        "内容台动作值非法（{action:?}），本次下发已降级为 disabled"
+                    ));
+                    return Value::String("disabled".into());
+                }
+            };
+            Value::String(format!("{HOST_ACTION_PREFIX}{uuid}"))
+        }
     }
 }
 

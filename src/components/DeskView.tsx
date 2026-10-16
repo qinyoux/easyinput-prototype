@@ -12,11 +12,12 @@
 //   后端 `emit_state_if_changed` **只在真变化时发**事件（不刷屏）。代价是——刚进页面
 //   时没有任何变化可言，纯监听会一直空着。所以必须先用一次轮询拿到初始值；之后
 //   事件负责即时性，轮询负责兜底（事件通道万一断了，界面不能就此僵住）。
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../api";
 import { CollapsibleHint, CollapsibleSection } from "./Collapsible";
 import type {
+  ChannelStatePayload,
   ConsumeOutcome,
   DeskSnapshot,
   DispatchOutcome,
@@ -182,10 +183,29 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
   const [noticeStatus, setNoticeStatus] = useState<NoticeStatusReport | null>(null);
   /** 最近一条上屏的播报（来自 `agent-desk-notice` 事件）。 */
   const [lastNotice, setLastNotice] = useState<NoticeEventPayload | null>(null);
+  /**
+   * 喇叭实况：正在播什么 + 后面还排着谁（`agent-desk-channel` 事件）。
+   *
+   * ⚠️ 为什么必须是**独立状态**，不能从 `snap` 里现取：`snap` 5 秒轮一次，
+   * 而队首等待恰恰发生在那 5 秒里 —— 只靠轮询，用户看到的是"已经播完了、
+   * 界面还写着在排队"，于是以为坏了。等待感来自不可见，不来自等待。
+   * 初值取自快照（事件通道可能还没连上），之后由事件接管。
+   */
+  const [channel, setChannel] = useState<ChannelStatePayload | null>(null);
+  /** 是否已经收到过 `agent-desk-channel`。用来决定快照能不能当兜底初值。 */
+  const channelSeenRef = useRef(false);
   /** 「播报未读」操作哪个槽。**独立于派发槽位** —— 这两件事没理由被绑在同一个选择器上。 */
   const [renderSlot, setRenderSlot] = useState(0);
   /** 最近一次"播报未读"的结果，用来把「听完才消费」这件事显式化。 */
   const [renderOutcome, setRenderOutcome] = useState<RenderResultReport | null>(null);
+  /**
+   * 「丢弃未读」的两段式确认。
+   *
+   * 不用 `window.confirm`：那是个会阻塞渲染线程的原生对话框，样式与主题脱节，
+   * 且在 webview 里行为依平台而异。两段式按钮不引入任何新依赖，也把
+   * "这一步不可逆"写在按钮本身（第二段文案变成"确认丢弃 N 条"）而不是写在弹窗里。
+   */
+  const [discardArmed, setDiscardArmed] = useState(false);
 
   // ---- 任务历史 ----
   //
@@ -224,6 +244,18 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         return;
       }
       setSnap(env.data ?? null);
+      // 喇叭实况的**初值**取自快照，但只在**还没收到过任何事件**时才写。
+      //
+      // ⚠️ 为什么不每次轮询都覆盖：请求往返期间队列可能已经变了（更极端的是，
+      // 响应里带着的是"读取那一刻"的状态，而事件早已推过更新的一版）——
+      // 无条件覆盖会让界面在"在播 / 空闲"之间来回跳，比慢 5 秒更让人困惑。
+      // 收到过事件就说明通道是通的，此后一律以事件为准。
+      if (env.data && !channelSeenRef.current) {
+        setChannel({
+          playing: env.data.playing,
+          notice_queue: env.data.notice_queue,
+        });
+      }
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -388,6 +420,34 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
       un?.();
     };
   }, [refreshNoticeStatus]);
+
+  // 喇叭实况：订阅 `agent-desk-channel`（遗留项第 3 条）。
+  //
+  // ⚠️ 不轮询：这里的事件是**播放动作**驱动的，频率由播放时长决定，
+  // 而"正在播什么、排着几条"的变化恰恰都发生在两次播放之间 ——
+  // 轮询要么太慢（错过等待期），要么为了抓这些变化而空转。
+  // 唯一的兜底是 `refresh()` 里那份快照初值（只在没收到过事件时才写）。
+  useEffect(() => {
+    let un: UnlistenFn | undefined;
+    let alive = true;
+    listen<ChannelStatePayload>("agent-desk-channel", (e) => {
+      if (!alive) return;
+      channelSeenRef.current = true;
+      setChannel(e.payload);
+    })
+      .then((f) => {
+        if (alive) un = f;
+        else f();
+      })
+      .catch(() => {
+        // 事件通道不可用不致命：喇叭照样在响、未读账本照样准，
+        // 这一层只是"让等待可见"。不弹错误（同 `agent-desk-state` 的处置）。
+      });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
 
   /** 统一包一层：连点保护 + 错误如实上报 + 成功后刷新运行时。 */
   async function run<T>(
@@ -606,6 +666,11 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                 <div className="desk-slot-head">
                   <span className="desk-slot-key">S{s.index + 1}</span>
                   <span className="desk-slot-mode">{s.mode}</span>
+                  {s.notes.length > 0 && (
+                    <span className="desk-tag off" title={s.notes.join("；")}>
+                      不可用
+                    </span>
+                  )}
                   {u && u.leased && <span className="desk-tag ok">播放中</span>}
                   {u && u.pending > 0 && <span className="desk-tag warn">未读 {u.pending}</span>}
                   {q && q.depth > 0 && <span className="desk-tag">待执行 {q.depth}</span>}
@@ -698,10 +763,8 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           <span className="desk-tag">Phase 2</span>
         </h3>
         <p className="empty-hint desk-lead">
-          这一块只回答一个问题：<strong>引擎现在行不行</strong>。
-          灯只有三档 —— 空闲（绿）· 正在执行（橙）·{" "}
-          <strong>有积压却没在跑</strong>（黄）。最后那档是唯一"要你留意"的：
-          有活排着队，却没有任何槽位在干，通常意味着卡住了。
+          引擎状态三档：<strong>空闲</strong>（绿）· <strong>正在执行</strong>（橙）·{" "}
+          <strong>有积压却没在跑</strong>（黄，唯一需要你留意的一档）。
         </p>
 
         {rtError && <p className="desk-bad">运行时状态读取失败：{rtError}</p>}
@@ -751,31 +814,21 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
               label="为什么重启后未读还在，队列却清零了？"
             >
               <p className="hint">
-                队列<strong>不持久化</strong>：一个"正在执行"的任务在重启后并不存在 ——
-                它对应的子进程 / HTTP 请求已经随进程一起消失了。把队列存下来再恢复，
-                只会得到一堆永远不会完成的<strong>幽灵任务</strong>。
+                队列<strong>不持久化</strong>：子进程 / HTTP 请求已随进程消失，恢复出来只会是永不完成的<strong>幽灵任务</strong>。
                 <br />
-                未读<strong>持久化</strong>：它的定义是"有一条结果你还没听过"，
-                这件事不会因为重启而变得不成立 —— 所以重启后未读还在是对的，
-                你上次没听的那条结果仍然等着你。
+                未读<strong>持久化</strong>：它的定义是"有一条结果你还没听过"，不因重启而失效。
               </p>
             </CollapsibleHint>
 
             <CollapsibleHint id="desk-runtime-led" label="键盘上那 5 颗灯分别在显示什么？">
               <ul className="desk-notes">
                 <li>
-                  <strong>第 1–4 颗</strong> = 四个槽各自的未读，绿色、亮度分三档
-                  （1–3 / 4–6 / 7 条以上）。正在播放的那个槽换一种颜色。
+                  <strong>第 1–4 颗</strong> = 各槽未读，亮度分三档（1–3 / 4–6 / 7+）；正在播放的槽换色。
                 </li>
                 <li>
-                  <strong>第 5 颗</strong> = <strong>正在执行的槽数</strong>，不是一个开关：
-                  0 / 1 / 2 / 3 / 4 分别对应绿、黄、橙、紫、红五档。
+                  <strong>第 5 颗</strong> = <strong>正在执行的槽数</strong>（0/1/2/3/4 → 绿/黄/橙/紫/红），不是开关。
                 </li>
               </ul>
-              <p className="hint">
-                所以"第 5 颗灯"不能用"亮 / 灭"来概括 —— 那是它最早的简化说法，
-                已经不再准确（上面灯箱里的"执行中 N"才是同一件事的完整表达）。
-              </p>
             </CollapsibleHint>
           </>
         )}
@@ -801,10 +854,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           }
         >
         <p className="empty-hint desk-lead">
-          这一整块<strong>不参与日常使用</strong> —— 按键能用了之后，
-          派发、播放这些动作都由键盘触发。它的价值在<strong>手上没有硬件时</strong>：
-          不接板子也能把整条编排链路压一遍
-          （入队 → 执行 → 终态 → 未读 → 租约 → 消费），复现问题、验回归都靠它。
+          不参与日常使用。手上没有硬件时，用它压完整条链路（入队 → 执行 → 终态 → 未读 → 租约 → 消费）。
         </p>
 
         <h4 className="desk-sub-title">① 手动派发</h4>
@@ -835,10 +885,9 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           />
           <p className="hint">
             {sessionInfo[dispatchSlot]
-              ? `S${dispatchSlot + 1} 正在续接会话 ${sessionInfo[dispatchSlot]!.id_short}…（执行器 ${sessionInfo[dispatchSlot]!.driver_id}）—— 下一条任务会接着这段对话跑。`
-              : `S${dispatchSlot + 1} 目前没有会话 —— 下一条任务会新起一轮对话。`}
-            {" "}
-            想换个话题就点「新起一轮对话」。
+              ? `S${dispatchSlot + 1} 续接会话 ${sessionInfo[dispatchSlot]!.id_short}…（${sessionInfo[dispatchSlot]!.driver_id}）`
+              : `S${dispatchSlot + 1} 无会话，下一条新起一轮`}
+            。想换话题点「新起一轮对话」。
           </p>
           <div className="desk-dispatch-row">
             <button className="btn-primary" onClick={dispatch} disabled={op === "dispatch"}>
@@ -846,8 +895,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
             </button>
           </div>
           <p className="hint">
-            派发即 <strong>后台执行</strong>：过程不占你的屏幕，跑完会语音播报结论、
-            有产物就自动打开。要追溯过程，用下面的「任务历史」。
+            后台执行：跑完播报结论、有产物自动打开。追溯过程用下面的「任务历史」。
           </p>
           <div className="desk-dispatch-row">
             <button
@@ -889,8 +937,8 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
               清空待执行
             </button>
             {rt && rt.queue.total_pending > 0 && (
-              <span className="desk-hint-inline">
-                当前共 {rt.queue.total_pending} 条排队（每槽上限 8 条，到顶会明确报错，不会静默丢弃）
+              <span className="desk-opt-reason">
+                排队 {rt.queue.total_pending} 条（每槽上限 8，到顶报错不静默丢弃）
               </span>
             )}
           </div>
@@ -898,9 +946,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
 
         <h4 className="desk-sub-title">② 播放租约</h4>
         <p className="hint">
-          模拟一次「按键播放」的生命周期：<strong>取租约 → 回执（听完）</strong>。
-          <strong>取租约本身不扣未读</strong>，只有回执才扣 ——
-          抢占、播到一半拔电，未读都保留。
+          模拟「按键播放」：<strong>取租约 → 回执（听完）</strong>。取租约不扣未读，只有回执才扣。
         </p>
 
         {!lease ? (
@@ -923,10 +969,10 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
             >
               取租约
             </button>
-            <span className="desk-hint-inline">
+            <span className={`desk-opt-reason${leasePending === 0 ? " bad" : ""}`}>
               {leasePending > 0
                 ? `该槽有 ${leasePending} 条未读`
-                : "该槽没有未读 —— 没有可播的内容，取不到租约"}
+                : "不可用：该槽没有未读，没有可播的内容"}
             </span>
           </div>
         ) : (
@@ -982,9 +1028,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         )}
 
         <p className="hint">
-          ⚠️ Phase 3 才接音频下行 —— 这里<strong>不会真的出声</strong>，
-          它验证的是账本与租约那一层：迟到回执不消费新租约、抢占不消费未读、
-          播到一半拔电未读保留。
+          ⚠️ 键盘喇叭未接 PCM 通道，这里<strong>不会真的出声</strong>；验的是账本与租约那一层。
         </p>
         </CollapsibleSection>
       </div>
@@ -1001,6 +1045,14 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           badges={
             <>
               <span className="desk-tag">Phase 3 · 后声</span>
+              {/*
+                未读徽标挂在**标题行**上，是"模块本身 / 「预合成语料」都折叠起来"之后
+                仍然要一眼看得见的东西。播报本身不产生未读，但它是**消费**未读的地方 ——
+                "有没有结果等你听"必须在这里就能读出来，而不是翻回上面的状态卡。
+              */}
+              {rt && rt.unread.total_pending > 0 && (
+                <span className="desk-tag warn">未读 {rt.unread.total_pending}</span>
+              )}
               {noticeStatus &&
                 (noticeStatus.offline_ready ? (
                   <span className="desk-tag ok">离线可用</span>
@@ -1013,11 +1065,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           }
         >
         <p className="empty-hint desk-lead">
-          喇叭念的是 <strong>Notice</strong>（状态播报），它和 <strong>未读</strong>
-          是<strong>两条独立通道</strong> ——
-          <strong>听到播报不代表有结果等你听</strong>。判断"有没有未读"只看上面那个
-          未读计数器，别拿这里的字幕当账本。反过来也一样：没听到声音 ≠ 没有未读，
-          可能是语料没预合成、或者你正在做别的事没注意。
+          播报（Notice）与<strong>未读</strong>是两条独立通道：<strong>听到播报 ≠ 有结果等你听</strong>。是否未读只看上面的计数器。
         </p>
 
         {!noticeStatus ? (
@@ -1026,6 +1074,23 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           </p>
         ) : (
           <>
+            {/* ---------------- 预合成语料（二级折叠，默认收起） ----------------
+                要求：「将『播报』模块下的预合成语料的内容折叠隐藏，但不要隐藏『播报』
+                模块本身」。所以**只收这一块** —— 模块标题行（未读 / 就绪徽标）与下面的
+                「播报未读」「最近一次播报」保持常显。
+                这 11 条语料列表 + 计数器 + 预合成按钮合计比一整屏还高，而日常要看的
+                其实只有"能不能播（离线可用）/ 有没有未读"这两件事，它们都在标题行上。
+                ⚠️ 被包住的内容**不跟着缩进**（同本文件其它折叠块，AGENTS.md §4.3）。 */}
+            <div className="desk-subfold">
+            <CollapsibleSection
+              id="desk-notice-corpus"
+              title="预合成语料"
+              badges={
+                <span className="desk-tag">
+                  {noticeStatus.cached}/{noticeStatus.total} 已就绪
+                </span>
+              }
+            >
             <div className="desk-counters">
               <span>
                 语料 <strong>{noticeStatus.cached}</strong> / {noticeStatus.total} 已就绪
@@ -1055,9 +1120,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
 
             {!noticeStatus.tts_configured && (
               <div className="desk-driver-note bad">
-                ✕ TTS 未配置 ⇒ <strong>无法预合成</strong>。先去「模型配置 → ③ 语音合成」
-                填好语音合成，再回来点下面的按钮。少了这一步，任务跑完只会静默产生未读，
-                而且离线时更是一条都发不出来。
+                ✕ 预合成<strong>不可用</strong>：TTS 未配置。先去「模型配置 → ③ 语音合成」填好，再回来点下面的按钮。
               </div>
             )}
 
@@ -1094,10 +1157,8 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
               >
                 {op === "notice-prepare" ? "合成中…" : "预合成全部语料"}
               </button>
-              <span className="desk-hint-inline">
-                预合成 = 把 10 句固定语料各合成一次、落成本地 wav。之后播报
-                <strong>不再联网</strong> —— 这正是"任务失联"这条告警能发出来的前提：
-                最需要它的时刻，网络往往正是坏的。
+              <span className="desk-opt-reason">
+                预合成 = 把固定语料各合成一次落成本地 wav，之后播报<strong>不再联网</strong>（网络最坏时也能出声）。
               </span>
             </div>
 
@@ -1113,7 +1174,10 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                           已就绪{it.bytes ? ` · ${Math.round(it.bytes / 1024)}KB` : ""}
                         </span>
                       ) : (
-                        <span className="desk-tag warn">未预合成 ⇒ 播不出来</span>
+                        <>
+                          <span className="desk-tag off">不可用</span>
+                          <span className="desk-opt-reason bad">未预合成 ⇒ 播不出来</span>
+                        </>
                       )}
                     </div>
                     <div className="desk-driver-sub">{it.text}</div>
@@ -1149,6 +1213,8 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                 </li>
               ))}
             </ul>
+            </CollapsibleSection>
+            </div>
 
             <div className="desk-lease">
               <div className="desk-driver-title">
@@ -1156,9 +1222,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                 <span className="desk-tag ok">会真的出声</span>
               </div>
               <div className="desk-driver-note">
-                这才是 3.4 / 3.5 要打通的东西：<strong>取租约 → 合成 → 真的播 → 播完才回执</strong>。
-                与上面「播放租约」段的手动回执不同，这里的回执是
-                <strong>播放器自己给的</strong> —— 前端没有任何机会替它撒谎。
+                完整链路：<strong>取租约 → 合成 → 真的播 → 播完才回执</strong>，回执由播放器自己给。
               </div>
               <div className="desk-dispatch-row">
                 <label>槽位</label>
@@ -1196,12 +1260,64 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                 >
                   {op === "render-result" ? "播报中…" : `播报 S${renderSlot + 1} 的未读`}
                 </button>
-                <span className="desk-hint-inline">
-                  {rt && rt.unread.total_pending === 0
-                    ? "现在没有未读 —— 先在上面手动派发一个任务，等它跑完再来。"
-                    : "盯着看：播放中被抢占、或半途拔电，未读都会留着。"}
+                <span className={`desk-opt-reason${(rt?.unread.total_pending ?? 0) === 0 ? " bad" : ""}`}>
+                  {(rt?.unread.total_pending ?? 0) === 0
+                    ? "不可用：现在没有未读，先派发一个任务并等它跑完"
+                    : "播放被抢占或半途断电，未读都会留着"}
                 </span>
               </div>
+
+              {/*
+                泄压阀。未读只能"被完整听完"消费 —— 这是灯可信的前提，不能动。
+                但它有个真实副作用：调试时反复派发的测试任务会一直挂在灯上，
+                把"灯亮 = 有事等你"这个信号本身淹掉。所以补一个**显式**的放弃入口。
+
+                文案刻意避开"标记已读"：它的语义是**删除**，不是"我听过"。
+              */}
+              <div className="desk-discard-row">
+                {discardArmed ? (
+                  <>
+                    <button
+                      className="btn-ghost danger"
+                      disabled={op === "discard-unread"}
+                      onClick={() =>
+                        run(
+                          "discard-unread",
+                          () => api.deskDiscardUnread(),
+                          (n: number | undefined) => {
+                            setDiscardArmed(false);
+                            notify(
+                              "ok",
+                              `已丢弃 ${n ?? 0} 条未读 —— 未读灯已熄灭。这些结果不会再被念出来（是删除，不是已读）。`,
+                            );
+                          },
+                        )
+                      }
+                    >
+                      {op === "discard-unread"
+                        ? "清理中…"
+                        : `确认丢弃 ${rt?.unread.total_pending ?? 0} 条`}
+                    </button>
+                    <button className="btn-ghost" onClick={() => setDiscardArmed(false)}>
+                      取消
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      className="btn-ghost danger"
+                      disabled={(rt?.unread.total_pending ?? 0) === 0}
+                      onClick={() => setDiscardArmed(true)}
+                    >
+                      丢弃全部未读
+                    </button>
+                    <span className="desk-opt-reason">
+                      「听完才消费」之外的人工出口：<strong>放弃收听</strong>、清掉积压。不可撤销。
+                    </span>
+                  </>
+                )}
+              </div>
+
               {renderOutcome && (
                 <div
                   className={`desk-driver-note ${renderOutcome.consumed ? "ok" : "warn"}`}
@@ -1226,6 +1342,55 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
               )}
             </div>
 
+            {/* 喇叭实况：现在在播什么 + 后面还排着谁（遗留项第 3 条）。
+                没有它，等待期的体验是"听完一句就没声音了，也不知道还有几条" ——
+                用户只能靠未读计数猜，而未读里混着还没排到播的结果。 */}
+            <div className="desk-notice-subtitle">
+              <span className="desk-tag">喇叭</span>
+              {channel?.playing ? (
+                <>
+                  <span className="desk-tag warn">正在播</span>
+                  {channel.playing.slot_label && (
+                    <strong>{channel.playing.slot_label}</strong>
+                  )}
+                  <em className="desk-hint-inline">「{channel.playing.text}」</em>
+                  {channel.playing.notice_kind == null && (
+                    <span className="desk-hint-inline">（结果播报 · 听完才消费未读）</span>
+                  )}
+                </>
+              ) : (
+                <strong className="desk-ok">空闲</strong>
+              )}
+              {channel && channel.notice_queue.length > 0 && (
+                <>
+                  <span className="desk-tag warn">
+                    排队 {channel.notice_queue.length} 条
+                  </span>
+                  {/* 队首单独点出来：它才是"马上要轮到的"，其余是"还要再等" */}
+                  {(() => {
+                    const head = channel.notice_queue[0];
+                    const rest = channel.notice_queue.slice(1);
+                    return (
+                      <>
+                        <span>
+                          下一个：{head.slot_label ? `${head.slot_label} ` : ""}
+                          {head.text}
+                          {head.terminal ? "" : "（进度类）"}
+                        </span>
+                        {rest.length > 0 && (
+                          <span className="desk-hint-inline">
+                            之后：{rest
+                              .map((r) => `${r.slot_label ?? "全局"} ${r.text}`)
+                              .join("、")}
+                          </span>
+                        )}
+                      </>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
+
             <div className="desk-notice-subtitle">
               <span className="desk-tag">最近一次播报</span>
               {lastNotice ? (
@@ -1234,7 +1399,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                   <span>{lastNotice.slot == null ? "（全局进度）" : `S${lastNotice.slot + 1}`}</span>
                   <span>{lastNotice.terminal ? "终态" : "过程类（可丢弃）"}</span>
                   {!lastNotice.audio_path && (
-                    <span className="desk-bad">⚠ 语料未预合成 ⇒ 这一次其实没出声</span>
+                    <span className="desk-tag off">未出声</span>
                   )}
                   <em className="desk-hint-inline">「{lastNotice.text}」</em>
                 </>
@@ -1284,9 +1449,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
           }
         >
         <p className="empty-hint desk-lead">
-          后台执行的前提是"不用守着看"，所以必须留下<strong>能追溯的痕迹</strong>：
-          每次派发跑了多久、什么结果、完整输出在哪、产物是什么。
-          这里只显示最近 50 条，磁盘上留 200 条（含全部日志）。
+          后台执行不用守着看，所以必须留痕：耗时、结果、完整输出、产物。页面显示最近 50 条，磁盘留 200 条（含全量日志）。
         </p>
 
         {historyErr && (
@@ -1294,9 +1457,8 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
         )}
 
         {history.length === 0 && !historyErr && (
-          <p className="desk-hint-inline">
-            还没有任何记录。在上面派发一个任务，或直接按键盘上的 S1–S4 说话 ——
-            跑完之后这里就会出现一条。
+          <p className="desk-opt-reason">
+            还没有记录。派发一个任务，或直接按 S1–S4 说话，跑完后这里会出现一条。
           </p>
         )}
 
@@ -1318,7 +1480,7 @@ export default function DeskView({ notify, onOpenSettings, onOpenApiConfig }: Pr
                     <span className="desk-tag">S{r.slot + 1}</span>
                     <span className={`desk-tag ${okStatus ? "ok" : "warn"}`}>{r.status}</span>
                     {okStatus && !gated && (
-                      <span className="desk-tag" title="完成判定没有世界门禁背书 —— 进程结束了，不等于事情做成了">
+                      <span className="desk-tag off" title="完成判定没有世界门禁背书 —— 进程结束了，不等于事情做成了">
                         未校验
                       </span>
                     )}

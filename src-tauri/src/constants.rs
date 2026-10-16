@@ -26,11 +26,59 @@ pub const REPORT_ID_APP_COMMAND: u8 = 0x11;
 /// | `0x10` | APP → 板 | 配置下发（上面的 `REPORT_ID_CONFIG`） |
 /// | `0x11` | 板 → APP | 回执 / 命令（上面的 `REPORT_ID_APP_COMMAND`） |
 /// | `0x12` | APP → 板 | Agent 状态（16B）。固件渲染成**整条灯带一个状态色** |
-/// | `0x13` | APP → 板 | 状态请求 |
+/// | `0x13` | APP → 板 | 状态请求（即下方的 `REPORT_ID_STATUS_REQUEST`） |
 /// | `0x14` | 板 → APP | 音库资产请求（63B） |
 /// | `0x15` | APP → 板 | 音库资产响应（63B） |
 /// | `0x16` | APP → 板 | **任务台逐像素帧**（本常量） |
 pub const REPORT_ID_DESK_LED: u8 = 0x16;
+
+/// 状态回读请求通道（APP → 板 Feature Report）。
+///
+/// 发出一条 17 字节 Feature Report（1 字节 Report ID + 16 字节载荷），载荷必须
+/// 以 `b"S3R"` + 协议版本开头，并带一个**非 0** 的 `request_id`。固件是 fail-closed：
+/// 任一项不符就**静默丢弃**（连错误回包都没有）—— 所以"发了没反应"首先怀疑载荷
+/// 写错，而不是板子坏了。真源见固件 `components/keyboard/src/status_hid_protocol.cpp`。
+pub const REPORT_ID_STATUS_REQUEST: u8 = 0x13;
+
+/// 0x13 载荷（**不含** Report ID）的固定长度与握手字节。
+pub const STATUS_REQUEST_PAYLOAD_LEN: usize = 16;
+pub const STATUS_REQUEST_MAGIC: [u8; 3] = *b"S3R";
+pub const STATUS_HID_PROTOCOL_VERSION: u8 = 1;
+/// 请求 flag：置位表示"跳过缓存，重建一份新的状态 JSON"。
+pub const STATUS_REQUEST_FLAG_FRESH: u8 = 0x01;
+/// 已知 flag 位集合；出现未知位固件会拒绝整条请求。
+pub const STATUS_REQUEST_KNOWN_FLAGS: u8 = STATUS_REQUEST_FLAG_FRESH;
+
+/// 0x11 命令 kind：**状态响应**。
+///
+/// 与 `KIND_CONFIG_ACK = 0x03`、`KIND_HOST_ACTION = 0x05` 是三个互不重叠的编号，
+/// 不得互换（固件侧有 `static_assert` 钉住 `0x05 != 0x04`）。
+///
+/// ⚠ 2026-09-30 之前本文件只有 0x03 / 0x05 —— 缺 `0x04` 的后果就是"**即使固件回了
+/// 状态，上位机也会把它当未知报文丢掉**"，表现为"板子不支持读版本"。
+pub const KIND_STATUS_RESPONSE: u8 = 0x04;
+
+/// 0x11 kind 0x04 的 63 字节消息容器布局（不含 Report ID）。
+///
+/// ```text
+/// [0]       kind = 0x04
+/// [1]       chunk_index
+/// [2]       total_chunks
+/// [3]       = STATUS_RESPONSE_METADATA_LEN + 本块 JSON 字节数
+/// [4]       协议版本（STATUS_HID_PROTOCOL_VERSION）
+/// [5..9]    request_id u32 LE（回显请求里的值，用于丢弃过期响应）
+/// [9..11]   JSON 总长 u16 LE
+/// [11..13]  JSON 的 crc16-ccitt u16 LE
+/// [13..63]  JSON 分片（每块最多 50 字节）
+/// ```
+pub const STATUS_MESSAGE_PAYLOAD_LEN: usize = 63;
+pub const STATUS_RESPONSE_HEADER_LEN: usize = 4;
+pub const STATUS_RESPONSE_METADATA_LEN: usize = 9;
+/// 单块能携带的 JSON 字节数（50）。
+pub const STATUS_RESPONSE_JSON_PER_CHUNK: usize =
+    STATUS_MESSAGE_PAYLOAD_LEN - STATUS_RESPONSE_HEADER_LEN - STATUS_RESPONSE_METADATA_LEN;
+/// 状态 JSON 的字节上限（固件 `kConfigStatusGattSafeLen`）。
+pub const STATUS_RESPONSE_MAX_JSON_LEN: usize = 512;
 
 /// 0x11 命令 kind。
 pub const KIND_CONFIG_ACK: u8 = 0x03;
@@ -266,10 +314,7 @@ pub const NAMED_ACTIONS: &[&str] = &[
     "ss_palette",
     // ---- easyop 主机端专有（启动终端并预置命令）----
     "cli_terminal",
-    // ---- easyop 主机端专有（内容台旋钮导航）----
-    "studio_prev",
-    "studio_next",
-    "studio_confirm",
+
 ];
 
 /// 内容台旋钮导航的功能列表（按焦点顺序排列）。

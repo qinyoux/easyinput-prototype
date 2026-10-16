@@ -7,6 +7,149 @@
 
 ---
 
+## [v0.45.0] — 2026-10-16
+
+> 署名：qinyoux
+
+### 新增
+
+- **本地激活码（授权码）系统**：让 easyop 成为"可以注册"的正式产品。采用 Ed25519 非对称签名，私钥由作者离线保管、公钥硬编码进二进制；激活码 = `base64url(载荷) + "~" + base64url(签名)`，本机校验、**无需联网、无法伪造**。载荷含版次/过期时间/备注/可选机器绑定。
+  - 后端：`src-tauri/src/license.rs`（纯逻辑 + 9 条单测）、`state.rs` 存取、命令 `activate_license` / `license_status`。
+  - 前端：状态条 `注册 / 激活` 徽标 + 激活弹窗（`src/App.tsx`、`api.ts`、`types.ts`、`styles.css`）。
+  - 作者专用生成器：`scripts/gen_license.mjs`（`genkey` / `pub` / `sign`），私钥 `scripts/.license_private.key` 已被 `.gitignore` 排除。
+- **NSIS 安装包**：`tauri.conf.json` 的 `bundle.targets` 由 `[]` 改为 `["nsis"]`，`tauri build` 现在会产出标准 Windows 安装程序（开始菜单 + 卸载），不再只是便携 exe。
+
+### 变更
+
+- 状态条新增"注册 / 激活"入口，未激活时显示"未注册（试用）"，激活后显示"已注册 · 版次"；激活状态存于本机 `%APPDATA%\com.easyop.app\license.json`。
+- **试用版功能完整**，激活只改变"是否注册"标识，不阉割任何能力。
+
+### 修复
+
+- 修复了"打包只出便携 exe、没有安装包"的问题：根因是 `bundle.targets: []` 在 Tauri 2.11 被当作"无目标"，显式声明 `["nsis"]` 后正常产出安装包。
+
+### ⚠️ 未完成
+
+- 自动更新（Tauri updater）尚未接入：需要作者生成 updater 密钥并托管更新文件，本期只做安装包 + 便携版，升级暂靠手动覆盖。
+- 机器绑定为可选能力（默认发不绑定的码），如需按设备授权，生成时传 `mid` 参数即可。
+
+---
+
+## [v0.44.0] — 2026-10-15
+
+> 署名：workbuddy/easyinput-prototype/锐
+
+> minor：**关闭任务台播报排队机制的三条遗留**（钦友点名要求写清楚的那三条）。
+> ① 进度类不再"被占即丢"；② 合并提醒从"只有条数"变成"带槽位与事项"；
+> ③ 排队等待期与队首**实时可见**（新事件 `agent-desk-channel` + 前端喇叭实况区）。
+
+### 新增
+
+- **`agent-desk-channel` 事件**（`ChannelState { playing, notice_queue }`）：
+  喇叭占用与播报队列一变化就推，"真变化才发"（内容比对，非版本号 —— 并发播放下
+  版本号必然错序）。⚠️ **刻意不并入 `agent-desk-state`**：后者由任务状态驱动，
+  而排队与播完发生在**任务状态完全没变**的时刻；等它再变，等待期已经结束。
+  （即三条遗留里的"队首等待没有实时进度"。）
+- **`project_channel(mgr)`**：喇叭实况的**唯一投影**。快照（5s 轮询）与实时事件
+  同源取值 —— 两处各算一遍早晚会漂移成"喇叭响着 A、界面写着在播 B"，
+  而这种 bug 恰恰在排查时最难重现。
+- **前端喇叭实况区**（`DeskView`）：正在播什么（槽位 + 文本 + 是否结果播报）、
+  排队几条、**队首单独点出**"下一个轮到谁"、其余折叠成"之后：…"。
+  快照只作**初值兜底**（收到过事件后不再覆盖，避免往返延迟导致界面来回跳）。
+- **回归测试 4 条**（投影）：空闲态、队列位置与槽位标签、全局进度无槽位标签、
+  快照与事件同源不漂移。`agent_desk` 共 **289 passed / 0 failed**。
+
+### 变更
+
+- **进度类播报改为"收敛入队"**（遗留 1）：此前被占用即丢，用户对排队期间
+  完全没有感知。现在**最多留一条最新的，且绝不压在终态前面**
+  （队里有终态 ⇒ 进度直接过期丢弃：FIFO 下它永远排在终态后，而终态播完时
+  任务多已结束，"正在推进"成了废话）。规则抽成纯函数 `enqueue_decide` 以便单测 ——
+  排队规则的失败形态是**静默的**（听不到、也无报错），只能靠测试钉死。
+- **合并提醒记明细而非计数**（遗留 2）：`notice_dropped` 从 `AtomicUsize`
+  改为 `Mutex<Vec<DroppedNotice { kind, slot }>>`，正文改为
+  "还有 2 条任务结果未播报（S1 任务已完成、S3 任务失败），请点击查看。"
+  超 3 条退化为纯条数（TTS 按字数计费，一句提醒念半分钟比不念更糟）。
+- **`speak_notice` 增加 `app` 参数**：播放的开始与结束都发生在它内部，
+  调用方在外面拿不到准确时刻，传进来才能在两处各推一次状态事件。
+
+### 修复
+
+- **修 v0.42.0 中断留下的编译错误**：`a_progress_notice_expires_when_a_terminal_is_queued`
+  与 `non_terminal_events_never_queue` 两条测试用 `EnqueueDecision::Drop { reason: _ }`
+  做模式匹配 —— `_` 不能出现在表达式位置，`cargo test` 直接编译失败（`E0599`）。
+  改用 `matches!(..., EnqueueDecision::Drop { .. })`。
+
+### ⚠️ 未完成
+
+- **喇叭硬件下行未闭环**：板载扬声器/键盘喇叭的 PCM 通道仍未接通，
+  播报只走 PC 声卡。本批改的是**排队与可见性**，不涉及输出设备。
+- **排队等待只有"静态快照"，没有进度条**：队首等待期间不会报"还要等约 12 秒"。
+  需要 `PlaybackControl` 暴露剩余时长并让前端定时刷新，属于下一步。
+- **进度类合并提醒仍不记明细**：设计如此（过期进度没有告知价值，
+  报进合并提醒是噪音）。
+
+---
+
+## [v0.43.3] — 2026-10-14
+
+> 署名：workbuddy/easyinput-prototype/锐
+
+> patch：**任务台的 Codex CLI 恢复联网能力**（钦友实测要求"去掉沙箱"）。
+> 预置参数加 `--sandbox danger-full-access`，老配置升级时自动补（只补一个沙箱旗标都没有的）。
+> **不改协议、不改前端、不动用户已设的值。**
+
+### 新增
+
+- **`config.rs` 迁移方向三**：`migrate_presets()` 世代 2 → 3，给老配置的 codex-cli
+  补上去沙箱旗标。只改 `default_drivers()` 对老用户**不生效**——
+  `normalize()` 只按 id 补"从未出现过"的预置，钦友磁盘上的 codex-cli 条目一直在，
+  表现为"升级了还是不能联网"。用户已设 `-s` / `--sandbox` /
+  `--dangerously-bypass-approvals-and-sandbox` 任意一种都不碰（`SANDBOX_FLAG_CANDIDATES`）。
+- **回归测试 4 条**（`config.rs`）：预置必带旗标且落在 `{prompt}` 之前；
+  老配置补旗标一次且仅一次；用户自设旗标绝不覆盖。
+  `cli_driver.rs` 加 1 条：拿**真实预置参数**叠续接，钉死 `resume` 仍落在所有全局选项之后。
+
+### 变更
+
+- **codex-cli 预置参数**：`exec --json --skip-git-repo-check {prompt}`
+  → `exec --json --skip-git-repo-check --sandbox danger-full-access {prompt}`。
+  完全去掉沙箱 ⇒ 命令以当前用户权限运行，**网络与全盘都不再受限**。
+  代价：模型生成的 shell 命令失去全部隔离，与"任务文本可来自语音识别"叠加，
+  只适用于本机自用、prompt 来源可信的场景。恢复隔离 = 删掉这两个参数，
+  或改用 `~/.codex/config.toml` 的 `[sandbox_workspace_write] network_access = true`
+  （保留文件系统边界、只放网络）。
+- **文档同步**：`docs/任务台设计方案.md` §13 命令串、§14.2 迁移表（世代 `< 3`）、
+  §14.3 预置表、**新增 §14.5**（沙箱决策的第一性原理依据 + 实测对照表）；
+  `docs/任务台使用说明.md` §3.1 表格 + **新增 §3.9**（症状/根因/处置/代价）。
+
+### 修复
+
+- **Codex CLI 不能联网（"沙箱受限"）**。根因两层叠加（2026-10-14 本机实测复现，
+  同一命令两次对照）：
+  ① `codex exec` 默认 sandbox 策略 `workspace-write`，该策略下
+  `sandbox_workspace_write.network_access` 默认 false；
+  ② 本机 `~/.codex/config.toml` 的 `[windows] sandbox = "elevated"` 是 Windows
+  原生沙箱（专用低权沙箱用户 + 防火墙规则），联网命令被整体挡掉。
+  该文件顶层的 `network_access = "enabled"` **位置错误被静默忽略**——
+  codex 只认 `[sandbox_workspace_write]` 表内的同名字段。
+  实证：旧预置 curl 退出码 1、`%{http_code}` = `000`；加旗标后退出码 0、`200`。
+- **顺带发现（未改，告知用户）**：`~/.codex/config.toml` 顶层的
+  `network_access = "enabled"` 是无效写法。任务台已不受影响（旗标绕开沙箱），
+  但他**交互式** codex 会话若也想放行网络，需把该键挪进
+  `[sandbox_workspace_write]` 表。这是用户的个人全局配置，应用不代改。
+
+### ⚠️ 未完成
+
+- 去沙箱是"全有或全无"：没有"放行网络但保留文件系统隔离"的中间档预置
+  （中间档依赖用户全局 config.toml，跨机器不可移植，且 Windows 原生沙箱的
+  防火墙是否理会 `network_access = true` 未经本机实证）。需要的话下一步：
+  在本机实证该开关，再决定是否加第二档预置。
+- 播报排队机制遗留（v0.42.0 起记）：排队只覆盖终态类；合并提醒只报条数不报槽位；
+  队首等待无实时进度。
+
+---
+
 ## [v0.43.2] — 2026-10-14
 
 > 署名：workbuddy / easyinput-prototype / AI小助手

@@ -6,15 +6,22 @@
  * 其余四处（tauri.conf.json / Cargo.toml / package-lock.json / Cargo.lock）由本脚本同步。
  *
  * 用法：
- *   node scripts/version.mjs check              校验：五处版本号一致 + CHANGELOG / README 有对应条目
+ *   node scripts/version.mjs check              校验：五处版本号一致 + CHANGELOG / README 有对应条目 + 署名已填
  *   node scripts/version.mjs sync               以 package.json 为准，同步其余四处版本号
  *   node scripts/version.mjs bump <spec>        升版本，同步版本号并插入 CHANGELOG / README 骨架
  *                                               spec = major | minor | patch | 0.7.0
+ *   node scripts/version.mjs bump <spec> --author "<署名>"
+ *                                               署名写入骨架，格式：宿主/项目/会话名
+ *                                               例：workbuddy/easyinput-prototype/AI小助手
+ *
+ * 署名规则（见 AGENTS.md §3.1）：**每个版本节必须署名**，否则 check 失败。
+ * 目的是多 agent 并行改动同一工作树时，能一眼回答"这一版是谁改的"。
  *
  * 退出码：0 = 通过；1 = 校验失败（CI / 收工自检可直接用退出码判断）
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -159,24 +166,56 @@ export function sync(version) {
   return done;
 }
 
+/**
+ * 署名：优先取 --author，其次取环境变量 EASYOP_AUTHOR，最后回落到 git 用户名。
+ * 格式约定：宿主/项目/会话名，例如 workbuddy/easyinput-prototype/AI小助手
+ */
+function resolveAuthor(explicit) {
+  const raw = (explicit || process.env.EASYOP_AUTHOR || "").trim();
+  if (raw) return raw;
+  return null;
+}
+
+/** 取 git user.name 作为兜底署名（拿不到就返回空，交由 check 报错） */
+function gitUserName() {
+  try {
+    return execFileSync("git", ["config", "user.name"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** 取某个版本节的署名行 */
+function authorOf(section) {
+  const m = section.match(/^>\s*署名\s*[:：]\s*(.+)$/m);
+  return m ? m[1].trim() : "";
+}
+
 /** 在 CHANGELOG 首个版本节之前插入新节骨架 */
-function insertChangelog(version) {
+function insertChangelog(version, author) {
   const raw = read(F.changelog);
   if (raw.includes(`## [v${version}]`)) return false;
   const at = raw.search(/^## \[/m);
   if (at < 0) throw new Error("CHANGELOG.md 找不到版本节（## [vX.Y.Z]），请先修正文件结构");
+  const who = author ? author : "（待填写：宿主/项目/会话名，例 workbuddy/easyinput-prototype/AI小助手）";
   const block =
     `## [v${version}] — ${today()}\n\n` +
+    `> 署名：${who}\n\n` +
     `### 新增\n\n- （待填写：新增了什么能力，为什么加）\n\n` +
     `### 变更\n\n- （待填写：改动了什么行为，会不会影响既有配置）\n\n` +
     `### 修复\n\n- （待填写：修了什么问题，根因是什么）\n\n` +
+    `### ⚠️ 未完成\n\n- （待填写：缺什么、卡在哪、下一步走哪条路；没有就写"无"）\n\n` +
     `---\n\n`;
   writeKeepEol(F.changelog, raw.slice(0, at) + block + raw.slice(at), raw);
   return true;
 }
 
 /** 在 README 的「版本历史」下插入新版本摘要骨架 */
-function insertReadme(version) {
+function insertReadme(version, author) {
   const raw = read(F.readme);
   if (raw.includes(`### v${version}\n`)) return false;
   const head = raw.search(/^## 版本历史\s*$/m);
@@ -184,7 +223,10 @@ function insertReadme(version) {
   const bodyFrom = head + raw.slice(head).indexOf("\n");
   const next = raw.slice(bodyFrom).search(/^### /m);
   const at = next < 0 ? raw.length : bodyFrom + next;
-  const block = `### v${version}\n\n- （待填写：一句话概括本版对用户的影响）\n\n`;
+  const who = author ? ` —— 署名：${author}` : "";
+  const block =
+    `### v${version}\n\n` +
+    `- （待填写：一句话概括本版对用户的影响）${who}\n\n`;
   writeKeepEol(F.readme, raw.slice(0, at) + block + raw.slice(at), raw);
   return true;
 }
@@ -210,21 +252,44 @@ function check() {
   console.log(`  ${hasCh ? "✅" : "❌"} CHANGELOG.md 存在 [v${pkgV}] 条目`);
   console.log(`  ${hasRd ? "✅" : "❌"} README.md 版本历史存在 v${pkgV} 条目`);
 
-  const ok = bad.length === 0 && hasCh && hasRd;
+  // ---- 署名校验：只校验当前版本节，历史节不追溯 ----
+  let author = "";
+  let authorOk = false;
+  if (hasCh) {
+    const from = ch.search(new RegExp(`^## \\[v${pkgV.replace(/\./g, "\\.")}\\]`, "m"));
+    const rest = ch.slice(from);
+    const nextIdx = rest.slice(1).search(/^## \[/m);
+    const section = nextIdx < 0 ? rest : rest.slice(0, nextIdx + 1);
+    author = authorOf(section);
+    authorOk = !!author && !/待填写/.test(author);
+    const shown = authorOk ? author : author || "（缺失）";
+    console.log(`  ${authorOk ? "✅" : "❌"} CHANGELOG [v${pkgV}] 已署名：${shown}`);
+    const pending = /^- \（待填写/m.test(section) || /（待填写/.test(section);
+    if (pending) console.log(`  ⚠️ [v${pkgV}] 节内仍有「待填写」占位符，必须填成真内容`);
+  }
+
+  const ok = bad.length === 0 && hasCh && hasRd && authorOk;
   if (!ok) {
     console.log("\n结论：❌ 版本纪律未满足。");
     if (bad.length) console.log(`  · 执行 \`node scripts/version.mjs sync\` 可把其余四处拉到 ${pkgV}`);
     if (!hasCh) console.log(`  · 到 CHANGELOG.md 补 [v${pkgV}] 条目（新增 / 变更 / 修复）`);
     if (!hasRd) console.log(`  · 到 README.md §版本历史 补 v${pkgV} 摘要`);
+    if (!authorOk)
+      console.log(`  · 到 CHANGELOG.md [v${pkgV}] 节补署名行：\`> 署名：宿主/项目/会话名\``);
   } else {
-    console.log(`\n结论：✅ 五处版本号一致，变更说明齐备（v${pkgV}）。`);
+    console.log(`\n结论：✅ 五处版本号一致，变更说明齐备，署名已填（v${pkgV} · ${author}）。`);
   }
   return ok;
 }
 
 // ---------- 入口 ----------
 
-const [cmd, arg] = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const arg = argv[1];
+// 署名来源优先级：--author "..." > EASYOP_AUTHOR 环境变量 > （都不给则写入占位符，check 会拦）
+const authorIdx = argv.indexOf("--author");
+const explicitAuthor = authorIdx >= 0 ? argv[authorIdx + 1] : undefined;
 
 try {
   if (cmd === "check" || !cmd) {
@@ -235,21 +300,23 @@ try {
     console.log(done.length ? `已同步到 v${v}：\n  · ${done.join("\n  · ")}` : `四处版本号已一致（v${v}），无需改动`);
     process.exit(check() ? 0 : 1);
   } else if (cmd === "bump") {
-    if (!arg) throw new Error("用法：node scripts/version.mjs bump <major|minor|patch|x.y.z>");
+    if (!arg) throw new Error("用法：node scripts/version.mjs bump <major|minor|patch|x.y.z> [--author \"署名\"]");
     const cur = JSON.parse(read(F.pkg)).version;
     const v = nextVersion(cur, arg);
     if (cmp(v, cur) <= 0) throw new Error(`新版本 ${v} 未高于当前 ${cur}`);
+    const author = resolveAuthor(explicitAuthor) || gitUserName();
     console.log(`版本：v${cur} → v${v}`);
+    console.log(`署名：${author || "（未提供，骨架将留占位符，check 会拦）"}`);
     const done = sync(v);
     console.log(`版本号已写入：\n  · ${done.join("\n  · ")}`);
-    const ch = insertChangelog(v);
-    const rd = insertReadme(v);
+    const ch = insertChangelog(v, author);
+    const rd = insertReadme(v, author);
     console.log(ch ? "CHANGELOG.md 已插入新版本节骨架" : "CHANGELOG.md 已存在该版本节，跳过");
     console.log(rd ? "README.md 已插入版本历史骨架" : "README.md 已存在该版本，跳过");
     console.log("\n⚠️ 骨架只是占位，必须逐项填成真内容；填完跑 `node scripts/version.mjs check` 验收。");
     process.exit(0);
   } else {
-    console.log("用法：node scripts/version.mjs <check|sync|bump> [spec]");
+    console.log("用法：node scripts/version.mjs <check|sync|bump> [spec] [--author \"署名\"]");
     process.exit(2);
   }
 } catch (e) {
